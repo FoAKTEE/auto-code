@@ -87,3 +87,6 @@
   id); N2–N6 and the projection fixed; every §M1 Accept item passes → `notes/reviews/M1-triage-3.md`. B1 fixed
   (997b815); suite 797 passed; m1-live-7 (snapshot, f70055e): both targets, controls passed, supplement linked,
   $0.22; cumulative M1 live $2.74 of $5. Next: focused Codex review of B1 + m1-live-7.
+- Codex re-review 4: BLOCK on residual B1 (post-reap signals on an interrupt after the reap or after ECHILD) →
+  `notes/reviews/M1-triage-4.md`; fixed with explicit pid ownership + pidfd (5d26221); suite 802 passed;
+  m1-live-8 (snapshot, 01d1f32): both targets, controls passed, supplement linked, $0.21; cumulative M1 live $2.95.
