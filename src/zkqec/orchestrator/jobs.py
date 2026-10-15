@@ -357,17 +357,15 @@ class JobBook:
 
         Every settled job must have exactly one matching event (kind, key, retry, generation,
         reservation, charge, settled-from state, result) and every event a settled job; the only
-        unsettled job allowed is the reserved confirmation job with the frozen reservation."""
-        problems = self.audit()
+        unsettled job allowed is the reserved confirmation job with the frozen reservation. The
+        replayed ops_log history must agree with the event too (Codex M1 re-review N3): the
+        completion record's measured usage is the event's ``actual``, the state the history
+        settled from is its ``from_state``, and the settlement record's charge is its ``charged``."""
+        problems, history = self._audit()
         events = {e["job_id"]: e for e in settlements if e.get("namespace") == self.namespace}
         for e in settlements:
             if e.get("namespace") != self.namespace:
                 problems.append(f"settlement {e.get('job_id')} is outside namespace {self.namespace}")
-        settled_log = {}
-        for job_id, detail in self.conn.execute(
-                "SELECT job_id, detail FROM ops_log WHERE event='settled' AND job_id IN "
-                "(SELECT job_id FROM ops_jobs WHERE campaign=?) ORDER BY seq", (self.campaign,)):
-            settled_log[job_id] = json.loads(detail).get("charged")
         for (job_id, kind, idem, retry_of, state, gen, res, actual, outcome,
              result) in self.conn.execute(
                 "SELECT job_id, kind, idem_key, retry_of, state, generation, reservation, actual, "
@@ -395,8 +393,14 @@ class JobBook:
                 diff = sorted(k for k in mine if mine[k] != theirs[k])
                 problems.append(f"job {job_id}: operational record differs from its settlement "
                                 f"event in {diff}")
-            if outcome != "cancelled" and settled_log.get(job_id) != ev.get("charged"):
+            h = history.get(job_id, {})
+            if h.get("charged") != ev.get("charged"):
                 problems.append(f"job {job_id}: ops_log charge differs from its settlement event")
+            if h.get("from") != ev.get("from_state"):
+                problems.append(f"job {job_id}: its ops_log history settled from {h.get('from')}, "
+                                f"its settlement event from {ev.get('from_state')}")
+            if h.get("actual") != ev.get("actual"):
+                problems.append(f"job {job_id}: completion usage differs from its settlement event")
         for job_id in sorted(events):
             problems.append(f"job_settled event {job_id} has no operational job")
         frozen = {u: float(c) for u, c in caps.items()}
@@ -423,8 +427,20 @@ class JobBook:
         """Replay ops_log through the job state machine and compare with ops_jobs (Codex M1
         milestone review #7): every job's history starts with the reservation it holds (kind, key,
         input hash, reservation and retry as recorded), follows the allowed transitions with
-        monotone generations, and ends in the table's state, generation, result and charge;
-        an ops_log record of a job that has no operational row is an orphan."""
+        monotone generations, and ends in the table's state, generation, outcome, result and
+        charge; an ops_log record of a job that has no operational row is an orphan.
+
+        The accounting history is replayed as well (Codex M1 re-review N3): a settlement record
+        must name the state its history settled from and charge exactly what the settlement rule
+        (:func:`charge_for`) gives for that state, the recorded reservation and the completion
+        record's measured usage (none after an expiry or a recovery; zero for a cancellation), with
+        a consistent overrun flag; an unsettled job's table usage is its completion record's."""
+        return self._audit()[0]
+
+    def _audit(self) -> tuple[list[str], dict[str, dict]]:
+        """:meth:`audit`, plus each job's replayed accounting: ``outcome`` (completed, failed,
+        uncertain or cancelled), ``actual`` (the completion's measured usage), ``from`` and
+        ``charged`` (of its settlement record)."""
         problems: list[str] = []
         rows = {r[0]: r for r in self.conn.execute(
             "SELECT job_id, kind, idem_key, input_sha, retry_of, state, generation, reservation, "
@@ -457,10 +473,18 @@ class JobBook:
                     diff = sorted(k for k, v in mine.items() if k in d and d[k] != v)
                     problems.append(f"{job_id}: operational row differs from its reservation "
                                     f"record in {diff}")
+                last = {**last, "reservation": d.get("reservation", mine["reservation"])}
             if isinstance(d, dict) and event in ("completed", "failed", "uncertain"):
-                last = {**last, "result_sha": d.get("result_sha")}
+                last = {**last, "result_sha": d.get("result_sha"), "outcome": event,
+                        "actual": d.get("actual")}
+            if event in ("expired", "recovered_uncertain"):
+                last = {**last, "outcome": "uncertain", "actual": None}
             if isinstance(d, dict) and event == "settled":
-                last = {**last, "charged": d.get("charged")}
+                last = {**last, "charged": d.get("charged"), "from": d.get("from")}
+                problems += self._settlement_problems(job_id, state, d, last)
+            if event == "cancelled":
+                last = {**last, "outcome": "cancelled", "from": "cancelled", "actual": None,
+                        "charged": {u: 0.0 for u in UNITS}}
             replay[job_id] = [rule[1], gen, last]
         for job_id, row in sorted(rows.items()):
             _, kind, idem, input_sha, retry_of, state, gen, res, actual, result, outcome = row
@@ -469,6 +493,17 @@ class JobBook:
                 problems.append(f"{job_id}: table {(state, gen)} != log {(state_log, gen_log)}")
             if "result_sha" in last and last["result_sha"] != result:
                 problems.append(f"{job_id}: result differs from its completion record")
+            if last.get("outcome") != outcome:
+                problems.append(f"{job_id}: table outcome {outcome} differs from its history "
+                                f"({last.get('outcome')})")
+            try:
+                usage = json.loads(actual) if actual else None
+            except ValueError:
+                usage = None
+            if state == "settled" and usage != last.get("charged"):
+                problems.append(f"{job_id}: charge differs from its settlement record")
+            elif state in ("completed", "failed", "uncertain") and usage != last.get("actual"):
+                problems.append(f"{job_id}: usage differs from its completion record")
             for name, text in (("reservation", res), ("charge", actual)):
                 try:
                     ok = text is None or _finite_charge(json.loads(text))
@@ -476,4 +511,24 @@ class JobBook:
                     ok = False
                 if not ok:
                     problems.append(f"{job_id}: {name} is not finite non-negative usage")
-        return problems
+        return problems, {j: v[2] for j, v in replay.items()}
+
+    @staticmethod
+    def _settlement_problems(job_id: str, state: str | None, d: dict, last: dict) -> list[str]:
+        """A settlement record against the replayed history: settled-from state, charging rule
+        (§K) for that state, the recorded reservation and the completion's usage, overrun flag."""
+        out = []
+        if d.get("from") != state:
+            out.append(f"{job_id}: ops_log settled from {d.get('from')}, but its history is "
+                       f"{state}")
+        try:
+            reservation = {u: float(last.get("reservation", {}).get(u, 0.0)) for u in UNITS}
+            rule = charge_for(state, reservation, check_usage(last.get("actual")))
+        except (JobError, AttributeError, TypeError, ValueError):
+            rule = None
+        if rule is None or d.get("charged") != rule:
+            out.append(f"{job_id}: settlement charge does not follow the settlement rule (§K) "
+                       f"for its history")
+        elif d.get("overrun") is not any(rule[u] > reservation[u] + 1e-12 for u in UNITS):
+            out.append(f"{job_id}: settlement overrun flag is inconsistent")
+        return out

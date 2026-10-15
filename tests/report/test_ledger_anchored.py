@@ -3,6 +3,7 @@ traverses every referenced artifact (Codex M1 review #3 and #7; appendix ยงA5, ย
 import inspect
 import json
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -354,3 +355,101 @@ def test_the_report_uses_only_its_own_namespaces_evidence(tmp_path):
         (other,) = report_data(adm, "cb")["evaluations"]
         assert mine["satisfies_task"] == "verified"
         assert other["satisfies_task"] != "verified" and report_data(adm, "cb")["receipts"] == []
+
+
+# --- Codex M1 re-review N3: the audit replays completion usage and the settlement source ---------
+@pytest.fixture(scope="module")
+def sealed_copy(tmp_path_factory):
+    """A campaign sealed into a bundle (fake closures; the offline re-execution is covered by the
+    slow round trip) and the bundle extracted: the sealed ledger, store and manifest."""
+    import zkqec.orchestrator.campaign as campaign
+    import zkqec.report.bundle as bundle_mod
+    from zkqec.contracts import Profile, Reservation
+    from zkqec.kernel.codes import bicycle_chain
+    from zkqec.orchestrator.campaign import CampaignConfig, run_campaign
+    root = tmp_path_factory.mktemp("sealed-n3")
+    archive, closures = root / "archive", {}
+    for kind in ("runtime", "wheelhouse", "evaluator"):
+        (root / kind).mkdir()
+        (root / kind / "f.txt").write_text(kind)
+        bundle_mod._tar_zst(root / kind, root / f"{kind}.tar.zst", kind)
+        closures[kind] = bundle_mod._cas_put(root / f"{kind}.tar.zst", {"kind": kind}, archive)
+    closures.update(git_commit="0" * 40, lock_sha256="1" * 64)
+    c = bicycle_chain(3, 7)
+    good = json.dumps({"family": "explicit_sparse", "rationale": "x",
+                       "params": {"hx": sparse(c.hx), "hz": sparse(c.hz)}})
+    cfg = CampaignConfig(
+        campaign_id="n3", profile=Profile(knowledge="K0", prompt="P-min", grammar=("G-open",)),
+        tasks=(TaskSA(task_id="sa-n3", targets=StructuralTargets(
+            n_max=50, k_min=6, d_min=6, w_max=8, deg_max=8)),),
+        provider="replay", model="replay-double", max_proposals_per_task=4,
+        caps={"usd": 1.0, "requests": 20},
+        per_call=Reservation(usd=0.2, requests=2, input_tokens=0, output_tokens=0,
+                             wall_seconds=0, cpu_seconds=0))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(bundle_mod, "ensure_closures", lambda *a, **k: closures)
+        mp.setattr(campaign, "audit_bundle", lambda *a, **k: {"ok": True, "problems": []})
+        out = run_campaign(cfg, ReplayDouble(["not json", good]), root / "runs",
+                           require_clean=False, archive=archive)
+    bundle_mod._untar_zst(Path(out["bundle"]["path"]), root / "x")
+    return root / "x" / "bundle"
+
+
+def _corrupt(db, sql, *args):
+    """Model corrupted evidence in a copy: drop the ops_log append-only triggers, apply the edit,
+    recreate them (production updates stay refused)."""
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        triggers = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                                "AND tbl_name='ops_log'").fetchall()
+        for name, _ in triggers:
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute(sql, args)
+        for _, ddl in triggers:
+            conn.execute(ddl)
+    finally:
+        conn.close()
+
+
+def _audit_copy(src, dst):
+    import shutil
+    shutil.copytree(src, dst)
+    return dst / "ledger.db"
+
+
+def test_the_sealed_ledger_copy_audits_clean(sealed_copy, tmp_path):
+    db = _audit_copy(sealed_copy, tmp_path / "b")
+    store = ArtifactStore(db.parent / "store")
+    with Admission(db, store, build_registry(store)) as adm:
+        assert adm.verify().ok and audit_campaign(adm, store, "n3") == []
+
+
+@pytest.mark.parametrize("mutation", ["completion_actual_usd", "settlement_from_uncertain"])
+def test_codex_repro_completion_usage_and_settlement_source_fail_the_audit(sealed_copy, tmp_path,
+                                                                           mutation):
+    """The re-review repro: in a copy of the sealed ledger, the completion record's actual.usd set
+    to 999999, or the settlement record's ``from`` set to ``uncertain``, gave verify=True and
+    audit_campaign=[]."""
+    db = _audit_copy(sealed_copy, tmp_path / "b")
+    event = "completed" if mutation.startswith("completion") else "settled"
+    conn = sqlite3.connect(db)
+    job, seq, detail = conn.execute(
+        "SELECT l.job_id, l.seq, l.detail FROM ops_log l JOIN ops_jobs j USING (job_id) "
+        "WHERE j.kind = 'propose' AND l.event = ? ORDER BY l.seq LIMIT 1", (event,)).fetchone()
+    conn.close()
+    d = json.loads(detail)
+    if event == "completed":
+        d["actual"]["usd"] = 999999
+    else:
+        assert d["from"] == "completed"
+        d["from"] = "uncertain"
+    _corrupt(db, "UPDATE ops_log SET detail = ? WHERE seq = ?", json.dumps(d, sort_keys=True), seq)
+    store = ArtifactStore(db.parent / "store")
+    with Admission(db, store, build_registry(store)) as adm:
+        assert adm.verify().ok                    # the hash chain does not cover the ops tables
+        problems = audit_campaign(adm, store, "n3")
+    assert any(job in p for p in problems), problems
+    if event == "completed":
+        assert any("completion usage differs from its settlement event" in p for p in problems)
+    else:
+        assert any("settled from uncertain" in p for p in problems), problems
