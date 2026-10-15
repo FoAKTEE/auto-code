@@ -263,3 +263,58 @@ def test_members_surviving_the_grace_period_are_an_escape(monkeypatch):
     res = run_bounded(lambda: 1, limits=ROOMY)
     assert res.outcome == "escaped" and res.value is None and not res.ok
     assert "escaped" in bounded.OUTCOMES and "cpu_seconds" not in res.usage()
+
+
+# --- Codex M1 re-review 3 B1: no signal to a process-group id after its leader was reaped ----------
+def _leave_a_straggler(path):
+    """Return at once, leaving a grandchild in the job's process group (a straggler to drain)."""
+    p = subprocess.Popen(["sleep", "30"])
+    with open(path, "w") as f:
+        f.write(str(p.pid))
+    return "done"
+
+
+def test_the_group_is_drained_before_its_leader_is_reaped(tmp_path, monkeypatch):
+    # Reaping the leader frees its pid; a later killpg on that id could hit a reused, unrelated
+    # group. Every group signal must precede the reap, so the id stays allocated (zombie leader).
+    import zkqec.exec.bounded as bounded
+    events = []
+    real_killpg, real_wait4 = os.killpg, os.wait4
+
+    def killpg(pgid, sig):
+        events.append(("killpg", pgid, sig))
+        return real_killpg(pgid, sig)
+
+    def wait4(pid, options):
+        out = real_wait4(pid, options)
+        events.append(("reap", pid))
+        return out
+    monkeypatch.setattr(bounded.os, "killpg", killpg)
+    monkeypatch.setattr(bounded.os, "wait4", wait4)
+    marker = tmp_path / "straggler"
+    res = run_bounded(_leave_a_straggler, str(marker), limits=Limits(5, 10, 256 * 2**20))
+    leader = res.detail["process_group"]
+    reap = events.index(("reap", leader))
+    assert [e for e in events[reap + 1:] if e[0] == "killpg" and e[1] == leader] == []
+    assert any(e[0] == "killpg" and e[2] == signal.SIGKILL for e in events[:reap])
+    assert res.detail["stragglers_killed"] is True
+    straggler = int(marker.read_text())
+    deadline = time.time() + 5
+    while os.path.exists(f"/proc/{straggler}") and time.time() < deadline:
+        time.sleep(0.02)
+    stat = open(f"/proc/{straggler}/stat").read() if os.path.exists(f"/proc/{straggler}") else ""
+    assert stat == "" or stat[stat.rindex(")") + 2] in "ZX"   # dead (reparented zombie at worst)
+    assert not os.path.exists(f"/proc/{leader}")                # the leader itself was reaped
+
+
+def test_a_zombie_leader_alone_is_not_a_live_group():
+    import zkqec.exec.bounded as bounded
+    pid = os.fork()
+    if pid == 0:
+        os.setpgid(0, 0)
+        os._exit(0)
+    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)          # exited, not reaped: a zombie
+    try:
+        assert bounded._group_alive(pid) is False
+    finally:
+        os.waitpid(pid, 0)

@@ -228,10 +228,19 @@ def _group_alive(pgid: int) -> bool:
     return False
 
 
+def _wait_exit(pid: int) -> None:
+    """Block until the child has exited, without reaping it: its unreaped zombie keeps the pid and
+    the process-group id allocated, so no later signal to them can reach a reused process."""
+    try:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+    except ChildProcessError:
+        pass
+
+
 def _drain_group(pgid: int) -> tuple[bool, bool]:
-    """Kill what is left of the reaped child's group and wait until it is gone; return
-    (members were left, the group is gone). Called after the leader was reaped: a live member
-    keeps the group id allocated, so ``killpg`` never reaches another group."""
+    """Kill what is left of the child's group and wait until no live member remains; return
+    (members were left, the group is gone). Called only while the leader is an unreaped zombie
+    (:func:`_wait_exit`), so ``pgid`` cannot have been reused by another group (re-review 3 B1)."""
     left = False
     end = time.monotonic() + ESCAPE_GRACE_SECONDS
     while _group_alive(pgid):
@@ -286,20 +295,22 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
                 _kill(pid, not nested)
                 break
             chunks.append(chunk)
-        _, status, ru = os.wait4(pid, 0)
-        reaped = (status, ru)
+        _wait_exit(pid)                       # exited but unreaped: pid and group id stay ours
         if not nested:
             left, gone = _drain_group(pid)
+        _, status, ru = os.wait4(pid, 0)      # reap last: nothing signals this id afterwards
+        reaped = (status, ru)
     finally:
         os.close(r)
         if reaped is None:                    # interrupted (e.g. KeyboardInterrupt): no orphan
-            _kill(pid, not nested)
+            _kill(pid, not nested)            # still unreaped here, so the id is still ours
+            _wait_exit(pid)
+            if not nested:
+                _drain_group(pid)
             try:
                 os.wait4(pid, 0)
             except ChildProcessError:
                 pass
-            if not nested:
-                _drain_group(pid)
     wall = time.monotonic() - t0
     status, ru = reaped
     cpu = float(ru.ru_utime + ru.ru_stime)
