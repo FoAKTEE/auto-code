@@ -19,10 +19,18 @@ group that the child leads; the child marks its process (:data:`_IN_BOUNDED_CHIL
 the confirmation's offline audit is, sees the mark too). A ``run_bounded`` inside a marked process
 is *nested*: its child stays in the enclosing group (no ``setpgid``), so the enclosing job's kill
 reaches it, and at its own deadline it is killed by pid (never ``killpg`` on a group it does not
-lead). After the child of a top-level run is reaped, for any reason, the parent kills whatever is
-left of the group and returns only once the group is gone (``killpg(pgid, 0)`` reports ``ESRCH``,
-or only zombies remain); members that survive :data:`ESCAPE_GRACE_SECONDS` make the outcome
-``escaped`` (non-ok, never evidence; callers keep the job's full reservation).
+lead). Once the child of a top-level run has exited, the parent kills whatever is left of the group
+and waits until no live (non-zombie) member remains — while the exited leader is still an unreaped
+zombie, which keeps its pid and the group id allocated — and only then reaps it; members that survive
+:data:`ESCAPE_GRACE_SECONDS` make the outcome ``escaped`` (non-ok, never evidence; callers keep the
+job's full reservation).
+
+Ownership of the child's pid (Codex M1 re-reviews 3–4, B1). The parent signals the child's pid or
+group id only while it owns the unreaped child: leader signals go through a pidfd (never a reused pid);
+ownership ends *before* any reaping wait, so an interrupt landing after the reap sends nothing; a
+child found already reaped (``ECHILD``) is never signalled again and the outcome is ``escaped`` with
+``ownership_lost`` (charged at the reservation). The process must not reap children it does not own:
+``run_bounded`` refuses to start while ``SIGCHLD`` is ignored (the kernel would reap the child).
 
 The CPU of processes the parent killed (or found left behind) was never reaped by the child, so
 ``wait4`` did not measure it: ``detail["cpu_complete"]`` is then False and :meth:`BoundedResult.usage`
@@ -196,9 +204,28 @@ def _child(fn: Callable[..., Any], args: tuple, kwargs: dict, limits: Limits, w:
         os._exit(status)
 
 
-def _kill(pid: int, group: bool) -> None:
-    """SIGKILL the child, and its process group when the child leads one (a top-level run)."""
-    kills = (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL))
+def _still_ours(pidfd: int | None) -> bool:
+    """Whether the child behind ``pidfd`` is still unreaped (running or a zombie we have not
+    reaped): only then does its pid, and so its group id, stay allocated to it."""
+    if pidfd is None:
+        return True
+    try:
+        os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except ChildProcessError:
+        return False
+    return True
+
+
+def _kill(pid: int, group: bool, pidfd: int | None) -> None:
+    """SIGKILL the (owned, unreaped) child, and its process group when it leads one (a top-level
+    run). The leader is signalled through its pidfd when there is one; the group only while the
+    pidfd shows the leader unreaped."""
+    def leader():
+        if pidfd is not None:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    kills = (lambda: _still_ours(pidfd) and os.killpg(pid, signal.SIGKILL), leader)
     for kill in kills if group else kills[1:]:
         try:
             kill()
@@ -228,22 +255,33 @@ def _group_alive(pgid: int) -> bool:
     return False
 
 
-def _wait_exit(pid: int) -> None:
+def _wait_exit(pid: int) -> bool:
     """Block until the child has exited, without reaping it: its unreaped zombie keeps the pid and
-    the process-group id allocated, so no later signal to them can reach a reused process."""
+    the process-group id allocated, so a later signal to them cannot reach a reused process. False
+    when the child is no longer ours to wait for (reaped elsewhere: ``ECHILD``)."""
     try:
         os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
     except ChildProcessError:
-        pass
+        return False
+    return True
 
 
-def _drain_group(pgid: int) -> tuple[bool, bool]:
+def _reap(pid: int):
+    """Reap the child (``wait4``: status and rusage), or None when it was already reaped."""
+    try:
+        _, status, ru = os.wait4(pid, 0)
+    except ChildProcessError:
+        return None
+    return status, ru
+
+
+def _drain_group(pgid: int, pidfd: int | None = None) -> tuple[bool, bool]:
     """Kill what is left of the child's group and wait until no live member remains; return
     (members were left, the group is gone). Called only while the leader is an unreaped zombie
     (:func:`_wait_exit`), so ``pgid`` cannot have been reused by another group (re-review 3 B1)."""
     left = False
     end = time.monotonic() + ESCAPE_GRACE_SECONDS
-    while _group_alive(pgid):
+    while _still_ours(pidfd) and _group_alive(pgid):
         left = True
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -259,6 +297,9 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
     """Run ``fn(*args, **kwargs)`` in a forked child under ``limits`` (see the module doc)."""
     if not isinstance(limits, Limits):
         raise TypeError("limits must be a Limits")
+    if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        raise RuntimeError("SIGCHLD is ignored: the kernel would reap the child, so run_bounded "
+                           "could not own its pid")
     nested = _nested()
     r, w = os.pipe()
     t0 = time.monotonic()
@@ -267,6 +308,11 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
         os.close(r)
         _child(fn, args, kwargs, limits, w, nested)
     os.close(w)
+    owned, lost = True, False             # owned: the child is ours and not reaped; signals allowed
+    try:
+        pidfd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        pidfd = None
     if not nested:
         try:
             os.setpgid(pid, pid)              # also set by the child; whichever runs first wins
@@ -281,7 +327,7 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 killed = True
-                _kill(pid, not nested)
+                _kill(pid, not nested, pidfd)
                 break
             ready, _, _ = select.select([r], [], [], remaining)
             if not ready:
@@ -292,26 +338,36 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
             size += len(chunk)
             if size > MAX_RESULT_BYTES:
                 oversized = True
-                _kill(pid, not nested)
+                _kill(pid, not nested, pidfd)
                 break
             chunks.append(chunk)
-        _wait_exit(pid)                       # exited but unreaped: pid and group id stay ours
-        if not nested:
-            left, gone = _drain_group(pid)
-        _, status, ru = os.wait4(pid, 0)      # reap last: nothing signals this id afterwards
-        reaped = (status, ru)
+        if _wait_exit(pid):                   # exited but unreaped: pid and group id stay ours
+            if not nested:
+                left, gone = _drain_group(pid, pidfd)
+        else:
+            lost = True                       # reaped elsewhere: never signal this id again
+        owned = False                         # before the reap: nothing signals this id afterwards
+        reaped = None if lost else _reap(pid)
+        lost = lost or reaped is None
     finally:
         os.close(r)
-        if reaped is None:                    # interrupted (e.g. KeyboardInterrupt): no orphan
-            _kill(pid, not nested)            # still unreaped here, so the id is still ours
-            _wait_exit(pid)
-            if not nested:
-                _drain_group(pid)
-            try:
-                os.wait4(pid, 0)
-            except ChildProcessError:
-                pass
+        if owned:                             # interrupted before the reap: the id is still ours
+            _kill(pid, not nested, pidfd)
+            if _wait_exit(pid) and not nested:
+                _drain_group(pid, pidfd)
+            owned = False
+        if reaped is None:
+            _reap(pid)                        # no orphan; never a signal (it may be reaped already)
+        if pidfd is not None:
+            os.close(pidfd)
     wall = time.monotonic() - t0
+    if lost:
+        return BoundedResult("escaped", None, 0.0, wall, 0, {
+            "limits": {"cpu_seconds": limits.cpu_seconds, "wall_seconds": limits.wall_seconds,
+                       "memory_bytes": limits.memory_bytes},
+            "process_group": None if nested else pid, "ownership_lost": True,
+            "cpu_complete": False,
+            "message": "the child was reaped outside run_bounded; its usage is unmeasured"})
     status, ru = reaped
     cpu = float(ru.ru_utime + ru.ru_stime)
     peak = int(ru.ru_maxrss) * 1024

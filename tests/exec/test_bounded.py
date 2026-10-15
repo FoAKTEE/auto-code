@@ -318,3 +318,73 @@ def test_a_zombie_leader_alone_is_not_a_live_group():
         assert bounded._group_alive(pid) is False
     finally:
         os.waitpid(pid, 0)
+
+
+# --- Codex M1 re-review 4 (residual B1): no signal once the child may have been reaped ---------------
+def _quick():
+    return "ok"
+
+
+def _record_signals(monkeypatch, bounded, events):
+    real = {"killpg": os.killpg, "kill": os.kill, "pidfd": signal.pidfd_send_signal}
+
+    def rec(name):
+        def f(*a, **k):
+            events.append(("signal", name, a[0], a[1] if len(a) > 1 else None))
+            return real[name](*a, **k)
+        return f
+    monkeypatch.setattr(bounded.os, "killpg", rec("killpg"))
+    monkeypatch.setattr(bounded.os, "kill", rec("kill"))
+    monkeypatch.setattr(bounded.signal, "pidfd_send_signal", rec("pidfd"))
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_an_interrupt_right_after_the_reap_sends_no_signal(monkeypatch, nested):
+    import zkqec.exec.bounded as bounded
+    if nested:
+        monkeypatch.setattr(bounded, "_IN_BOUNDED_CHILD", True)
+    events = []
+    real_wait4 = os.wait4
+
+    def wait4_then_interrupt(pid, options):
+        out = real_wait4(pid, options)                       # the child is reaped here ...
+        events.append(("reaped", pid))
+        raise KeyboardInterrupt                              # ... and SIGINT lands before `reaped =`
+    _record_signals(monkeypatch, bounded, events)
+    monkeypatch.setattr(bounded.os, "wait4", wait4_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_bounded(_quick, limits=Limits(5, 10, 256 * 2**20))
+    i = next(k for k, e in enumerate(events) if e[0] == "reaped")
+    assert [e for e in events[i + 1:] if e[0] == "signal"] == []
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_a_child_reaped_elsewhere_is_never_signalled(monkeypatch, nested):
+    import zkqec.exec.bounded as bounded
+    if nested:
+        monkeypatch.setattr(bounded, "_IN_BOUNDED_CHILD", True)
+    events = []
+    real_waitpid = os.waitpid
+
+    def foreign_reaper(idtype, ident, options):
+        pid = ident if idtype == os.P_PID else None
+        real_waitpid(pid, 0)                                 # another reaper takes the child
+        events.append(("reaped", pid))
+        raise ChildProcessError(10, "No child processes")
+    _record_signals(monkeypatch, bounded, events)
+    monkeypatch.setattr(bounded.os, "waitid", foreign_reaper)
+    res = run_bounded(_quick, limits=Limits(5, 10, 256 * 2**20))
+    assert res.outcome == "escaped" and res.value is None
+    assert res.detail.get("ownership_lost") is True and "cpu_seconds" not in res.usage()
+    i = next(k for k, e in enumerate(events) if e[0] == "reaped")
+    assert [e for e in events[i + 1:] if e[0] == "signal"] == []
+
+
+def test_an_ignored_sigchld_is_refused():
+    # SIG_IGN makes the kernel reap children itself: run_bounded could never own its child's pid.
+    old = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    try:
+        with pytest.raises(RuntimeError, match="SIGCHLD"):
+            run_bounded(_quick, limits=Limits(5, 10, 256 * 2**20))
+    finally:
+        signal.signal(signal.SIGCHLD, old)
