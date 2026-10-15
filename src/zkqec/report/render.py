@@ -43,7 +43,7 @@ def report_data(adm: Admission, campaign_id: str) -> dict[str, Any]:
     if camp is None:
         raise KeyError(f"campaign {campaign_id} is not frozen in this ledger")
     domain = camp["domain"]
-    res = adm.resolver(domain)
+    res = adm.resolver(domain, namespace=camp["namespace"])     # §N: this campaign's evidence only
     tasks = {t["task_id"]: _task(t) for t in camp["tasks"]}
     rows = []
     for ev in adm.ledger.evaluations(campaign_id):

@@ -327,3 +327,30 @@ def test_a_campaign_frozen_without_campaign_ceilings_audits_clean(camp):
     confirmation in its config) has no frozen ceilings to compare its verifier jobs with."""
     adm, store, _, _ = camp
     assert audit_campaign(adm, store, "c3") == []
+
+
+def test_the_report_uses_only_its_own_namespaces_evidence(tmp_path):
+    """§N with the namespaced ledger (zkqec-ledger-2): a candidate evaluated in campaign ca is not
+    verified in campaign cb's report just because both share a ledger."""
+    from zkqec.report.render import report_data
+    store = ArtifactStore(tmp_path / "store")
+    reg = build_registry(store)
+    task = steane_task(3)
+    with Admission(tmp_path / "ledger.db", store, reg) as adm:
+        dom = evaluator_domain(reg)
+        for cid in ("ca", "cb"):
+            adm.freeze_campaign(cid, namespace=cid, config={"tasks": [task.model_dump(mode="json")]},
+                                tasks=[task.model_dump(mode="json")], caps={"cpu_seconds": 1e4},
+                                labels=["single-implementation"], domain=dom,
+                                manifest=store.put_json({"c": cid}))
+        book = adm.job_book("ca")
+        book.set_caps({"cpu_seconds": 1e4})
+        h = np.asarray(steane().hx)
+        ev = Pipeline(adm, store, book, dom, caps=GrammarCaps()).evaluate(
+            Proposal(family="explicit_sparse", params={"hx": sparse(h), "hz": sparse(h)}), task)
+        for cid in ("ca", "cb"):
+            adm.record_evaluation(cid, "sa-steane", candidate=ev.candidate, source="fixture")
+        (mine,) = report_data(adm, "ca")["evaluations"]
+        (other,) = report_data(adm, "cb")["evaluations"]
+        assert mine["satisfies_task"] == "verified"
+        assert other["satisfies_task"] != "verified" and report_data(adm, "cb")["receipts"] == []

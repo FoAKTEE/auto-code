@@ -367,3 +367,47 @@ def test_the_confirmation_audit_is_killed_at_its_reservation(tmp_path, monkeypat
     assert out["audit"]["ok"] is False and "wall_exceeded" in out["audit"]["problems"][0]
     assert 2 <= out["confirmation"]["wall_seconds"] < 10
     assert out["confirmation_supplement"]["problems"] == ["the confirmation audit did not pass"]
+
+
+# --- read-only evaluator snapshot (#14 integration) and boundary checks for controls/confirmation --
+def test_git_state_inside_the_snapshot_needs_no_checkout(monkeypatch):
+    import zkqec.orchestrator.campaign as c
+
+    def no_git(*a, **k):
+        raise AssertionError("git is not available inside the read-only snapshot")
+    monkeypatch.setattr(c.freeze, "active_snapshot",
+                        lambda: {"root": "/snap", "commit": "a" * 40, "evaluator_closure": "b" * 64})
+    monkeypatch.setattr(c.subprocess, "run", no_git)
+    assert c.git_state() == {"commit": "a" * 40, "dirty": False, "dirty_paths": [],
+                             "snapshot": "b" * 64}
+
+
+@pytest.mark.parametrize("boundary", ["controls", "confirmation"])
+def test_controls_and_confirmation_are_evaluator_boundaries(tmp_path, monkeypatch, boundary):
+    import sqlite3
+    import zkqec.orchestrator.campaign as campaign
+    import zkqec.report.bundle as bundle_mod
+    from zkqec.orchestrator import freeze
+    seen, audited = [], []
+    orig = freeze.EvaluatorGuard.check
+
+    def check(self, b):
+        seen.append(b)
+        if b == boundary:
+            raise freeze.EvaluatorChanged(f"{b}: evaluator changed (test)")
+        return orig(self, b)
+    monkeypatch.setattr(freeze.EvaluatorGuard, "check", check)
+    archive = tmp_path / "archive"
+    closures = _fake_closures(archive, tmp_path)
+    monkeypatch.setattr(bundle_mod, "ensure_closures", lambda *a, **k: closures)
+    monkeypatch.setattr(campaign, "audit_bundle", lambda *a, **k: audited.append(a) or {"ok": True})
+    with pytest.raises(freeze.EvaluatorChanged):
+        run_campaign(cfg(controls="p1a", max_proposals_per_task=1), ReplayProviderDouble(["not json"]),
+                     tmp_path / "runs", require_clean=False, archive=archive)
+    assert seen[-1] == boundary and audited == []
+    conn = sqlite3.connect(tmp_path / "runs" / "t1" / "ledger.db")
+    kind = "verify" if boundary == "controls" else "confirm"
+    states = [s for s, in conn.execute("SELECT state FROM ops_jobs WHERE kind=? AND idem_key IN "
+                                       "('controls:p1a', 'confirmation')", (kind,))]
+    conn.close()
+    assert states == ["reserved"]                          # never dispatched past a changed evaluator

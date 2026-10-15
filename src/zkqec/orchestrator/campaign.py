@@ -118,6 +118,10 @@ def grammar_for(profile: Profile) -> dict[str, Any]:
 
 
 def git_state() -> dict[str, Any]:
+    snap = freeze.active_snapshot()
+    if snap is not None:      # §O: running from the read-only evaluator snapshot (not a checkout)
+        return {"commit": snap["commit"], "dirty": False, "dirty_paths": [],
+                "snapshot": snap["evaluator_closure"]}
     head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True,
                           text=True, check=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--", *FROZEN_PATHS],
@@ -304,6 +308,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                     break
         control_summary = None
         if controls_job is not None:
+            check_evaluator("controls")               # §O: the control suite is a boundary too
             control_summary = _run_controls(cfg, adm, store, book, controls_job, run / "controls")
         report_md = render(adm, cfg.campaign_id)          # from the ledger only (§A5)
         (run / "report.md").write_text(report_md)
@@ -323,6 +328,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
         kw = {"archive": archive} if archive else {}
         entry = seal(run, cfg.campaign_id, run / "ledger.db", run / "store", report_md,
                      extra_dirs=extra_dirs, commit=gs["commit"], **kw)
+        guard.check("confirmation")                   # adm is closed: the guard directly
         audit, confirmation_charge, supplement = _confirm(run, cfg, prof, store, confirm_job,
                                                           entry, kw)
         out.update(bundle=entry, audit={k: audit[k] for k in ("ok", "problems") if k in audit},
