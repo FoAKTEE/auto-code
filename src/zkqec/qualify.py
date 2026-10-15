@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import secrets
 import shutil
 import socket
@@ -515,6 +516,61 @@ class Qualifier:
                   and reasons.get("s_out") == "output_ceiling",
                   "2nd request over max_model_requests=1, 2 KB body over a 512 B input bound, max_tokens 50 over a "
                   "10-token ceiling: all 403 before forwarding", ev)))
+
+    def j1_log_failure(self) -> None:
+        """Fail-closed broker when its log cannot be written (Codex M1 milestone review B1): the
+        running mitmdump gets an RLIMIT_FSIZE just above its log size, so the next decision record is
+        written short and then fails (EFBIG)."""
+        d = self.out / "logfail"
+        d.mkdir(exist_ok=True)
+        pki = make_test_pki(d / "pki")
+        up = FakeUpstream(pki["cert"], pki["key"]).start()
+        b = Broker(self.campaign + "f", d, overrides=local_policy_overrides(up.port))
+        b.start(extra_args=["--set", f"ssl_verify_upstream_trusted_ca={pki['ca']}"])
+        body = json.dumps({"model": "m1", "max_tokens": 50, "messages": [{"role": "user", "content": "x"}]}).encode()
+        res: dict[str, Any] = {}
+        try:
+            toks = {j: b.grant(j, "claude", ["m1"], Ceilings(3, 6, 4096, 100, 60)) for j in ("lf_a", "lf_b")}
+            self.secrets.extend(t.encode() for t in toks.values())
+            with Bridge(str(d / "a.sock"), b.port, toks["lf_a"]), Bridge(str(d / "b.sock"), b.port, toks["lf_b"]):
+                ca = ProxyClient(str(d / "a.sock"), str(b.ca_cert), "localhost", up.port)
+                cb = ProxyClient(str(d / "b.sock"), str(b.ca_cert), "localhost", up.port)
+                res["before"] = ca.request("POST", "/v1/messages", body)[0]
+                deadline = time.time() + 10
+                while not [r for r in b.records("lf_a") if r.get("event") == "response"] and time.time() < deadline:
+                    time.sleep(0.05)
+                n0 = len(up.seen)
+                soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+                resource.prlimit(b.proc.pid, resource.RLIMIT_FSIZE, (b.log_path.stat().st_size + 16, hard))
+                try:
+                    res["cut"] = ca.request("POST", "/v1/messages", body)[0]
+                finally:
+                    resource.prlimit(b.proc.pid, resource.RLIMIT_FSIZE, (soft, hard))
+                res["same_job_after"] = ca.request("POST", "/v1/messages", body)[0]
+                res["other_job_after"] = cb.request("POST", "/v1/messages", body)[0]
+                ca.close(); cb.close()
+            res["forwarded_after_cut"] = len(up.seen) - n0
+            res["job_failed"] = b.blocked_reason("lf_a")
+            res["dispatch_disabled"] = b.dispatch_disabled()
+        finally:
+            b.stop()
+            up.stop()
+            b.remove_ca_key()
+            for key in (d / "pki").glob("*.key"):
+                key.unlink()
+        ev = [{"results": res, "log": os.path.relpath(b.log_path, self.out)}]
+        self.add(Property(
+            "J1.log_failure_fail_closed", "Broker fails closed when its decision log cannot be written",
+            "§J1/§L",
+            "The real mitmdump broker forwards a request only after its decision record is completely written "
+            "and fsync'ed; when the log write fails (short write, then EFBIG under RLIMIT_FSIZE) the request is "
+            "blocked, the job fails and all further dispatch is disabled.",
+            Check(res.get("before") == 200, "with a writable log the request is forwarded", ev),
+            Check(res.get("cut") == 403 and res.get("same_job_after") == 403 and res.get("other_job_after") == 403
+                  and res.get("forwarded_after_cut") == 0 and res.get("job_failed") is not None
+                  and res.get("dispatch_disabled") is True,
+                  f"log cut short → 403; later requests of this and another job → 403; nothing forwarded; "
+                  f"job failed ({res.get('job_failed')}); dispatch disabled", ev)))
 
     # ==============================================================================================
     # Live CLI calls
@@ -1119,7 +1175,7 @@ class Qualifier:
         self.setup()
         try:
             for fn in (self.j0_signal_and_proc, self.j0_env_fds, self.j0_sockets, self.j0_descendants,
-                       self.j1_egress, self.j1_synthetic, self.j2_canaries, self.j2_fresh_home,
+                       self.j1_egress, self.j1_synthetic, self.j1_log_failure, self.j2_canaries, self.j2_fresh_home,
                        self.live_claude, self.live_codex, self.j4_slice, self.j4_output_caps, self.j4_deadline,
                        self.o_pinning, self.j1_logs):
                 self.run_property(fn)
