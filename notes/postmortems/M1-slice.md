@@ -144,18 +144,35 @@ samples. One sample per arm supports no comparison (H3/H4 need the P1b paired de
 
 All list-price charges in M1 are reproduced exactly by `configs/broker/prices.json` × broker usage. One Opus 5.5
 (effort high) proposal cost $0.04–0.05 (S-F, ~2k output tokens) to $0.24–0.64 (S-A, 12k–32k output tokens); the
-§K reservation per call is $1.92. The projection below uses the m1-live-3 S-A cost ($0.31); at the m1-live-5 cost
-($0.64) it doubles (smoke ≈ $13, pilot ≈ $240), above both caps — the reservation-enforced caps still bind, so the
-pilot would complete fewer proposals, and M3 must measure per-role costs before the pilot is sized. Projection, assuming M2–M4 tasks cost at most the m1-live-3 S-A call and ≤ 1.3× for skeptic,
-route and commentator calls (Sonnet/Opus) with Designer-B on the Codex subscription (no list price): M3 smoke of
-≤ 8 tasks × 2 proposals ≈ 8 × 2 × 0.31 × 1.3 ≈ $6.5 (cap $10); P1b dev pilot of 24 tasks × 2 arms × 6 proposals
-≈ 24 × 2 × 6 × 0.31 × 1.3 ≈ $116 (cap $150). Harder D10 targets lengthen thinking; the hard bound remains the cap
-enforced through reservations ($1.92 each), so the pilot cannot exceed $150 but may finish fewer proposals.
+§K reservation per call is $1.92.
+
+Projection from the latest telemetry (m1-live-5 S-A call, $0.6397666), keeping the **unmeasured** assumption of 1.3×
+for skeptic, route and commentator calls:
+
+| workload | calculation | projection | D5 cap |
+|---|---|---|---|
+| M3 smoke | 8 tasks × 2 proposals × $0.640 × 1.3 | ≈ $13.31 | $10 |
+| P1b dev pilot | 24 tasks × 2 arms × 6 proposals × $0.640 × 1.3 | ≈ $239.53 | $150 |
+
+Both exceed their caps as sized. The caps cannot be exceeded (reservations bind), but a workload that does not fit
+is not a plan. D4 therefore also requires (`notes/reviews/M1-triage-2.md`): the M3 smoke is resized before
+dispatch to fit $10 at the measured per-proposal cost (e.g. 5 tasks × 2 proposals ≈ $8.3 at 1.3×); every role and
+retry is measured in that smoke; Codex's K0-unqualified status (D16) and missing price basis are handled explicitly
+(a Codex arm is dev-only and its cost is reported in requests and tokens, not USD); the pilot is recomputed from
+the smoke telemetry and resized before any pilot dispatch.
 
 ## 6. Residual risks carried into Phase 1b
 
 - Codex is K0-disqualified (declares tools via `additional_tools`); Designer-B on Codex is dev-only (G6, D16).
-- No aggregate CPU quota on this host (G7): concurrency caps, RLIMIT_CPU and wall limits only.
-- Evaluator snapshot import deferred to M2 (hardening #14).
-- Verifier CPU is charged, not interrupted mid-run (hardening #13).
+- No aggregate CPU quota on this host (G7): concurrency caps, per-child RLIMIT_CPU, wall kills and measured charges.
+- Bounded children are forked from the orchestrator: an inherited lock held by another thread can stall a child
+  (timeout, never false evidence). Before any concurrent dispatch (M3) workers move to a clean-exec or forkserver
+  start with controlled inherited handles.
+- `RLIMIT_AS` bounds the address space a child adds after fork, not its resident set or an aggregate.
+- Nested bounded workers must stay inside the enclosing worker's kill scope (review N1; fixed in the third
+  hardening round).
+- The snapshot isolates evaluator code; the runtime dependencies (`.venv` site-packages, `.venv-broker`) are trusted,
+  hash-recorded in the manifest, not copied into the snapshot (§O trust boundary).
+- Admission still accepts `limits=None` for direct API use and the standalone audit replays inline; production
+  campaign paths always pass limits (M3 prerequisite: refuse unbounded production calls).
 - Credential refresh endpoints are blocked: an expired token fails closed mid-campaign.
