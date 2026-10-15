@@ -7,3 +7,5 @@
 | 2026-10-15 | G2 | `ref-code/` is untracked (gitignored) | provisional (D6) | contains nested git repos; read-only inputs |
 | 2026-10-15 | G3 | Work on branch `zkqec-dev` | provisional (D7) | keep `main` clean until owner merges |
 | 2026-10-15 | G5 | Owner: "upon finish prompt editing, proceed to begin the project" — build starts after the v0.4 review is triaged, with the prompt's default decisions D1–D17 adopted (incl. D4 Phase 1a now, Phase 1b conditional; D15 local TLS-inspecting broker; D16 unenforced runs dev-only) | owner instruction | defaults stand unless the owner changes them |
+| 2026-10-15 | G6 | Codex disqualified for K0 (declares tools via `additional_tools`); live K0 campaigns use Claude only; Codex runs dev-only `K0-unenforced` (D16) until an alternative is qualified in P1b | qualification evidence | runs/qualify/20261015T105932Z |
+| 2026-10-15 | G7 | Aggregate CPU quota unenforceable without root (`Delegate=cpu`); accept concurrency caps + per-process RLIMIT_CPU + wall time; ask owner if a hard aggregate CPU bound is needed | host limitation | J4.slice_cpu unqualified |

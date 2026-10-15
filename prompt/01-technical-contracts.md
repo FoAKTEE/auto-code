@@ -557,11 +557,14 @@ Any policy violation blocks the request and fails the job closed.
 - *Codex 0.160.1 (ChatGPT auth):*
   - It uses `chatgpt.com/backend-api/codex/responses` over a **WebSocket**, so the broker must
     inspect client frames.
-  - With the feature-disable set, the `response.create` frames carry **no `tools` key**.
+  - With the feature-disable set, the `response.create` frames carry no top-level `tools` key, but
+    tools are still declared in an `input` item of type `additional_tools` (M0 qualification).
+    The broker inspects input items and blocks such frames. Codex is therefore not K0-qualified.
   - It also sends analytics (`/backend-api/codex/analytics-events/events`) and OTLP metrics
     (`ab.chatgpt.com`). M0 tests whether blocking these breaks calls.
 - *Broker policy follows from these facts.* Allowlist exact (host, method, path) triples; the tool
-  set must be ⊆ {`StructuredOutput`, `DeferredToolPlaceholder`} for Claude, and absent for Codex.
+  set must be ⊆ {`StructuredOutput`, `DeferredToolPlaceholder`} for Claude. For Codex it must be absent,
+  both as a top-level key and as `additional_tools` input items.
 
 If TLS interception cannot be qualified (for example, because of pinning), a campaign **cannot claim
 K0** (D16). In that case only CLI configuration plus telemetry is available, and it is labelled

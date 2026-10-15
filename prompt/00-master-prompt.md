@@ -1,6 +1,8 @@
 # Master self-prompt — zkqec: a modular multi-agent zero-knowledge QEC code-discovery workflow
 
-> **Status:** v0.5 — FINAL for Phase 1a.
+> **Status:** v0.5.1 — FINAL for Phase 1a.
+> - v0.5.1 corrects the ground truth after M0 qualification: Codex is not tool-free, and aggregate
+>   CPU quota is unavailable on this host.
 > - The owner approved starting the build with the default decisions: "upon finish prompt editing,
 >   proceed to begin the project".
 > - Codex's v0.4 verdict was "yes-with-listed-edits — Phase 1a", and those edits are applied here
@@ -172,8 +174,15 @@ by us. Fixtures are trusted test data and are exempt from the D10 caps.
   - It also offers `--max-budget-usd`, and `--system-prompt` replaces the default system prompt,
     which otherwise carries environment details.
 - **Codex.**
-  - Via WebSocket to `chatgpt.com/backend-api/codex/responses`. With the feature-disable set, its
-    `response.create` frames have no `tools` key, and `--output-schema` worked.
+  - It talks over a WebSocket to `chatgpt.com/backend-api/codex/responses`, and `--output-schema`
+    works.
+  - **Correction (M0 qualification 20261015T105932Z):** the frames have no top-level `tools` key,
+    but Codex 0.160.1 declares tools inside an `input` item of type `additional_tools`. That holds
+    even with every disable flag: `functions.exec/wait/request_user_input(_async)` and six
+    `collaboration.*` agent tools.
+  - **So Codex is not tool-free and is disqualified for K0 (D16).** The broker blocks those frames.
+    Codex runs are dev-only and labelled `K0-unenforced` until an alternative is qualified, such as
+    broker-side stripping or a pinned older CLI (P1b).
   - Analytics and OTLP endpoints still need blocking tests.
 - **TLS interception works for both CLIs**, via `NODE_EXTRA_CA_CERTS` and via
   `SSL_CERT_FILE`/`CODEX_CA_CERTIFICATE`.
@@ -185,6 +194,9 @@ by us. Fixtures are trusted test data and are exempt from the D10 caps.
     lines, and there is no quota-block file.
 - **Runtime.**
   - systemd 249: `RuntimeMaxSec` applies to scopes, not slices.
+  - The user manager delegates only the `memory` and `pids` controllers, so an aggregate
+    `CPUQuota` is **not enforced**. Mitigations: concurrency caps, per-process `RLIMIT_CPU`, and
+    per-job wall time. The full fix needs root (`Delegate=cpu` on `user@.service`).
   - `python3 -m venv` fails here (no ensurepip). uv 0.13.1 works and offers standalone CPython
     3.10.22, which becomes the archived runtime (§M).
 
@@ -364,7 +376,7 @@ There are no dashboards.
 | Role | Phase | Produces (proposals only) | Default model (D2) |
 |---|---|---|---|
 | Designer-A | 1a | component edits: explicit matrices or two-block params, bases, operation witnesses | Claude Opus 5.5 |
-| Designer-B | 1b | same, independently | Codex gpt-6-astra (max), if qualified tool-free |
+| Designer-B | 1b | same, independently | Codex gpt-6-astra (max) **only after** a tool-free path is qualified; otherwise a second Claude configuration, labelled as not cross-family |
 | Skeptic (always the other family from the reviewed proposer) | 1b | structured counterexample *requests* that verifiers execute | the other family |
 | Route agent (S-F) | 1b | conditional routes within the operation class, falsifiers, revisions | Claude Opus 5.5 |
 | Commentator | 1b | prose only in the quarantined commentary appendix | Claude Sonnet 5.5 |
