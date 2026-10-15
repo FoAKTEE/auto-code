@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..agents.providers import ClaudeCallProvider
+from ..agents.providers import ClaudeCallProvider, check_reservation
 from ..broker.launcher import Broker
 from ..sandbox.cgroup import CampaignSlice, DeadlineSupervisor
 from .campaign import CampaignConfig, run_campaign
@@ -24,6 +24,7 @@ def run_live(cfg: CampaignConfig, run_root: Path, *, deadline_seconds: int = 360
              memory_max: int = 64 * 1024**3, tasks_max: int = 4096) -> dict[str, Any]:
     if cfg.provider != "claude" or cfg.profile.knowledge != "K0":
         raise ValueError("live K0 campaigns are qualified for the claude provider only (D16)")
+    check_reservation(cfg.model, cfg.per_call)          # §K: reservation ≥ max charge, before any effect
     ops = Path(run_root) / f"{cfg.campaign_id}.ops"
     ops.mkdir(parents=True, exist_ok=False)
     ident = re.sub(r"[^A-Za-z0-9_]", "_", cfg.campaign_id)[:48]   # systemd/broker identifier rule

@@ -4,7 +4,9 @@
 tool-free; Codex declares tools via ``additional_tools`` and is K0-unenforced, D16). Ceilings are
 derived from the job's reservation and enforced at the broker (requests, input bytes, output tokens)
 and by the CLI (``--max-budget-usd``); the scope's wall time bounds the call. Usage comes from the
-broker log (authoritative for tokens/requests) and the CLI JSON (list-price USD). Incomplete
+broker log (authoritative for tokens/requests) and the CLI JSON (list-price USD). The reservation
+must cover the maximum charge of those ceilings under the declared price table
+(:func:`check_reservation`, enforced before a live campaign starts). Incomplete
 telemetry or a possibly-billed failure is reported as ``uncertain`` so the job keeps its full
 reservation (§K).
 """
@@ -15,12 +17,56 @@ from pathlib import Path
 from typing import Any
 
 from ..broker.launcher import Broker, Ceilings, summarize_job
+from ..broker.policy import Grant, reservation_bound
 from ..contracts import Reservation, content_hash
 from ..orchestrator.campaign import CallResult
 from ..sandbox.cgroup import CampaignSlice
 from ..sandbox.profiles import agent_call_profile
 from ..sandbox.runner import JobSpec, Limits, run_job
 from .launch import CallSpec, claude_call
+
+
+PRICES = Path(__file__).resolve().parents[3] / "configs" / "broker" / "prices.json"
+
+
+class ReservationBelowBound(ValueError):
+    """A per-call USD reservation that does not cover the §K maximum charge of its ceilings."""
+
+
+def call_ceilings(reservation: Reservation) -> Ceilings:
+    """Broker ceilings of one call, derived from its reservation (the only derivation)."""
+    return Ceilings(max_model_requests=max(1, reservation.requests),
+                    max_total_requests=max(1, reservation.requests) + 4,
+                    max_input_bytes=reservation.input_tokens,           # bytes ≥ tokens (§K)
+                    max_output_tokens=reservation.output_tokens,
+                    ttl_seconds=reservation.wall_seconds + 60)
+
+
+def reservation_floor(model: str, reservation: Reservation, prices: dict | None = None) -> float | None:
+    """§K maximum total charge of one call: model-request ceiling × (input bound × the highest input
+    price of any tier, cache writes included, + output ceiling × the highest output price), from the
+    declared price table. None when the model has no declared price."""
+    table = prices if prices is not None else json.loads(PRICES.read_text())
+    row = table.get("models", {}).get(model) or {}
+    p_in = [v for k, v in row.items() if k.startswith(("input", "cache_write")) and v is not None]
+    p_out = [v for k, v in row.items() if k.startswith("output") and v is not None]
+    if not p_in or not p_out:
+        return None
+    c = call_ceilings(reservation)
+    grant = Grant("bound", "claude", frozenset([model]), c.max_model_requests, c.max_total_requests,
+                  c.max_input_bytes, c.max_output_tokens, 0)
+    return reservation_bound(grant, max(p_in), max(p_out))
+
+
+def check_reservation(model: str, reservation: Reservation) -> float:
+    """The floor, or :class:`ReservationBelowBound` if the reservation does not cover it."""
+    floor = reservation_floor(model, reservation)
+    if floor is None:
+        raise ReservationBelowBound(f"{model} has no declared price in {PRICES.name}")
+    if reservation.usd < floor - 1e-9:
+        raise ReservationBelowBound(f"per-call reservation ${reservation.usd} is below the §K bound "
+                                    f"${floor:.4f} of its ceilings for {model}")
+    return floor
 
 
 class ClaudeCallProvider:
@@ -34,11 +80,7 @@ class ClaudeCallProvider:
 
     def call(self, *, job_id: str, system_prompt: str, request: str, schema: dict,
              reservation: Reservation) -> CallResult:
-        ceil = Ceilings(max_model_requests=max(1, reservation.requests),
-                        max_total_requests=max(1, reservation.requests) + 4,
-                        max_input_bytes=reservation.input_tokens,       # bytes ≥ tokens (§K)
-                        max_output_tokens=reservation.output_tokens,
-                        ttl_seconds=reservation.wall_seconds + 60)
+        ceil = call_ceilings(reservation)
         spec = CallSpec("claude", self.model, system_prompt, request, schema, effort=self.effort,
                         max_budget_usd=reservation.usd, max_output_tokens=reservation.output_tokens,
                         max_retries=max(0, reservation.requests - 1))
