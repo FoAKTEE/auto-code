@@ -31,8 +31,8 @@ def run_live(cfg: CampaignConfig, run_root: Path, *, deadline_seconds: int = 360
     sup = DeadlineSupervisor(slice_, broker.switch_path, time.time() + deadline_seconds)
     sup.arm()
     try:
-        provider = ClaudeCallProvider(cfg.model, broker=broker, slice_=slice_, jobs_root=ops / "jobs",
-                                      effort=cfg.effort)
+        provider = ClaudeCallProvider(cfg.model, broker=broker, slice_=slice_,
+                                      jobs_root=Path(f"/tmp/zkq-{ident}"), effort=cfg.effort)
         out = run_campaign(cfg, provider, Path(run_root))
         out["broker_manifest"] = broker.manifest()
         (Path(out["run_dir"]) / "broker-manifest.json").write_text(

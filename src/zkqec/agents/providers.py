@@ -43,9 +43,12 @@ class ClaudeCallProvider:
                         max_budget_usd=reservation.usd, max_output_tokens=reservation.output_tokens,
                         max_retries=max(0, reservation.requests - 1))
         launch = claude_call(spec)
-        token = self.broker.grant(job_id, "claude", [self.model], ceil)
+        # AF_UNIX socket paths are limited to 108 bytes: the sandbox job (and its broker grant) use a
+        # 16-hex prefix of the job id under a short host jobs root.
+        sandbox_job = job_id[:16]
+        token = self.broker.grant(sandbox_job, "claude", [self.model], ceil)
         try:
-            res = run_job(JobSpec(job_id, agent_call_profile("claude"), launch.argv, launch.env,
+            res = run_job(JobSpec(sandbox_job, agent_call_profile("claude"), launch.argv, launch.env,
                                   inputs=launch.inputs, home_files=launch.home_files,
                                   stdin_input=launch.stdin_input,
                                   limits=Limits(wall_seconds=reservation.wall_seconds),
@@ -54,7 +57,7 @@ class ClaudeCallProvider:
                           self.jobs_root, self.slice, blocked_probe=self.broker.blocked_reason)
         finally:
             self.broker.revoke(token)
-        summ = summarize_job(self.broker.records(job_id))
+        summ = summarize_job(self.broker.records(sandbox_job))
         cli: dict[str, Any] = {}
         try:
             cli = json.loads(res.stdout.decode("utf-8", "replace") or "{}")
@@ -76,6 +79,9 @@ class ClaudeCallProvider:
                                             "duration_api_ms", "is_error", "stop_reason", "subtype")}
             if isinstance(cli, dict) else {},
             "stdout_sha256": content_hash(res.stdout.decode("utf-8", "replace")),
+            # Raw CLI JSON (result, usage, cost); the artifact store sanitizes before hashing (§M).
+            "cli_stdout": res.stdout.decode("utf-8", "replace")[:1_000_000],
+            "sandbox_job_id": sandbox_job,
             "telemetry_complete": bool(usage_known),
         }
         tokens = summ["usage"] if usage_known else {}
