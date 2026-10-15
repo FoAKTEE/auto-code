@@ -17,6 +17,9 @@
         "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
       },
       "confirmation": {
+        "basis": "pre-B6",
+        "required": false,
+        "status": "pre-B6",
         "supplement": null
       },
       "evaluated": [],
@@ -58,6 +61,9 @@
         "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
       },
       "confirmation": {
+        "basis": "pre-B6",
+        "required": false,
+        "status": "pre-B6",
         "supplement": null
       },
       "evaluated": [
@@ -112,6 +118,9 @@
         "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
       },
       "confirmation": {
+        "basis": "pre-B6",
+        "required": false,
+        "status": "pre-B6",
         "supplement": null
       },
       "evaluated": [
@@ -169,6 +178,7 @@
         "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
       },
       "confirmation": {
+        "basis": "inferred from sealed broker evidence",
         "final_totals": {
           "cpu_seconds": 22.47167401,
           "input_tokens": 6503.0,
@@ -177,7 +187,9 @@
           "usd": 0.29522840000000006,
           "wall_seconds": 140.78195997606963
         },
+        "required": true,
         "sha256": "c9522a499c1ea963b789e98aac677ea0e8c7cc0205ef1d114599a81b8b3714d2",
+        "status": "linked",
         "supplement": "f4f8dd9d8077d520c940efa36c31af39a1b048bd8ea5be28ea0e020a5e1e10b3.confirmation.json"
       },
       "evaluated": [
@@ -232,6 +244,7 @@
         "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
       },
       "confirmation": {
+        "basis": "inferred from sealed broker evidence",
         "final_totals": {
           "cpu_seconds": 44.012025932,
           "input_tokens": 6503.0,
@@ -240,7 +253,9 @@
           "usd": 0.6774557999999999,
           "wall_seconds": 376.221563776955
         },
+        "required": true,
         "sha256": "8538b9eefa6cb41f1ba5c2eba9652fe42791379eb26997bccfdb29caf62c5b3d",
+        "status": "linked",
         "supplement": "924c2f02e3d7f3553c9bd28e27ebc38684631c1e1c04dbf8b9f598097151ccf2.confirmation.json"
       },
       "evaluated": [
@@ -268,7 +283,7 @@
         "hash": "3cab5f6c8a0a88d598d4643e6abd734f39ae6fad3706147aee56b4c16f522a15",
         "seq": 50
       },
-      "note": "second hardening round, read-only snapshot (9458710); controls passed; M1 acceptance run",
+      "note": "second hardening round (9458710); superseded by the re-review (N1-N5)",
       "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-5/924c2f02e3d7f3553c9bd28e27ebc38684631c1e1c04dbf8b9f598097151ccf2.tar.zst",
       "spend": {
         "cpu_seconds": 13.4492,
@@ -278,9 +293,75 @@
         "usd": 0.677456,
         "wall_seconds": 330.808
       }
+    },
+    {
+      "audit": {
+        "ok": true,
+        "problems": []
+      },
+      "bundle_sha256": "29ac9d25c92ef6a10aeb97154372963fa185dffb552e651aa44870ae49b3c46a",
+      "bytes": 131885420,
+      "campaign_id": "m1-live-6",
+      "closures": {
+        "evaluator": "fd847b89a000b42c19e3c9f7caa7e2f1b427ee18aef622654bc046cd4268a364",
+        "git_commit": "6e7e610c49efd142de50b0e7beb88d7338e326d2",
+        "lock_sha256": "4347389f85529a2da685f464f12a6746d6208da6ba1c7ec995afa535ac2563b4",
+        "runtime": "608529a930a6266bb3fd617dc5c281d3ef39b8abce833303d577aa0321677551",
+        "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
+      },
+      "confirmation": {
+        "basis": "declared",
+        "final_totals": {
+          "cpu_seconds": 44.164625888,
+          "input_tokens": 6503.0,
+          "output_tokens": 14766.0,
+          "requests": 2.0,
+          "usd": 0.3318684,
+          "wall_seconds": 204.91497278492898
+        },
+        "required": true,
+        "sha256": "a37cbb4ddda057ea6e43571d22b77bf86b2c49c20640209a88b95dfcf2e9e4bb",
+        "status": "linked",
+        "supplement": "29ac9d25c92ef6a10aeb97154372963fa185dffb552e651aa44870ae49b3c46a.confirmation.json"
+      },
+      "evaluated": [
+        {
+          "candidate": "1016c96ed5f742fc",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sa-live-1"
+        },
+        {
+          "candidate": "ea493c6ce89fe94e",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sf-live-1"
+        }
+      ],
+      "evaluator_commit": "6e7e610c49efd142de50b0e7beb88d7338e326d2",
+      "format": "zkqec-bundle-v2",
+      "labels": [
+        "single-implementation",
+        "non-evaluation",
+        "M1-live-slice"
+      ],
+      "ledger_head": {
+        "hash": "aae2348a7c83728ba4d20aa5be549678a190d7a92d311800f0b628759f060abf",
+        "seq": 50
+      },
+      "note": "third hardening round, read-only snapshot (6e7e610); controls passed; M1 acceptance run",
+      "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-6/29ac9d25c92ef6a10aeb97154372963fa185dffb552e651aa44870ae49b3c46a.tar.zst",
+      "spend": {
+        "cpu_seconds": 13.2719,
+        "input_tokens": 6503.0,
+        "output_tokens": 14766.0,
+        "requests": 2.0,
+        "usd": 0.331868,
+        "wall_seconds": 159.757
+      }
     }
   ],
-  "indexed_utc": "2026-10-15T20:30:23Z",
-  "indexed_with_commit": "94f79e3b3a2a636d1cfac4ce3ce430573f557d77",
+  "indexed_utc": "2026-10-15T21:50:25Z",
+  "indexed_with_commit": "6e7e610c49efd142de50b0e7beb88d7338e326d2",
   "schema": "zkqec.bundle-index/1"
 }
