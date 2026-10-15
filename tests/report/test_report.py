@@ -60,4 +60,4 @@ def test_commentary_is_allowed_only_after_marker(env):
 def test_report_cites_receipts(env):
     adm, dom, camp = env
     md = render(adm, dom, camp)
-    assert "distance_lower_bound" in md and "l2.distance 1.0.0" in md
+    assert "distance_lower_bound" in md and "l2.distance 1.1.0" in md

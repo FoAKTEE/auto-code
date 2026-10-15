@@ -79,7 +79,7 @@ def build_registry(store: ArtifactStore) -> VerifierRegistry:
         return code_sha(hx, hz)
 
     reg.register("l1.css_algebra", "1.0.0", l1)
-    reg.register("l2.distance", "1.0.0", l2)
+    reg.register("l2.distance", "1.1.0", l2)
     reg.register("l3.logical_action", "1.0.0", l3)
     reg.register_identity("identity.code_sha", "1.0.0", ident)
     return reg

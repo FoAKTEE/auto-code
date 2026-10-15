@@ -18,7 +18,15 @@ not in the opposite stabilizer row space — a basis-free test). Every run, comp
 completed-range record. A preflight refusal, a budget exception or a deadline yields ``unknown``
 on ``distance_lower_bound(sector, 2t+1)`` and **no bound at all**.
 
-Enumeration is the vendored kernel's ``sector_distance`` (complete syndrome-collision MITM).
+Enumeration is the vendored kernel's ``sector_distance`` (complete syndrome-collision MITM), run on
+the canonical RREF row bases of ``H_X`` and ``H_Z`` (the same row spaces, hence the same code, code
+hash, logical basis and certificate): the kernel encodes one syndrome bit per check row, so redundant
+rows would widen every syndrome integer beyond the rank the memory estimate assumes. The preflight
+memory estimate is preprocessing (input copies, row reduction, CSS check, logical basis; estimated
+from the input shapes, whose size the grammar caps bound) plus the enumeration at the exact syndrome
+width; a refusal is ``budget_exhausted`` before any enumeration. Process-level memory is
+additionally bounded by the campaign cgroup slice (§J4); an OS kill is ``resource_killed``
+(``unknown``).
 """
 from __future__ import annotations
 
@@ -39,9 +47,9 @@ from ..kernel.distance import EnumerationBudgetExceeded, sector_distance
 from .common import (ArtifactSink, VerifierId, binary_matrix, css_violations, proposition,
                      refusal, result, store)
 
-VERIFIER = VerifierId("zkqec.verify.distance", "1.0.0", "L2",
+VERIFIER = VerifierId("zkqec.verify.distance", "1.1.0", "L2",
                       ("distance_lower_bound", "distance_upper_bound"))
-WITNESS_VERIFIER = VerifierId("zkqec.verify.logical_witness", "1.0.0", "L2",
+WITNESS_VERIFIER = VerifierId("zkqec.verify.logical_witness", "1.1.0", "L2",
                               ("distance_upper_bound",))
 M_ENUM = "complete_syndrome_collision_enumeration(zkqec.kernel.distance.sector_distance)"
 M_WITNESS = "logical_witness_recheck_v1"
@@ -73,10 +81,19 @@ def half_patterns(n: int, t: int) -> int:
 
 def memory_estimate(n: int, k: int, r: int, m: int) -> int:
     """Conservative bytes for the kernel's buckets: every pattern in its own bucket, CPython 3.10
-    object sizes (dict slot + key int + list + 2-tuple + two ints), plus the syndrome columns."""
+    object sizes (dict slot + key int + list + 2-tuple + two ints), plus the syndrome columns.
+    ``r`` must be the syndrome width the kernel actually uses (here: the rank, after reduction)."""
     words = (lambda bits: 28 + 4 * max(1, -(-bits // 30)))
     per_pattern = 104 + words(r) + 64 + 64 + words(n) + words(k)
     return m * per_pattern + 2 * n * (words(r) + words(k)) + (1 << 20)
+
+
+def preprocess_estimate(rows: int, n: int) -> int:
+    """Conservative bytes for preprocessing ``rows`` input check rows of length ``n``: binary
+    validation and uint8 copies (with boolean temporaries), RREF row reduction, the int64 CSS check
+    on the reduced bases, and the kernel's canonical logical basis (nullspace / quotient /
+    inverse, O(n^2) uint8 with temporaries)."""
+    return 12 * rows * n + 96 * n * n + (2 << 20)
 
 
 def pair_work_lower_bound(m: int, r: int) -> int:
@@ -85,11 +102,14 @@ def pair_work_lower_bound(m: int, r: int) -> int:
     return max(0, (m * m // buckets - m) // 2)
 
 
-def preflight(n: int, k: int, r: int, t: int, budget: DistanceBudget) -> dict[str, Any]:
-    """§C1 checks before any enumeration; ``r`` = GF(2) rank of the sector's syndrome matrix."""
+def preflight(n: int, k: int, r: int, t: int, budget: DistanceBudget, *,
+              preprocess_bytes: int = 0) -> dict[str, Any]:
+    """§C1 checks before any enumeration; ``r`` = GF(2) rank of the sector's syndrome matrix (the
+    syndrome width of the reduced matrix the kernel enumerates on)."""
     m = half_patterns(n, t)
-    rec = {"n": n, "k": k, "syndrome_rank": r, "half_weight": t, "half_patterns": m,
-           "memory_bytes_estimate": memory_estimate(n, k, r, m),
+    rec = {"n": n, "k": k, "syndrome_rank": r, "syndrome_width": r, "half_weight": t,
+           "half_patterns": m, "preprocess_bytes_estimate": preprocess_bytes,
+           "memory_bytes_estimate": preprocess_bytes + memory_estimate(n, k, r, m),
            "pair_work_lower_bound": pair_work_lower_bound(m, r),
            "pair_work_upper_bound": m * (m - 1) // 2, "budget": asdict(budget)}
     reasons = []
@@ -154,12 +174,20 @@ def _witness(hx, hz, sector, v, csha, sink) -> str:
 
 
 def _load(hx, hz) -> tuple[np.ndarray, np.ndarray, str | None]:
+    """Binary-validate and reduce to canonical RREF row bases (same row spaces, so the same code
+    and the same logical/stabilizer membership tests); CSS validity is checked on the bases."""
     hx, hz = binary_matrix(hx, "hx"), binary_matrix(hz, "hz")
     if hx.shape[1] != hz.shape[1] or hx.shape[1] < 1:
         return hx, hz, "hx and hz need a common positive number of columns"
+    hx, hz = gf2.row_basis(hx), gf2.row_basis(hz)
     if len(css_violations(hx, hz)):
         return hx, hz, "presentation is not CSS-valid"
     return hx, hz, None
+
+
+def _shape(a) -> tuple[int, int]:
+    shape = np.shape(a)
+    return (int(shape[0]), int(shape[1])) if len(shape) == 2 else (0, 0)
 
 
 def certify_distance(hx, hz, half_weight: int, *, artifact_sink: ArtifactSink,
@@ -175,6 +203,8 @@ def certify_distance(hx, hz, half_weight: int, *, artifact_sink: ArtifactSink,
             or not hasattr(signal, "setitimer")):
         raise ValueError("budget.max_seconds needs SIGALRM in the main thread; "
                          "enforce wall-clock limits in the job runner instead")
+    (rx, nx), (rz, nz) = _shape(hx), _shape(hz)
+    pre_bytes = preprocess_estimate(rx + rz, max(nx, nz))
     hx, hz, problem = _load(hx, hz)
     if hx.shape[1] != hz.shape[1] or hx.shape[1] < 1:
         raise ValueError(problem)
@@ -184,7 +214,7 @@ def certify_distance(hx, hz, half_weight: int, *, artifact_sink: ArtifactSink,
     if problem:
         return [refusal(proposition("distance_lower_bound", "code", csha, sector=s, d=2 * t + 1),
                         M_ENUM, problem, outcome="premise_refuted") for s in sectors]
-    code = CSSCode(hx, hz)
+    code = CSSCode(hx, hz)                 # reduced bases: syndrome width = rank
     n, k = code.n, code.k
     if t > n:
         raise ValueError(f"half_weight {t} exceeds n = {n}")
@@ -195,7 +225,7 @@ def certify_distance(hx, hz, half_weight: int, *, artifact_sink: ArtifactSink,
                                outcome="unsupported", completion="unsupported"))
             continue
         h, _ = _sector_matrices(hx, hz, s)
-        pre = preflight(n, k, gf2.rank(h), t, budget)
+        pre = preflight(n, k, int(h.shape[0]), t, budget, preprocess_bytes=pre_bytes)
         record = {"kind": "distance_completed_range_v1", "code": csha, "sector": s, "n": n, "k": k,
                   "t": t, "method": M_ENUM, "verifier": VERIFIER.as_dict(), "preflight": pre}
         if not pre["ok"]:

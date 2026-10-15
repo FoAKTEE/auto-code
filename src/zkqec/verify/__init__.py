@@ -10,8 +10,8 @@ verifier (name, version)               entrypoints                              
 zkqec.verify.css_algebra 1.0.0 (L1)    analyze, css_valid, block_length_eq,      css_valid, ...
                                        dimension_eq, max_check_weight_eq,
                                        max_qubit_degree_eq (+ canonical_basis)
-zkqec.verify.distance 1.0.0 (L2)       certify_distance (+ preflight)            distance_*_bound
-zkqec.verify.logical_witness 1.0.0     validate_logical_witness                  distance_upper_bound
+zkqec.verify.distance 1.1.0 (L2)       certify_distance (+ preflight)            distance_*_bound
+zkqec.verify.logical_witness 1.1.0     validate_logical_witness                  distance_upper_bound
 zkqec.verify.logical_action 1.0.0 (L3) implements (+ compute_logical_action)     implements
 =====================================  ========================================  =============
 """

@@ -275,3 +275,27 @@ def test_bb72_distance_six_certified_by_complete_t3_enumeration(sink):
     res = certify_distance(hx, hz, 3, artifact_sink=sink)
     assert set(bounds(res).values()) == {6} and len(bounds(res)) == 4
     assert_witnesses_reverified(res, hx, hz, sink)
+
+
+# --- Codex M1 review #11: preflight must cover redundant syndrome rows and preprocessing ----------
+def test_memory_preflight_covers_redundant_syndrome_rows(sink):
+    n = 101
+    hz = np.zeros((4096, n), dtype=np.uint8)
+    hz[np.arange(4096), np.arange(4096) % 100] = 1          # 4096 rows spanning e_0..e_99
+    hx = np.zeros((0, n), dtype=np.uint8)
+    probe = certify_distance(hx, hz, 2, artifact_sink=sink)
+    est = max(sink.get(r.artifacts[0])["preflight"]["memory_bytes_estimate"] for r in probe
+              if r.proposition.predicate == "distance_lower_bound")
+    tracemalloc.start()
+    try:
+        res = certify_distance(hx, hz, 2, artifact_sink=sink,
+                               budget=DistanceBudget(max_memory_bytes=est))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert {r.completion for r in res} == {"completed"}      # accepted at a ceiling = estimate
+    assert peak <= est, (peak, est)
+    assert bounds(res) == bounds(probe) == {("distance_lower_bound", "X"): 1,
+                                            ("distance_upper_bound", "X"): 1,
+                                            ("distance_lower_bound", "Z"): 1,
+                                            ("distance_upper_bound", "Z"): 1}
