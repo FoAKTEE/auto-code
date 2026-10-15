@@ -615,7 +615,7 @@ class Qualifier:
                   summarize_job(recs_i)["model_requests"] == 0 and summarize_job(recs_o)["model_requests"] == 0,
                   "ceiling-violating requests were never forwarded (0 model requests, nothing to settle)",
                   [{"would_be_bound_usd": blocked_potential}]),
-            note="Prices are declared M0 values derived from CLI reports (configs/broker/prices.json); Codex has "
+            note="Prices are Anthropic list prices (configs/broker/prices.json, fetched 2026-10-15); Codex has "
                  "no declared price (subscription)."))
         bu = summ["usage"] if isinstance(summ["usage"], dict) else {}
         cu = cli.get("usage") or {}
