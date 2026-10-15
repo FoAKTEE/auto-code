@@ -39,3 +39,17 @@
   works for both. `~/.local/bin/codex` silently falls back to Claude on usage limits; use `~/.local/node/bin/codex`.
 - Prompt v0.5 is final for Phase 1a; owner instructed to proceed with defaults (G5). Build started: `.venv` (uv,
   pinned + hash lock), kernel vendored byte-identically, 64/64 upstream tests pass.
+
+## 2026-10-15 — Phase 1a build (M0 + M1) in progress
+- Landed: env scaffold + hash lock (d54f1a6); kernel vendored (a93de63); standalone CPython 3.10.22 runtime
+  (a5fac07); contracts (5b375f7); kernel fix KD-1 + supersession guard (9a91887); designer contracts + prompt
+  linter (f4e1b23); B1 random two-block baseline (310f238).
+- Running in parallel (separate file ownership, lead commits): (A) store + admission ledger + resolver;
+  (B) grammar + identity + verifiers L0–L3; (C) M0 sandbox + cgroup slice + TLS-inspecting broker + CLI launch +
+  `qualify-host`.
+- Planned M1 live tasks (cheap to certify; final values fixed after B reports measured feasibility):
+  S-A `sa-live-1`: n_max 60, k_min 4, d_min 4, w_max 6, deg_max 6 (d ≥ 4 needs exclusion through weight 3:
+  t = 2 MITM, C(60,≤2) = 1831 half-patterns). S-F `sf-live-1`: k_req 2, target logical SWAP
+  (X1↔X2, Z1↔Z2), allowed class qubit_permutation, n_max 40, k_min 2, d_min 3.
+- Deterministic positive fixtures (no LLM): S-A — bicycle_chain(3,7) [[42,6,6]] as explicit_sparse against
+  (n_max 50, k_min 6, d_min 6, w_max 8); S-F — B's verified permutation fixture.
