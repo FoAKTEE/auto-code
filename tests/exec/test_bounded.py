@@ -3,6 +3,7 @@ by ``wait4`` and only an ``ok`` run carries a value (Codex M1 review B5; appendi
 import os
 import signal
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -388,3 +389,124 @@ def test_an_ignored_sigchld_is_refused():
             run_bounded(_quick, limits=Limits(5, 10, 256 * 2**20))
     finally:
         signal.signal(signal.SIGCHLD, old)
+
+
+# --- Codex M1 re-review 5: asynchronous interrupts anywhere in the lifecycle (B1 combined, B2) ------
+class _Interrupted(Exception):
+    pass
+
+
+@pytest.fixture
+def real_sigint():
+    """A real SIGINT to this process raises _Interrupted (not KeyboardInterrupt, which pytest owns)."""
+    def handler(signum, frame):
+        raise _Interrupted()
+    old = signal.signal(signal.SIGINT, handler)
+    yield lambda: os.kill(os.getpid(), signal.SIGINT)
+    signal.signal(signal.SIGINT, old)
+
+
+def _sleep_writing_pid(path):
+    with open(path, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(30)
+
+
+def _fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+def _dead(pid, timeout=3.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+        except OSError:
+            return True
+        if stat[stat.rindex(")") + 2] in "ZX":
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_ownership_loss_with_an_interrupt_and_no_pidfd_sends_no_signal(monkeypatch, real_sigint, nested):
+    import zkqec.exec.bounded as bounded
+    if nested:
+        monkeypatch.setattr(bounded, "_IN_BOUNDED_CHILD", True)
+    events = []
+    real_waitpid = os.waitpid
+
+    def no_pidfd(pid):
+        raise OSError(38, "pidfd_open unavailable")
+
+    def foreign_reaper_then_interrupt(idtype, ident, options):
+        real_waitpid(ident, 0)
+        events.append(("reaped", ident))
+        real_sigint()                                         # lands before ownership is cleared
+        raise ChildProcessError(10, "No child processes")
+    _record_signals(monkeypatch, bounded, events)
+    monkeypatch.setattr(bounded.os, "pidfd_open", no_pidfd)
+    monkeypatch.setattr(bounded.os, "waitid", foreign_reaper_then_interrupt)
+    with pytest.raises(_Interrupted):
+        run_bounded(_quick, limits=Limits(5, 10, 256 * 2**20))
+    i, child = next((k, e[1]) for k, e in enumerate(events) if e[0] == "reaped")
+    assert [e for e in events[i + 1:] if e[0] == "signal" and e[2] == child] == []
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_an_interrupt_during_setup_still_kills_and_reaps_the_child(monkeypatch, real_sigint, tmp_path,
+                                                                   nested):
+    import zkqec.exec.bounded as bounded
+    if nested:
+        monkeypatch.setattr(bounded, "_IN_BOUNDED_CHILD", True)
+    real_open = os.pidfd_open
+
+    def open_then_interrupt(pid, *a):
+        fd = real_open(pid, *a)
+        real_sigint()                                         # before the lifecycle try/finally
+        return fd
+    monkeypatch.setattr(bounded.os, "pidfd_open", open_then_interrupt)
+    marker = tmp_path / "child"
+    before, t0 = _fds(), time.monotonic()
+    with pytest.raises(_Interrupted):
+        run_bounded(_sleep_writing_pid, str(marker), limits=Limits(60, 60, 256 * 2**20))
+    assert time.monotonic() - t0 < 10                        # the interrupt was honoured promptly
+    end = time.time() + 3
+    while not marker.exists() and time.time() < end:
+        time.sleep(0.02)
+    if marker.exists():
+        assert _dead(int(marker.read_text()))
+    assert _fds() == before                                   # pipe and pidfd closed
+
+
+def test_an_interrupt_during_the_final_cleanup_leaks_no_descriptor(monkeypatch, real_sigint):
+    import zkqec.exec.bounded as bounded
+    real_reap = bounded._reap
+
+    def reap_then_interrupt(pid):
+        out = real_reap(pid)
+        real_sigint()
+        return out
+    monkeypatch.setattr(bounded, "_reap", reap_then_interrupt)
+    before = _fds()
+    with pytest.raises(_Interrupted):
+        run_bounded(_quick, limits=Limits(5, 10, 256 * 2**20))
+    assert _fds() == before
+
+
+def test_a_bounded_child_dies_with_its_parent(tmp_path):
+    marker = tmp_path / "child"
+    code = ("import sys, time\nfrom zkqec.exec import Limits, run_bounded\n"
+            "sys.path.insert(0, %r)\nimport test_bounded as t\n"
+            "run_bounded(t._sleep_writing_pid, %r, limits=Limits(60, 60, 256 * 2**20))\n"
+            % (os.path.dirname(__file__), str(marker)))
+    parent = subprocess.Popen([sys.executable, "-c", code])
+    end = time.time() + 20
+    while not marker.exists() and time.time() < end:
+        time.sleep(0.05)
+    assert marker.exists()
+    parent.kill()
+    parent.wait()
+    assert _dead(int(marker.read_text()))

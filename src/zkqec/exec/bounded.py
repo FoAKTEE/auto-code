@@ -32,6 +32,16 @@ child found already reaped (``ECHILD``) is never signalled again and the outcome
 ``ownership_lost`` (charged at the reservation). The process must not reap children it does not own:
 ``run_bounded`` refuses to start while ``SIGCHLD`` is ignored (the kernel would reap the child).
 
+Asynchronous interrupts (re-review 5). In the main thread, the parent-side lifecycle — pipe, fork, pidfd,
+the wait, the kill, the drain, the reap and closing the descriptors — runs with the Python handlers of
+:data:`_DEFERRED` signals replaced by one that only records the signal; a recorded interrupt makes the
+wait loop kill the child and clean up through the ordinary ordered path, and only afterwards are the
+original handlers restored and the recorded signals re-delivered (a ``KeyboardInterrupt`` then surfaces
+with no child, group member or descriptor left). An interrupt therefore never lands between an
+ownership transition and its bookkeeping. The child restores the original handlers, and dies with its
+parent (``PR_SET_PDEATHSIG``). Without a pidfd, a numeric signal is sent only after ``waitid(WNOHANG |
+WNOWAIT)`` positively shows the pid is still this process's unreaped child.
+
 The CPU of processes the parent killed (or found left behind) was never reaped by the child, so
 ``wait4`` did not measure it: ``detail["cpu_complete"]`` is then False and :meth:`BoundedResult.usage`
 omits ``cpu_seconds`` (unmeasured: charged at the reservation, §K), unless the measured lower bound
@@ -56,6 +66,7 @@ import pickle
 import resource
 import select
 import signal
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
@@ -63,6 +74,9 @@ from typing import Any, Callable, Literal
 Outcome = Literal["ok", "cpu_exceeded", "wall_exceeded", "memory_exceeded", "crashed", "escaped"]
 OUTCOMES: tuple[str, ...] = ("ok", "cpu_exceeded", "wall_exceeded", "memory_exceeded", "crashed",
                              "escaped")
+_DEFERRED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGALRM,
+             signal.SIGUSR1, signal.SIGUSR2)
+_POLL_SECONDS = 0.1                     # how soon a recorded interrupt is honoured
 MAX_RESULT_BYTES = 256 * 2**20          # a larger pickled result is a crash, not a value
 _RESERVE_BYTES = 8 * 2**20              # released on MemoryError so the child can still report
 _MESSAGE = 500
@@ -150,12 +164,27 @@ def _nested() -> bool:
         return False
 
 
+def _die_with_parent(parent: int) -> None:
+    """``PR_SET_PDEATHSIG``: the kernel kills this child if its parent dies (an orchestrator killed
+    by SIGKILL or a default-action signal must not leave a bounded child running)."""
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+    if os.getppid() != parent:                  # the parent died before the request took effect
+        os._exit(72)
+
+
 def _child(fn: Callable[..., Any], args: tuple, kwargs: dict, limits: Limits, w: int,
-           nested: bool) -> None:
+           nested: bool, saved: dict, parent: int) -> None:
     """Runs in the forked child; never returns."""
     global _IN_BOUNDED_CHILD, _RESULT_FD
     status = 70
     try:
+        for sig, handler in saved.items():      # the parent's deferral is not the child's
+            signal.signal(sig, handler)
+        _die_with_parent(parent)
         if _RESULT_FD is not None:              # the enclosing child's pipe is not ours to hold
             try:
                 os.close(_RESULT_FD)
@@ -204,14 +233,16 @@ def _child(fn: Callable[..., Any], args: tuple, kwargs: dict, limits: Limits, w:
         os._exit(status)
 
 
-def _still_ours(pidfd: int | None) -> bool:
-    """Whether the child behind ``pidfd`` is still unreaped (running or a zombie we have not
-    reaped): only then does its pid, and so its group id, stay allocated to it."""
-    if pidfd is None:
-        return True
+def _still_ours(pid: int, pidfd: int | None) -> bool:
+    """Whether the child is still this process's unreaped child (running, or a zombie not yet
+    reaped): only then do its pid and group id stay allocated to it. Checked through the pidfd, or
+    without one positively through ``waitid(P_PID, …, WNOHANG | WNOWAIT)``; fails closed."""
     try:
-        os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-    except ChildProcessError:
+        if pidfd is not None:
+            os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        else:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except (ChildProcessError, OSError):
         return False
     return True
 
@@ -223,9 +254,9 @@ def _kill(pid: int, group: bool, pidfd: int | None) -> None:
     def leader():
         if pidfd is not None:
             signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-        else:
+        elif _still_ours(pid, None):
             os.kill(pid, signal.SIGKILL)
-    kills = (lambda: _still_ours(pidfd) and os.killpg(pid, signal.SIGKILL), leader)
+    kills = (lambda: _still_ours(pid, pidfd) and os.killpg(pid, signal.SIGKILL), leader)
     for kill in kills if group else kills[1:]:
         try:
             kill()
@@ -281,7 +312,7 @@ def _drain_group(pgid: int, pidfd: int | None = None) -> tuple[bool, bool]:
     (:func:`_wait_exit`), so ``pgid`` cannot have been reused by another group (re-review 3 B1)."""
     left = False
     end = time.monotonic() + ESCAPE_GRACE_SECONDS
-    while _still_ours(pidfd) and _group_alive(pgid):
+    while _still_ours(pgid, pidfd) and _group_alive(pgid):
         left = True
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -293,6 +324,34 @@ def _drain_group(pgid: int, pidfd: int | None = None) -> tuple[bool, bool]:
     return left, True
 
 
+def _defer_signals(pending: list[int], saved: dict) -> None:
+    """Replace the Python handlers of :data:`_DEFERRED` signals by one that records them (main
+    thread only: Python runs signal handlers in the main thread, so no other thread is interrupted)."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def record(signum, frame):
+        pending.append(signum)
+    for sig in _DEFERRED:
+        handler = signal.getsignal(sig)
+        if handler is None or handler == signal.SIG_IGN:
+            continue
+        saved[sig] = handler
+        signal.signal(sig, record)
+
+
+def _redeliver(pending: list[int], saved: dict) -> None:
+    """Restore the original handlers, then deliver what was recorded while they were deferred."""
+    for sig, handler in saved.items():
+        signal.signal(sig, handler)
+    for sig in dict.fromkeys(pending):
+        handler = saved.get(sig)
+        if callable(handler):
+            handler(sig, None)
+        elif handler == signal.SIG_DFL:
+            signal.raise_signal(sig)
+
+
 def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: Any) -> BoundedResult:
     """Run ``fn(*args, **kwargs)`` in a forked child under ``limits`` (see the module doc)."""
     if not isinstance(limits, Limits):
@@ -300,36 +359,54 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
     if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
         raise RuntimeError("SIGCHLD is ignored: the kernel would reap the child, so run_bounded "
                            "could not own its pid")
+    pending: list[int] = []
+    saved: dict = {}
+    try:
+        _defer_signals(pending, saved)
+        return _lifecycle(fn, args, kwargs, limits, pending, saved)
+    finally:
+        _redeliver(pending, saved)            # after every child, member and descriptor is gone
+
+
+def _lifecycle(fn, args, kwargs, limits: Limits, pending: list[int], saved: dict) -> BoundedResult:
     nested = _nested()
-    r, w = os.pipe()
-    t0 = time.monotonic()
-    pid = os.fork()
-    if pid == 0:                                                  # child
-        os.close(r)
-        _child(fn, args, kwargs, limits, w, nested)
-    os.close(w)
-    owned, lost = True, False             # owned: the child is ours and not reaped; signals allowed
-    try:
-        pidfd = os.pidfd_open(pid)
-    except (AttributeError, OSError):
-        pidfd = None
-    if not nested:
-        try:
-            os.setpgid(pid, pid)              # also set by the child; whichever runs first wins
-        except OSError:
-            pass
+    r = w = pidfd = pid = None
+    owned = lost = killed = oversized = interrupted = False
     chunks: list[bytes] = []
-    size, reaped, killed, oversized = 0, None, False, False
+    size, reaped = 0, None
     left, gone = False, True
+    t0 = time.monotonic()
     try:
+        r, w = os.pipe()
+        parent = os.getpid()
+        pid = os.fork()
+        if pid == 0:                                              # child
+            os.close(r)
+            _child(fn, args, kwargs, limits, w, nested, saved, parent)
+        owned = True                      # the child is ours and not reaped: signals allowed
+        os.close(w)
+        w = None
+        try:
+            pidfd = os.pidfd_open(pid)
+        except (AttributeError, OSError):
+            pidfd = None
+        if not nested:
+            try:
+                os.setpgid(pid, pid)          # also set by the child; whichever runs first wins
+            except OSError:
+                pass
         deadline = t0 + float(limits.wall_seconds)
         while True:
+            if pending:                       # a deferred interrupt: stop the child, clean up
+                interrupted = True
+                _kill(pid, not nested, pidfd)
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 killed = True
                 _kill(pid, not nested, pidfd)
                 break
-            ready, _, _ = select.select([r], [], [], remaining)
+            ready, _, _ = select.select([r], [], [], min(remaining, _POLL_SECONDS))
             if not ready:
                 continue
             chunk = os.read(r, 1 << 20)
@@ -347,19 +424,23 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
         else:
             lost = True                       # reaped elsewhere: never signal this id again
         owned = False                         # before the reap: nothing signals this id afterwards
-        reaped = None if lost else _reap(pid)
-        lost = lost or reaped is None
+        if not lost:
+            reaped = _reap(pid)
+            lost = reaped is None
     finally:
-        os.close(r)
-        if owned:                             # interrupted before the reap: the id is still ours
+        if owned:                             # a synchronous error before the reap
             _kill(pid, not nested, pidfd)
-            if _wait_exit(pid) and not nested:
-                _drain_group(pid, pidfd)
+            if _wait_exit(pid):
+                if not nested:
+                    _drain_group(pid, pidfd)
+                reaped = _reap(pid)
             owned = False
-        if reaped is None:
-            _reap(pid)                        # no orphan; never a signal (it may be reaped already)
-        if pidfd is not None:
-            os.close(pidfd)
+        for fd in (r, w, pidfd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     wall = time.monotonic() - t0
     if lost:
         return BoundedResult("escaped", None, 0.0, wall, 0, {
@@ -376,7 +457,7 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
                                          "memory_bytes": limits.memory_bytes},
                               "process_group": None if nested else pid,
                               "stragglers_killed": left,
-                              "cpu_complete": not (killed or oversized or left)}
+                              "cpu_complete": not (killed or oversized or left or interrupted)}
     if os.WIFSIGNALED(status):
         detail["signal"] = signal.Signals(os.WTERMSIG(status)).name
     elif os.WIFEXITED(status):
@@ -388,6 +469,9 @@ def run_bounded(fn: Callable[..., Any], *args: Any, limits: Limits, **kwargs: An
     if not gone:
         return done("escaped", message=f"process group {pid} still had live members "
                                        f"{ESCAPE_GRACE_SECONDS} s after it was killed")
+    if interrupted:
+        return done("crashed", error_type="interrupted",
+                    message=f"signal {pending[0]} arrived; the child was killed and reaped")
     if killed:
         return done("wall_exceeded", message=f"wall-clock ceiling of {limits.wall_seconds} s "
                                              "reached; " + ("child killed" if nested
