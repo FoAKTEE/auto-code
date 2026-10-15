@@ -57,10 +57,8 @@ def cfg(**kw):
 
 
 @pytest.fixture(scope="module")
-def ran(tmp_path_factory):
-    root = tmp_path_factory.mktemp("campaign")
-    out = run_campaign(cfg(), ReplayDouble([GOOD]), root, require_clean=False, seal_bundle=False)
-    run = root / "ctl"
+def ran(controls_campaign):
+    out, run = controls_campaign                    # conftest: one shared replay campaign
     store = ArtifactStore(run / "store")
     adm = Admission(run / "ledger.db", store, build_registry(store))
     yield out, run, adm, store

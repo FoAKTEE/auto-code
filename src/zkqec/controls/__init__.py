@@ -8,7 +8,7 @@ re-runs it and requires byte-identical evidence.
 from . import p1a
 from .env import SuiteInputs
 from .p1a import CONTROL_SETS, ControlSuiteError, run_suite
-from .record import campaign_inputs
+from .record import audit_controls, campaign_inputs
 
-__all__ = ["CONTROL_SETS", "ControlSuiteError", "SuiteInputs", "campaign_inputs", "p1a",
-           "run_suite"]
+__all__ = ["CONTROL_SETS", "ControlSuiteError", "SuiteInputs", "audit_controls", "campaign_inputs",
+           "p1a", "run_suite"]

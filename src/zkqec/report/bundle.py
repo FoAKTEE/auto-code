@@ -21,7 +21,8 @@ invariants + projections + event-referenced artifact hashes (``Admission.verify`
 artifact and redaction record re-hashed, every candidate component and call-record artifact
 reference traversed, the operational job tables reconciled with the ``job_settled`` events and the
 frozen caps, call-record usage reconciled with the settled measurements, byte-level replay of every
-execution, and the report lint against the ledger only.
+execution, the §I control suite re-run from the frozen campaign's inputs with byte-identical evidence
+required, and the report lint against the ledger only.
 """
 from __future__ import annotations
 
@@ -395,8 +396,9 @@ def audit_campaign(adm, store, campaign_id: str) -> list[str]:
 
 def audit_inner(bundle_dir: str) -> dict[str, Any]:
     """Inside the reconstructed environment: verify ledger, store and accounting, replay
-    executions, lint the report (all from the bundle's ledger)."""
+    executions, reproduce the recorded controls, lint the report (all from the bundle's ledger)."""
     from zkqec.admission import Admission
+    from zkqec.controls.record import audit_controls
     from zkqec.pipeline import build_registry
     from zkqec.report.render import lint
     from zkqec.store import ArtifactStore
@@ -418,8 +420,13 @@ def audit_inner(bundle_dir: str) -> dict[str, Any]:
         problems += audit_campaign(adm, store, manifest["campaign_id"])
         replay_problems, replayed, identities = replay_executions(adm, reg, store)
         problems += replay_problems
+        # scratch beside the bundle: the audit workdir is the only writable path offline
+        control_problems, reproduced = audit_controls(
+            adm, store, manifest["campaign_id"], b.parent / "controls-rerun")
+        problems += [f"controls: {p}" for p in control_problems]
         problems += lint((b / "report.md").read_text(), adm, manifest["campaign_id"])
     finally:
         adm.close()
     return {"ok": not problems, "problems": problems, "replayed_executions": replayed,
-            "replayed_identities": identities, "ledger_events": head[0]}
+            "replayed_identities": identities, "controls_reproduced": reproduced,
+            "ledger_events": head[0]}

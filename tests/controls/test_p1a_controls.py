@@ -118,11 +118,12 @@ def test_deferred_controls_are_listed_with_reasons_and_never_counted(evidence):
     assert not set(deferred) & {r["control"] for r in evidence["results"]}
 
 
-def test_evidence_is_canonical_reproducible_and_free_of_paths_and_times(evidence, tmp_path):
-    again = run_suite("p1a", tmp_path / "again", INPUTS)
+def test_evidence_is_canonical_and_free_of_paths_and_times(evidence, tmp_path_factory):
+    """Byte reproducibility across runs is the audit's check (test_controls_audit)."""
     data = canonical_json(evidence)
-    assert data == canonical_json(again)
-    assert str(tmp_path).encode() not in data and b"/tmp" not in data and b"/data" not in data
+    assert json.loads(data) == evidence
+    assert str(tmp_path_factory.getbasetemp()).encode() not in data
+    assert b"/tmp" not in data and b"/data" not in data and b"created_at" not in data
     assert evidence["inputs"] == {"schema_sha256": INPUTS.schema_sha, "families": ["explicit_sparse"]}
     assert evidence["control_set"] == "p1a" and evidence["suite_version"] == p1a.SUITE_VERSION
 
