@@ -74,7 +74,8 @@ class Admission:
     def __init__(self, ledger_path, store: ArtifactStore, registry: VerifierRegistry):
         registry.freeze()
         self.store, self.registry = store, registry
-        self.ledger = Ledger(ledger_path)
+        self._writer = object()          # the ledger's single-writer capability (§4.2)
+        self.ledger = Ledger(ledger_path, writer=self._writer)
         try:
             self._declare()
         except BaseException:
@@ -90,13 +91,16 @@ class Admission:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    def _append(self, kind: str, payload: dict):
+        return self.ledger.append(kind, payload, writer=self._writer)
+
     def _declare(self) -> None:
         manifest = {"schema": SCHEMA_VERSION, "registry_version": REGISTRY_VERSION,
                     "sanitizer": SANITIZER_VERSION, "issuers": self.registry.manifest()}
         first = self.ledger.first_event()
         if first is None:
             with self.ledger.transaction():
-                self.ledger.append("ledger_opened", manifest)
+                self._append("ledger_opened", manifest)
         elif first.kind != "ledger_opened" or first.payload != manifest:
             raise RegistryMismatch("ledger was opened with a different issuer registry/schema")
 
@@ -186,7 +190,7 @@ class Admission:
                 raise KeyError(f"no receipt or identity record {target_id}")
             if self.ledger.is_revoked(target_id):
                 return False
-            self.ledger.append("revoked", {"target_id": target_id, "reason": reason})
+            self._append("revoked", {"target_id": target_id, "reason": reason})
         return True
 
     def open_incident(self, category: str, detail: dict) -> str:
@@ -199,7 +203,7 @@ class Admission:
         if self.store.sanitizer.detect_obj(detail):
             raise SecretDetected("incident detail contains secret-like content")
         iid = uuid.uuid4().hex
-        self.ledger.append("incident_opened", {"incident_id": iid, "category": category,
+        self._append("incident_opened", {"incident_id": iid, "category": category,
                                                "detail": detail})
         return iid
 
@@ -257,7 +261,7 @@ class Admission:
                     except (StoreError, OSError) as exc:
                         raise AdmissionRefused(f"input {sha} is not durably published: {exc}") \
                             from None
-                self.ledger.append("execution_opened", {
+                self._append("execution_opened", {
                     "execution_id": execution_id, "role": spec.role, "issuer": spec.name,
                     "issuer_version": spec.version, "domain": domain, "inputs": inputs})
         return self.ledger.execution(execution_id)
@@ -283,7 +287,7 @@ class Admission:
         with self.ledger.transaction():
             if self.ledger.closure(ex["execution_id"]) is not None:
                 raise DuplicateCompletion(f"execution {ex['execution_id']} is already closed")
-            self.ledger.append("execution_closed", {
+            self._append("execution_closed", {
                 "execution_id": ex["execution_id"], "outcome": "crashed", "completion": "crashed",
                 "records": [], "detail": detail})
             if on_close is not None:
@@ -310,7 +314,7 @@ class Admission:
                     incidents = (self._incident("artifact_integrity", {
                         "execution_id": ex["execution_id"], "artifacts": changed}),)
                 detail = {"problems": problems}
-                self.ledger.append("execution_closed", {
+                self._append("execution_closed", {
                     "execution_id": ex["execution_id"], "outcome": "refused", "completion": None,
                     "records": [], "detail": detail})
                 refused = self._report(ex, "refused", incidents=incidents, detail=detail)
@@ -324,8 +328,8 @@ class Admission:
                     if rid in written or exists:
                         continue                                    # idempotent re-admission
                     written.add(rid)
-                    self.ledger.append(kind, payload)
-                self.ledger.append("execution_closed", {
+                    self._append(kind, payload)
+                self._append("execution_closed", {
                     "execution_id": ex["execution_id"], "outcome": "admitted", "completion": None,
                     "records": list(ids), "detail": {}})
                 quarantined, incidents = self._quarantine_conflicts(ex["domain"])
@@ -373,7 +377,7 @@ class Admission:
             iid = self._incident(category, detail)
             incidents.append(iid)
             for target in targets:
-                self.ledger.append("quarantined", {"target_id": target, "incident_id": iid,
+                self._append("quarantined", {"target_id": target, "incident_id": iid,
                                                    "reason": category})
                 quarantined.append(target)
         return tuple(quarantined), tuple(incidents)

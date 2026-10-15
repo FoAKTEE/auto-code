@@ -205,12 +205,51 @@ def audit_bundle(bundle: Path, archive: Path = ARCHIVE, workdir: Path | None = N
     return result
 
 
-def audit_inner(bundle_dir: str) -> dict[str, Any]:
-    """Inside the reconstructed environment: verify ledger, replay executions, lint the report."""
-    from zkqec.admission import Admission
+def replay_executions(adm, reg, store) -> tuple[list[str], int, int]:
+    """Byte-level replay of every execution: an ``admitted`` closure must be reproduced exactly
+    (same receipt ids / identity codes); a closure of any other outcome must have no records, and
+    an execution without a closure is a problem (it was never settled)."""
     from zkqec.admission.registry import ArtifactInput
     from zkqec.admission.service import _revalidate_results, _stamp
     from zkqec.contracts import content_hash
+
+    problems: list[str] = []
+    replayed = identities = 0
+    conn = adm.ledger.conn
+    for ex_id, in conn.execute("SELECT execution_id FROM executions ORDER BY event_seq").fetchall():
+        ex, cl = adm.ledger.execution(ex_id), adm.ledger.closure(ex_id)
+        if cl is None:
+            problems.append(f"{ex_id}: execution of {ex['issuer']} has no closure")
+            continue
+        if cl["outcome"] != "admitted":
+            if cl["records"]:
+                problems.append(f"{ex_id}: {cl['outcome']} closure lists records")
+            continue
+        try:
+            spec = reg.get(ex["issuer"], ex["role"])
+        except Exception as exc:                                 # noqa: BLE001
+            problems.append(f"{ex_id}: {exc}"); continue
+        if spec.version != ex["issuer_version"]:
+            problems.append(f"{ex_id}: issuer version differs"); continue
+        inputs = {k: ArtifactInput(sha, store.get_bytes(sha)) for k, sha in ex["inputs"].items()}
+        if ex["role"] == "verifier":
+            results = _revalidate_results(spec.fn(**inputs))
+            ids = sorted({content_hash(_stamp(ex, r)) for r in results})
+            if ids != sorted(cl["records"]):
+                problems.append(f"{ex_id}: replay of {ex['issuer']} gives different receipts")
+            replayed += 1
+        else:
+            code = spec.fn(**inputs)
+            rows = conn.execute("SELECT code FROM identities WHERE execution_id=?", (ex_id,)).fetchall()
+            if not rows or any(r[0] != code for r in rows):
+                problems.append(f"{ex_id}: identity replay differs")
+            identities += 1
+    return problems, replayed, identities
+
+
+def audit_inner(bundle_dir: str) -> dict[str, Any]:
+    """Inside the reconstructed environment: verify ledger, replay executions, lint the report."""
+    from zkqec.admission import Admission
     from zkqec.pipeline import build_registry
     from zkqec.report.render import CampaignRecord, lint
     from zkqec.store import ArtifactStore
@@ -228,28 +267,8 @@ def audit_inner(bundle_dir: str) -> dict[str, Any]:
         head = adm.ledger.head()
         if {"seq": head[0], "hash": head[1]} != manifest["ledger_head"]:
             problems.append("ledger head differs from the sealed manifest (truncation or tamper)")
-        replayed = identities = 0
-        conn = adm.ledger.conn
-        for ex_id, in conn.execute("SELECT execution_id FROM executions ORDER BY rowid"):
-            ex, cl = adm.ledger.execution(ex_id), adm.ledger.closure(ex_id)
-            if cl is None or cl["outcome"] != "admitted":
-                continue
-            spec = reg.get(ex["issuer"], ex["role"])
-            if spec.version != ex["issuer_version"]:
-                problems.append(f"{ex_id}: issuer version differs"); continue
-            inputs = {k: ArtifactInput(sha, store.get_bytes(sha)) for k, sha in ex["inputs"].items()}
-            if ex["role"] == "verifier":
-                results = _revalidate_results(spec.fn(**inputs))
-                ids = sorted({content_hash(_stamp(ex, r)) for r in results})
-                if ids != sorted(cl["records"]):
-                    problems.append(f"{ex_id}: replay of {ex['issuer']} gives different receipts")
-                replayed += 1
-            else:
-                code = spec.fn(**inputs)
-                rows = conn.execute("SELECT code FROM identities WHERE execution_id=?", (ex_id,)).fetchall()
-                if any(r[0] != code for r in rows):
-                    problems.append(f"{ex_id}: identity replay differs")
-                identities += 1
+        replay_problems, replayed, identities = replay_executions(adm, reg, store)
+        problems += replay_problems
         camp = CampaignRecord.model_validate(json.loads((b / "campaign.json").read_text()))
         domain = camp.manifest.get("domain")
         problems += lint((b / "report.md").read_text(), adm, domain, camp)

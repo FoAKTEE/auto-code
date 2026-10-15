@@ -246,7 +246,8 @@ def test_ledger_refuses_secret_bearing_payloads(env):
     with pytest.raises(SecretDetected):
         with env.adm.ledger.transaction():
             env.adm.ledger.append("incident_opened", {"incident_id": "x", "category": "c",
-                                                      "detail": {"api_key": "SYNTHETICkey"}})
+                                                      "detail": {"api_key": "SYNTHETICkey"}},
+                                  writer=env.adm._writer)     # the trusted path, as admission
     assert "incident_opened" not in env.event_kinds()
 
 

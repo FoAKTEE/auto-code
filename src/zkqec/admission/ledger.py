@@ -11,6 +11,16 @@
   :meth:`Ledger.rebuild` drops and recreates them from the events.
 * :meth:`Ledger.verify` recomputes the chain, re-hashes every referenced artifact, checks the
   triggers are present, and compares projections with a fresh in-memory rebuild.
+* **Apply-time invariants** (checked on append, on :meth:`Ledger.rebuild` and in the verify
+  replay, so a forged chain extension cannot be re-applied): an execution's issuer, version and role
+  must be in the ``ledger_opened`` registry manifest; receipts and identities attach only to an
+  OPEN execution of the matching role, with the execution's issuer/version/domain and exactly its
+  input hashes; an ``admitted`` closure must list exactly the execution's receipts (or identities),
+  a ``crashed``/``refused`` closure none; nothing attaches to a closed execution.
+* Only records of executions with an ``admitted`` closure are returned to the resolver; ``verify``
+  reports open executions and records without an admitted closure.
+* :meth:`Ledger.append` requires the writer capability the admission service created the ledger
+  with: scientific events have a single writer (§4.2).
 
 Operational job/dispatch state is *not* kept here (§L: separate from the scientific log).
 Hash chains detect accidental or third-party tampering, not a compromised trusted writer (§O).
@@ -28,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 from zkqec.contracts import Receipt, canonical_json, content_hash
+from zkqec.store import check_sha
 from zkqec.store.sanitize import DEFAULT_SANITIZER, SecretDetected
 
 from .evidence import IdentityRecord, ReceiptRecord
@@ -167,18 +178,68 @@ def referenced_artifacts(kind: str, payload: dict) -> list[tuple[str, str]]:
 
 
 # --- apply (the only writer of projections) ---------------------------------------------------------
+def _manifest(conn) -> dict:
+    row = conn.execute("SELECT kind, payload FROM events WHERE seq = 1").fetchone()
+    if row is None or row[0] != "ledger_opened":
+        raise LedgerError("the ledger has no ledger_opened registry manifest")
+    return json.loads(row[1])
+
+
+def _open_execution(conn, seq: int, execution_id: str, role: str) -> tuple:
+    """The execution record a receipt/identity attaches to: it must exist, be OPEN and have the
+    matching role. Returns (issuer, issuer_version, domain, inputs dict)."""
+    ex = conn.execute("SELECT role, issuer, issuer_version, domain, inputs FROM executions "
+                      "WHERE execution_id=?", (execution_id,)).fetchone()
+    if ex is None:
+        raise LedgerError(f"event {seq}: no execution record {execution_id}")
+    if ex[0] != role:
+        raise LedgerError(f"event {seq}: execution {execution_id} is a {ex[0]}, not a {role}")
+    if conn.execute("SELECT 1 FROM execution_closures WHERE execution_id=?",
+                    (execution_id,)).fetchone():
+        raise LedgerError(f"event {seq}: execution {execution_id} is attached to after its closure")
+    return ex[1], ex[2], ex[3], json.loads(ex[4])
+
+
 def _apply_ledger_opened(conn, seq, p):
     if seq != 1:
         raise LedgerError("ledger_opened must be the first event")
+    if not isinstance(p.get("issuers"), dict):
+        raise LedgerError("ledger_opened must carry the issuer registry manifest")
 
 
 def _apply_execution_opened(conn, seq, p):
+    entry = _manifest(conn)["issuers"].get(p["issuer"])
+    if not isinstance(entry, dict) or entry.get("version") != p["issuer_version"] \
+            or entry.get("role") != p["role"]:
+        raise LedgerError(f"event {seq}: issuer {p['issuer']!r} {p['issuer_version']!r} "
+                          f"({p['role']}) is not in the frozen registry manifest")
+    check_sha(p["domain"])
+    inputs = p["inputs"]
+    if not isinstance(inputs, dict) or not inputs or any(
+            not (isinstance(k, str) and k.isidentifier()) for k in inputs):
+        raise LedgerError(f"event {seq}: execution inputs must be a non-empty name -> sha map")
+    for sha in inputs.values():
+        check_sha(sha)
     conn.execute("INSERT INTO executions VALUES (?,?,?,?,?,?,?)",
                  (p["execution_id"], seq, p["role"], p["issuer"], p["issuer_version"], p["domain"],
                   canonical_json(p["inputs"]).decode()))
 
 
 def _apply_execution_closed(conn, seq, p):
+    ex = conn.execute("SELECT role FROM executions WHERE execution_id=?",
+                      (p["execution_id"],)).fetchone()
+    if ex is None:
+        raise LedgerError(f"event {seq}: closure of unknown execution {p['execution_id']}")
+    table, col = (("receipts", "receipt_id") if ex[0] == "verifier"
+                  else ("identities", "identity_id"))
+    actual = sorted(r[0] for r in conn.execute(
+        f"SELECT {col} FROM {table} WHERE execution_id=?", (p["execution_id"],)))
+    records = p["records"]
+    expect = sorted(set(records)) if p["outcome"] == "admitted" else []
+    if not isinstance(records, list) or sorted(records) != expect or actual != expect \
+            or (p["outcome"] != "admitted" and records):
+        raise LedgerError(f"event {seq}: an {p['outcome']} closure must list exactly the "
+                          f"execution's records ({len(actual)} admitted, {len(records)} listed)")
     conn.execute("INSERT INTO execution_closures VALUES (?,?,?,?,?,?)",
                  (p["execution_id"], seq, p["outcome"], p.get("completion"),
                   canonical_json(p["records"]).decode(), canonical_json(p["detail"]).decode()))
@@ -189,10 +250,11 @@ def _apply_receipt_admitted(conn, seq, p):
     rid = content_hash(receipt)
     if rid != p["receipt_id"]:
         raise LedgerError(f"event {seq}: receipt_id does not match receipt content")
-    ex = conn.execute("SELECT issuer, issuer_version, domain FROM executions WHERE execution_id=?",
-                      (receipt.execution_id,)).fetchone()
-    if ex is None or tuple(ex) != (receipt.issuer, receipt.issuer_version, receipt.domain):
+    issuer, version, domain, inputs = _open_execution(conn, seq, receipt.execution_id, "verifier")
+    if (issuer, version, domain) != (receipt.issuer, receipt.issuer_version, receipt.domain):
         raise LedgerError(f"event {seq}: receipt issuer/domain differ from its execution record")
+    if list(receipt.input_hashes) != sorted(set(inputs.values())):
+        raise LedgerError(f"event {seq}: receipt input hashes are not its execution's inputs")
     prop = receipt.proposition
     conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (rid, seq, receipt.execution_id, receipt.domain, prop.predicate, prop.subject_type,
@@ -206,10 +268,10 @@ def _apply_identity_recorded(conn, seq, p):
     expect = content_hash({k: p[k] for k in ("presentation", "code", "execution_id")})
     if expect != p["identity_id"]:
         raise LedgerError(f"event {seq}: identity_id does not match its content")
-    ex = conn.execute("SELECT role, issuer, issuer_version, domain FROM executions "
-                      "WHERE execution_id=?", (p["execution_id"],)).fetchone()
-    if ex is None or tuple(ex) != ("identity", p["issuer"], p["issuer_version"], p["domain"]):
-        raise LedgerError(f"event {seq}: identity not backed by an identity execution record")
+    issuer, version, domain, inputs = _open_execution(conn, seq, p["execution_id"], "identity")
+    if (issuer, version, domain) != (p["issuer"], p["issuer_version"], p["domain"]) \
+            or inputs != {"presentation": p["presentation"]}:
+        raise LedgerError(f"event {seq}: identity not backed by its identity execution record")
     conn.execute("INSERT INTO identities VALUES (?,?,?,?,?,?,?,?)",
                  (p["identity_id"], seq, p["execution_id"], p["domain"], p["presentation"],
                   p["code"], p["issuer"], p["issuer_version"]))
@@ -282,8 +344,9 @@ def _connect(path: str) -> sqlite3.Connection:
 class Ledger:
     """SQLite-backed ledger. One writer per database file (enforced with an exclusive flock)."""
 
-    def __init__(self, path: str | os.PathLike):
+    def __init__(self, path: str | os.PathLike, *, writer: object | None = None):
         self.path = str(path)
+        self._writer = writer           # capability held by the single writer (admission)
         self._lock_fd: int | None = None
         if self.path != ":memory:":
             self._lock_fd = os.open(self.path + ".writer.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -319,8 +382,13 @@ class Ledger:
         finally:
             self._in_tx = False
 
-    def append(self, kind: str, payload: dict) -> Event:
-        """Append one event and apply it to the projections (inside :meth:`transaction`)."""
+    def append(self, kind: str, payload: dict, *, writer: object | None = None) -> Event:
+        """Append one event and apply it to the projections (inside :meth:`transaction`).
+
+        ``writer`` must be the capability this ledger was opened with: only the admission service
+        appends events."""
+        if self._writer is None or writer is not self._writer:
+            raise LedgerError("events are appended only by the admission service")
         if not self._in_tx:
             raise LedgerError("append outside a transaction")
         if kind not in _APPLY:
@@ -382,11 +450,17 @@ class Ledger:
         return bool(self.conn.execute("SELECT 1 FROM revocations WHERE target_id=?",
                                       (target_id,)).fetchone())
 
+    _ADMITTED = ("EXISTS (SELECT 1 FROM execution_closures c WHERE c.execution_id = {t}.execution_id "
+                 "AND c.outcome = 'admitted')")
+
     def receipt_records(self, domain: str | None = None) -> list[ReceiptRecord]:
+        """Receipts of executions with an ``admitted`` closure (an open execution's receipts carry
+        no authority)."""
         sql = ("SELECT r.receipt_id, r.body, "
                "EXISTS (SELECT 1 FROM revocations v WHERE v.target_id = r.receipt_id), "
                "EXISTS (SELECT 1 FROM quarantines q WHERE q.target_id = r.receipt_id) "
-               "FROM receipts r" + (" WHERE r.domain = ?" if domain else "") + " ORDER BY r.event_seq")
+               "FROM receipts r WHERE " + self._ADMITTED.format(t="r")
+               + (" AND r.domain = ?" if domain else "") + " ORDER BY r.event_seq")
         rows = self.conn.execute(sql, (domain,) if domain else ())
         return [ReceiptRecord(rid, Receipt.model_validate_json(body), bool(rv), bool(q))
                 for rid, body, rv, q in rows]
@@ -396,8 +470,8 @@ class Ledger:
                "i.issuer_version, "
                "EXISTS (SELECT 1 FROM revocations v WHERE v.target_id = i.identity_id), "
                "EXISTS (SELECT 1 FROM quarantines q WHERE q.target_id = i.identity_id) "
-               "FROM identities i" + (" WHERE i.domain = ?" if domain else "")
-               + " ORDER BY i.event_seq")
+               "FROM identities i WHERE " + self._ADMITTED.format(t="i")
+               + (" AND i.domain = ?" if domain else "") + " ORDER BY i.event_seq")
         rows = self.conn.execute(sql, (domain,) if domain else ())
         return [IdentityRecord(*row[:7], revoked=bool(row[7]), quarantined=bool(row[8]))
                 for row in rows]
@@ -479,5 +553,21 @@ class Ledger:
             for table in PROJECTION_TABLES:
                 if live[table] != rebuilt[table]:
                     problems.append(f"projection {table} differs from a fresh rebuild")
+            problems += _closure_problems(fresh)
         fresh.close()
         return VerifyReport(not problems, len(rows), tuple(problems))
+
+
+def _closure_problems(conn: sqlite3.Connection) -> list[str]:
+    """Every execution closed; every receipt/identity belongs to an admitted closure listing it."""
+    out = [f"execution {eid} ({issuer}) is open: no closure was recorded"
+           for eid, issuer in conn.execute(
+               "SELECT execution_id, issuer FROM executions WHERE execution_id NOT IN "
+               "(SELECT execution_id FROM execution_closures) ORDER BY event_seq")]
+    for table, col in (("receipts", "receipt_id"), ("identities", "identity_id")):
+        for rid, eid in conn.execute(f"SELECT {col}, execution_id FROM {table} ORDER BY event_seq"):
+            row = conn.execute("SELECT outcome, records FROM execution_closures WHERE "
+                               "execution_id=?", (eid,)).fetchone()
+            if row is None or row[0] != "admitted" or rid not in json.loads(row[1]):
+                out.append(f"{table[:-1]} {rid} is without an admitted closure listing it")
+    return out
