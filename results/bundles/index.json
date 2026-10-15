@@ -349,7 +349,7 @@
         "hash": "aae2348a7c83728ba4d20aa5be549678a190d7a92d311800f0b628759f060abf",
         "seq": 50
       },
-      "note": "third hardening round, read-only snapshot (6e7e610); controls passed; M1 acceptance run",
+      "note": "third hardening round (6e7e610); superseded by re-review 3 (B1 cleanup race)",
       "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-6/29ac9d25c92ef6a10aeb97154372963fa185dffb552e651aa44870ae49b3c46a.tar.zst",
       "spend": {
         "cpu_seconds": 13.2719,
@@ -359,9 +359,75 @@
         "usd": 0.331868,
         "wall_seconds": 159.757
       }
+    },
+    {
+      "audit": {
+        "ok": true,
+        "problems": []
+      },
+      "bundle_sha256": "78d2f0a8667beda9e2dcfb80070c206d35731b59e757a827da0adb62057af26b",
+      "bytes": 131885237,
+      "campaign_id": "m1-live-7",
+      "closures": {
+        "evaluator": "932c6abc80a939e9e0dc2845d37b296e46e29703a1e5ec3680b59790bfb511b0",
+        "git_commit": "f70055ea90fb31c9a2c4b4aa98cacdd3a3f07819",
+        "lock_sha256": "4347389f85529a2da685f464f12a6746d6208da6ba1c7ec995afa535ac2563b4",
+        "runtime": "608529a930a6266bb3fd617dc5c281d3ef39b8abce833303d577aa0321677551",
+        "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
+      },
+      "confirmation": {
+        "basis": "declared",
+        "final_totals": {
+          "cpu_seconds": 43.384299294,
+          "input_tokens": 6503.0,
+          "output_tokens": 10800.0,
+          "requests": 2.0,
+          "usd": 0.2173158,
+          "wall_seconds": 160.59941984340549
+        },
+        "required": true,
+        "sha256": "e90efa82f76ec3534881fab37a8650532f518333b439c1763067aa55a7a46e29",
+        "status": "linked",
+        "supplement": "78d2f0a8667beda9e2dcfb80070c206d35731b59e757a827da0adb62057af26b.confirmation.json"
+      },
+      "evaluated": [
+        {
+          "candidate": "1016c96ed5f742fc",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sa-live-1"
+        },
+        {
+          "candidate": "02f09068d7ccce0c",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sf-live-1"
+        }
+      ],
+      "evaluator_commit": "f70055ea90fb31c9a2c4b4aa98cacdd3a3f07819",
+      "format": "zkqec-bundle-v2",
+      "labels": [
+        "single-implementation",
+        "non-evaluation",
+        "M1-live-slice"
+      ],
+      "ledger_head": {
+        "hash": "3752fc4dfef1dd01c5aacba71ca669eb23b8c70a9f3a5a9e66b52072eb8c6b83",
+        "seq": 50
+      },
+      "note": "B1 fix, read-only snapshot (f70055e); controls passed; M1 acceptance run",
+      "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-7/78d2f0a8667beda9e2dcfb80070c206d35731b59e757a827da0adb62057af26b.tar.zst",
+      "spend": {
+        "cpu_seconds": 14.6209,
+        "input_tokens": 6503.0,
+        "output_tokens": 10800.0,
+        "requests": 2.0,
+        "usd": 0.217316,
+        "wall_seconds": 122.9
+      }
     }
   ],
-  "indexed_utc": "2026-10-15T21:50:25Z",
-  "indexed_with_commit": "6e7e610c49efd142de50b0e7beb88d7338e326d2",
+  "indexed_utc": "2026-10-15T22:20:29Z",
+  "indexed_with_commit": "f70055ea90fb31c9a2c4b4aa98cacdd3a3f07819",
   "schema": "zkqec.bundle-index/1"
 }
