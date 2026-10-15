@@ -35,7 +35,7 @@ from zkqec.store import (SANITIZER_VERSION, ArtifactNotFound, ArtifactStore, Art
                          IntegrityError, SecretDetected, StoreError, check_sha)
 
 from .evidence import current_identities, current_receipts, find_conflicts
-from .ledger import SCHEMA_VERSION, Ledger, LedgerError, VerifyReport, evaluation_core
+from .ledger import NAMESPACE_RE, SCHEMA_VERSION, Ledger, LedgerError, VerifyReport, evaluation_core
 from .registry import ArtifactInput, Registered, VerifierRegistry
 from .resolver import Resolver
 
@@ -132,9 +132,13 @@ class Admission:
                      idempotency_key: str | None = None,
                      on_close: Callable[[str], None] | None = None,
                      wall_seconds: float | None = None, limits: Limits | None = None,
-                     on_measure: Callable[[BoundedResult], None] | None = None
-                     ) -> ExecutionReport:
+                     on_measure: Callable[[BoundedResult], None] | None = None,
+                     namespace: str | None = None) -> ExecutionReport:
         """Run a registered verifier and admit its results.
+
+        ``namespace`` (§N: campaign/arm/split/profile) is part of the execution's identity and
+        record: a keyed execution is reused (replayed) only within its own namespace, and conflict
+        quarantine and :meth:`resolver` lookups can be scoped to it.
 
         ``on_close(outcome)`` runs INSIDE the closing write transaction (outcome ``admitted``,
         ``refused`` or ``crashed``) so operational job settlement and accounting commit atomically
@@ -150,7 +154,7 @@ class Admission:
         """
         spec = self.registry.get(name, "verifier")
         loaded = self._load_inputs(inputs)
-        ex = self._open(spec, inputs, domain, idempotency_key)
+        ex = self._open(spec, inputs, domain, idempotency_key, namespace)
         done = self._replay(ex)
         if done is not None:
             return done
@@ -212,18 +216,18 @@ class Admission:
                      idempotency_key: str | None = None,
                      on_close: Callable[[str], None] | None = None,
                      wall_seconds: float | None = None, limits: Limits | None = None,
-                     on_measure: Callable[[BoundedResult], None] | None = None
-                     ) -> ExecutionReport:
+                     on_measure: Callable[[BoundedResult], None] | None = None,
+                     namespace: str | None = None) -> ExecutionReport:
         """Record ``presentation -> code`` as computed by a registered identity function.
 
         The mapping comes only from the function's return value and the issuer only from the
-        execution record; there is no API that accepts a caller-supplied mapping. ``limits`` and
-        ``on_measure`` bound and measure the computation as in :meth:`run_verifier`.
+        execution record; there is no API that accepts a caller-supplied mapping. ``limits``,
+        ``on_measure`` and ``namespace`` work as in :meth:`run_verifier`.
         """
         spec = self.registry.get(name, "identity")
         inputs = {"presentation": presentation}
         loaded = self._load_inputs(inputs)
-        ex = self._open(spec, inputs, domain, idempotency_key)
+        ex = self._open(spec, inputs, domain, idempotency_key, namespace)
         done = self._replay(ex)
         if done is not None:
             return done
@@ -352,18 +356,26 @@ class Admission:
         self._append("job_settled", {"campaign_id": campaign_id, **payload})
 
     # -- reading, verification -------------------------------------------------------------------
-    def resolver(self, domain: str) -> Resolver:
-        return Resolver(domain, self.ledger.receipt_records(domain),
-                        self.ledger.identity_records(domain), store=self.store)
+    def resolver(self, domain: str, *, namespace: str | None = None) -> Resolver:
+        """Current authority in ``domain``; with ``namespace`` only that namespace's executions
+        count (§N: evidence of another campaign/arm/split/profile is never used). ``None`` is the
+        unscoped view over every namespace of this ledger."""
+        return Resolver(domain, self.ledger.receipt_records(domain, namespace=namespace),
+                        self.ledger.identity_records(domain, namespace=namespace),
+                        store=self.store)
 
     def verify(self) -> VerifyReport:
-        """Ledger verify (chain, triggers, artifacts, projections) plus a consistency re-check."""
+        """Ledger verify (chain, triggers, artifacts, projections) plus a consistency re-check
+        (no unquarantined conflict within any domain and namespace)."""
         report = self.ledger.verify(self.store)
         problems = list(report.problems)
         records = self.ledger.receipt_records()
-        for domain in sorted({r.receipt.domain for r in records}):
-            for c in find_conflicts(current_receipts(records, domain)):
-                problems.append(f"unquarantined {c.category} in domain {domain}: {c.receipt_ids}")
+        for domain, ns in sorted({(r.receipt.domain, r.namespace) for r in records},
+                                 key=lambda x: (x[0], x[1] or "")):
+            group = [r for r in records if r.namespace == ns]
+            for c in find_conflicts(current_receipts(group, domain)):
+                problems.append(f"unquarantined {c.category} in domain {domain} namespace {ns}: "
+                                f"{c.receipt_ids}")
         return VerifyReport(not problems, report.events, tuple(problems))
 
     def rebuild(self) -> None:
@@ -389,23 +401,29 @@ class Admission:
         return loaded
 
     @staticmethod
-    def _execution_id(spec: Registered, inputs: dict[str, str], domain: str, key: str) -> str:
-        return content_hash({"issuer": spec.name, "version": spec.version,
-                             "inputs": dict(sorted(inputs.items())), "domain": domain,
-                             "key": str(key)})
+    def _execution_id(spec: Registered, inputs: dict[str, str], domain: str, key: str,
+                      namespace: str | None = None) -> str:
+        core = {"issuer": spec.name, "version": spec.version,
+                "inputs": dict(sorted(inputs.items())), "domain": domain, "key": str(key)}
+        if namespace is not None:
+            core["namespace"] = namespace          # §N: no execution is shared across namespaces
+        return content_hash(core)
 
-    def execution_id_for(self, name: str, inputs: dict[str, str], domain: str, key: str) -> str:
-        """The deterministic execution id of an idempotency-keyed run."""
+    def execution_id_for(self, name: str, inputs: dict[str, str], domain: str, key: str, *,
+                         namespace: str | None = None) -> str:
+        """The deterministic execution id of an idempotency-keyed run in ``namespace``."""
         entry = self.registry._entries.get(name)
         if entry is None:
             raise KeyError(f"unregistered issuer {name!r}")
-        return self._execution_id(entry, inputs, domain, key)
+        return self._execution_id(entry, inputs, domain, key, _namespace(namespace))
 
-    def closed_report(self, name: str, inputs: dict[str, str], domain: str,
-                      key: str) -> ExecutionReport | None:
-        """Read-only: the recorded closure of a keyed execution, or ``None`` if it is not closed.
-        Never runs anything (recovery reads settled work only through this; §L)."""
-        ex = self.ledger.execution(self.execution_id_for(name, inputs, domain, key))
+    def closed_report(self, name: str, inputs: dict[str, str], domain: str, key: str, *,
+                      namespace: str | None = None) -> ExecutionReport | None:
+        """Read-only: the recorded closure of a keyed execution of ``namespace``, or ``None`` if it
+        is not closed (a closure of another namespace is never returned). Never runs anything
+        (recovery reads settled work only through this; §L)."""
+        ex = self.ledger.execution(self.execution_id_for(name, inputs, domain, key,
+                                                         namespace=namespace))
         return None if ex is None else self._replay(ex)
 
     def abandon(self, execution_id: str, reason: str) -> bool:
@@ -424,13 +442,14 @@ class Admission:
         return True
 
     def _open(self, spec: Registered, inputs: dict[str, str], domain: str,
-              key: str | None) -> dict:
+              key: str | None, namespace: str | None = None) -> dict:
         check_sha(domain)
+        namespace = _namespace(namespace)
         inputs = dict(sorted(inputs.items()))
         if key is None:
             execution_id = uuid.uuid4().hex
         else:
-            execution_id = self._execution_id(spec, inputs, domain, key)
+            execution_id = self._execution_id(spec, inputs, domain, key, namespace)
         with self.ledger.transaction():
             if self.ledger.execution(execution_id) is None:
                 for sha in inputs.values():
@@ -439,9 +458,11 @@ class Admission:
                     except (StoreError, OSError) as exc:
                         raise AdmissionRefused(f"input {sha} is not durably published: {exc}") \
                             from None
-                self._append("execution_opened", {
-                    "execution_id": execution_id, "role": spec.role, "issuer": spec.name,
-                    "issuer_version": spec.version, "domain": domain, "inputs": inputs})
+                payload = {"execution_id": execution_id, "role": spec.role, "issuer": spec.name,
+                           "issuer_version": spec.version, "domain": domain, "inputs": inputs}
+                if namespace is not None:
+                    payload["namespace"] = namespace
+                self._append("execution_opened", payload)
         return self.ledger.execution(execution_id)
 
     def _report(self, ex: dict, outcome: Outcome, **kw) -> ExecutionReport:
@@ -511,7 +532,8 @@ class Admission:
                 self._append("execution_closed", {
                     "execution_id": ex["execution_id"], "outcome": "admitted", "completion": None,
                     "records": list(ids), "detail": {}})
-                quarantined, incidents = self._quarantine_conflicts(ex["domain"])
+                quarantined, incidents = self._quarantine_conflicts(ex["domain"],
+                                                                    ex.get("namespace"))
                 report = self._report(ex, "admitted", records=ids, quarantined=quarantined,
                                       incidents=incidents)
                 if on_close is not None:
@@ -537,15 +559,20 @@ class Admission:
                 problems.append(f"artifact {sha} could not be made durable: {exc}")
         return changed
 
-    def _quarantine_conflicts(self, domain: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """Semantic-conflict control (§A3): quarantine every conflicting premise + open incident."""
+    def _quarantine_conflicts(self, domain: str, namespace: str | None = None
+                              ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Semantic-conflict control (§A3): quarantine every conflicting premise + open incident,
+        within the closing execution's domain and namespace (§N: another namespace's receipts are
+        neither premises nor quarantined here)."""
         quarantined, incidents = [], []
-        current = current_receipts(self.ledger.receipt_records(domain), domain)
+        records = [r for r in self.ledger.receipt_records(domain) if r.namespace == namespace]
+        current = current_receipts(records, domain)
         groups = [(c.category, {"domain": domain, "subject": c.subject, "key": c.key,
                                 "receipts": list(c.receipt_ids)}, c.receipt_ids)
                   for c in find_conflicts(current)]
         by_presentation: dict[str, list] = defaultdict(list)
-        for rec in current_identities(self.ledger.identity_records(domain), domain):
+        idents = [r for r in self.ledger.identity_records(domain) if r.namespace == namespace]
+        for rec in current_identities(idents, domain):
             by_presentation[rec.presentation].append(rec)
         for pres, recs in sorted(by_presentation.items()):
             if len({r.code for r in recs}) > 1:
@@ -560,6 +587,14 @@ class Admission:
                                                    "reason": category})
                 quarantined.append(target)
         return tuple(quarantined), tuple(incidents)
+
+
+def _namespace(namespace: str | None) -> str | None:
+    """A §N namespace key (``campaign`` or ``campaign/arm/split/profile``), or ``None``."""
+    if namespace is not None and (not isinstance(namespace, str)
+                                  or not NAMESPACE_RE.match(namespace)):
+        raise ValueError(f"bad namespace {namespace!r}")
+    return namespace
 
 
 def _revalidate_results(raw: Any) -> list[VerifierResult]:

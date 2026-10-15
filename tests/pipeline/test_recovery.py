@@ -66,15 +66,50 @@ def test_settled_job_without_closure_retries_under_a_new_fenced_job(pipe, monkey
     assert again.replayed and again.records == rep.records and len(_jobs(pipe)) == 2
 
 
-def test_closed_execution_is_never_rerun_for_a_fresh_job(pipe):
+def _other_profile(pipe, profile="other"):
+    """A second profile of the same campaign sharing the ledger and the store (§N namespace)."""
+    book = JobBook(pipe.adm.ledger.conn, "recovery", profile=profile)
+    book.set_caps({"cpu_seconds": 10_000})
+    return Pipeline(pipe.adm, pipe.store, book, pipe.domain, caps=GrammarCaps())
+
+
+def test_profiles_sharing_a_ledger_each_run_and_pay_for_their_own_executions(pipe):
+    """Codex M1 milestone review B4: a closure from another namespace is never reused (no zero-cost
+    cancel + replay); each profile runs, is charged and gets its own execution and receipts."""
     p_sha = _steane(pipe.store)
     inputs, key = {"presentation": p_sha}, f"l1:{p_sha}"
     first = pipe._run("l1.css_algebra", inputs, key)
-    other = JobBook(pipe.adm.ledger.conn, "recovery", profile="other")   # same ledger, new namespace
-    other.set_caps({"cpu_seconds": 10_000})
-    pipe.book = other
-    rep = pipe._run("l1.css_algebra", inputs, key)
-    assert rep.replayed and rep.records == first.records
-    rows = other.conn.execute("SELECT state FROM ops_jobs WHERE campaign=?",
-                              (other.campaign,)).fetchall()
-    assert rows == [("settled",)] and other.totals()["cpu_seconds"]["spent"] == 0
+    other = _other_profile(pipe)
+    rep = other._run("l1.css_algebra", inputs, key)
+    assert rep.outcome == "admitted" and not rep.replayed
+    assert rep.execution_id != first.execution_id and set(rep.records).isdisjoint(first.records)
+    rows = other.book.conn.execute("SELECT state, outcome FROM ops_jobs WHERE campaign=?",
+                                   (other.book.campaign,)).fetchall()
+    assert rows == [("settled", "completed")]
+    assert other.book.totals()["cpu_seconds"]["spent"] > 0
+    assert pipe.book.totals()["cpu_seconds"]["spent"] > 0
+    namespaces = [ns for ns, in pipe.adm.ledger.conn.execute(
+        "SELECT namespace FROM executions ORDER BY event_seq")]
+    assert namespaces == [pipe.book.namespace, other.book.namespace]
+    again = other._run("l1.css_algebra", inputs, key)          # within a namespace: read only
+    assert again.replayed and again.records == rep.records
+    assert pipe.adm.verify().ok
+
+
+def test_evidence_of_another_profile_never_authorizes(pipe, monkeypatch):
+    """Profile B cannot satisfy a task with profile A's distance evidence: its own L2 failed."""
+    from test_ceilings import TASK, chain
+    assert pipe.evaluate(chain(), TASK).satisfies == "verified"
+    import zkqec.verify.distance as dist
+
+    def broken(*a, **k):
+        raise RuntimeError("B's L2 fails")
+    monkeypatch.setattr(dist, "sector_distance", broken)
+    other = _other_profile(pipe)
+    ev = other.evaluate(chain(), TASK)
+    assert ev.satisfies == "unknown" and ev.facts["d_both"] == [None, None]
+    kinds = [k for k, in other.book.conn.execute(
+        "SELECT idem_key FROM ops_jobs WHERE campaign=? AND outcome != 'cancelled'",
+        (other.book.campaign,))]
+    assert {k.split(":")[0] for k in kinds} == {"l1.css_algebra", "identity.code_sha",
+                                                  "l2.distance"}       # B ran each of its own

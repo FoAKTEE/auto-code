@@ -58,7 +58,7 @@ from zkqec.store.sanitize import DEFAULT_SANITIZER, SecretDetected
 from .evidence import IdentityRecord, ReceiptRecord
 
 GENESIS = "0" * 64
-SCHEMA_VERSION = "zkqec-ledger-1"
+SCHEMA_VERSION = "zkqec-ledger-2"
 EVENT_KINDS = ("ledger_opened", "execution_opened", "execution_closed", "receipt_admitted",
                "identity_recorded", "revoked", "incident_opened", "quarantined",
                "campaign_frozen", "evaluation_recorded", "job_settled", "autonomy_recorded",
@@ -101,7 +101,7 @@ _PROJECTIONS: dict[str, tuple[str, tuple[str, ...], str]] = {
         event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
         role TEXT NOT NULL CHECK (role IN ('verifier', 'identity')),
         issuer TEXT NOT NULL, issuer_version TEXT NOT NULL, domain TEXT NOT NULL,
-        inputs TEXT NOT NULL""", ("execution_opened",), ""),
+        inputs TEXT NOT NULL, namespace TEXT""", ("execution_opened",), ""),
     "execution_closures": ("""execution_id TEXT PRIMARY KEY REFERENCES executions(execution_id),
         event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
         outcome TEXT NOT NULL CHECK (outcome IN ('admitted', 'crashed', 'refused')),
@@ -283,9 +283,12 @@ def _apply_execution_opened(conn, seq, p):
         raise LedgerError(f"event {seq}: execution inputs must be a non-empty name -> sha map")
     for sha in inputs.values():
         check_sha(sha)
-    conn.execute("INSERT INTO executions VALUES (?,?,?,?,?,?,?)",
+    namespace = p.get("namespace")
+    if namespace is not None:
+        _match(seq, NAMESPACE_RE, namespace, "namespace")
+    conn.execute("INSERT INTO executions VALUES (?,?,?,?,?,?,?,?)",
                  (p["execution_id"], seq, p["role"], p["issuer"], p["issuer_version"], p["domain"],
-                  canonical_json(p["inputs"]).decode()))
+                  canonical_json(p["inputs"]).decode(), namespace))
 
 
 def _apply_execution_closed(conn, seq, p):
@@ -667,11 +670,12 @@ class Ledger:
 
     # -- projection queries ----------------------------------------------------------------------
     def execution(self, execution_id: str) -> dict | None:
-        row = self.conn.execute("SELECT execution_id, role, issuer, issuer_version, domain, inputs "
-                                "FROM executions WHERE execution_id=?", (execution_id,)).fetchone()
+        row = self.conn.execute("SELECT execution_id, role, issuer, issuer_version, domain, inputs, "
+                                "namespace FROM executions WHERE execution_id=?",
+                                (execution_id,)).fetchone()
         if row is None:
             return None
-        keys = ("execution_id", "role", "issuer", "issuer_version", "domain", "inputs")
+        keys = ("execution_id", "role", "issuer", "issuer_version", "domain", "inputs", "namespace")
         out = dict(zip(keys, row))
         out["inputs"] = json.loads(out["inputs"])
         return out
@@ -703,28 +707,43 @@ class Ledger:
     _ADMITTED = ("EXISTS (SELECT 1 FROM execution_closures c WHERE c.execution_id = {t}.execution_id "
                  "AND c.outcome = 'admitted')")
 
-    def receipt_records(self, domain: str | None = None) -> list[ReceiptRecord]:
+    @staticmethod
+    def _scope(t: str, domain: str | None, namespace: str | None) -> tuple[str, tuple]:
+        """SQL filter: optional domain, optional §N namespace of the record's execution."""
+        sql, args = "", ()
+        if domain:
+            sql, args = f" AND {t}.domain = ?", (domain,)
+        if namespace is not None:
+            sql += " AND e.namespace = ?"
+            args += (namespace,)
+        return sql, args
+
+    def receipt_records(self, domain: str | None = None, *,
+                        namespace: str | None = None) -> list[ReceiptRecord]:
         """Receipts of executions with an ``admitted`` closure (an open execution's receipts carry
-        no authority)."""
+        no authority). ``namespace`` restricts them to executions of that §N namespace; ``None``
+        is the unscoped view over every namespace. Each record carries its execution's namespace."""
+        where, args = self._scope("r", domain, namespace)
         sql = ("SELECT r.receipt_id, r.body, "
                "EXISTS (SELECT 1 FROM revocations v WHERE v.target_id = r.receipt_id), "
-               "EXISTS (SELECT 1 FROM quarantines q WHERE q.target_id = r.receipt_id) "
-               "FROM receipts r WHERE " + self._ADMITTED.format(t="r")
-               + (" AND r.domain = ?" if domain else "") + " ORDER BY r.event_seq")
-        rows = self.conn.execute(sql, (domain,) if domain else ())
-        return [ReceiptRecord(rid, Receipt.model_validate_json(body), bool(rv), bool(q))
-                for rid, body, rv, q in rows]
+               "EXISTS (SELECT 1 FROM quarantines q WHERE q.target_id = r.receipt_id), e.namespace "
+               "FROM receipts r JOIN executions e ON e.execution_id = r.execution_id WHERE "
+               + self._ADMITTED.format(t="r") + where + " ORDER BY r.event_seq")
+        return [ReceiptRecord(rid, Receipt.model_validate_json(body), bool(rv), bool(q), ns)
+                for rid, body, rv, q, ns in self.conn.execute(sql, args)]
 
-    def identity_records(self, domain: str | None = None) -> list[IdentityRecord]:
+    def identity_records(self, domain: str | None = None, *,
+                         namespace: str | None = None) -> list[IdentityRecord]:
+        where, args = self._scope("i", domain, namespace)
         sql = ("SELECT i.identity_id, i.presentation, i.code, i.domain, i.execution_id, i.issuer, "
                "i.issuer_version, "
                "EXISTS (SELECT 1 FROM revocations v WHERE v.target_id = i.identity_id), "
-               "EXISTS (SELECT 1 FROM quarantines q WHERE q.target_id = i.identity_id) "
-               "FROM identities i WHERE " + self._ADMITTED.format(t="i")
-               + (" AND i.domain = ?" if domain else "") + " ORDER BY i.event_seq")
-        rows = self.conn.execute(sql, (domain,) if domain else ())
-        return [IdentityRecord(*row[:7], revoked=bool(row[7]), quarantined=bool(row[8]))
-                for row in rows]
+               "EXISTS (SELECT 1 FROM quarantines q WHERE q.target_id = i.identity_id), "
+               "e.namespace FROM identities i JOIN executions e ON e.execution_id = i.execution_id "
+               "WHERE " + self._ADMITTED.format(t="i") + where + " ORDER BY i.event_seq")
+        return [IdentityRecord(*row[:7], revoked=bool(row[7]), quarantined=bool(row[8]),
+                               namespace=row[9])
+                for row in self.conn.execute(sql, args)]
 
     # -- campaign projections ---------------------------------------------------------------------
     def campaign(self, campaign_id: str) -> dict | None:

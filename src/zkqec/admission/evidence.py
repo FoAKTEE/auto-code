@@ -34,6 +34,7 @@ class ReceiptRecord:
     receipt: Receipt
     revoked: bool = False
     quarantined: bool = False
+    namespace: str | None = None          # §N namespace of the receipt's execution
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class IdentityRecord:
     issuer_version: str
     revoked: bool = False
     quarantined: bool = False
+    namespace: str | None = None          # §N namespace of the record's execution
 
 
 def is_authorizing(r: Receipt) -> bool:

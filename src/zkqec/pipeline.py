@@ -15,7 +15,11 @@ plus this process's own) and wall time are charged. Settlement commits inside th
 closing transaction (fenced by the lease generation). Recovery (§L): a settled job is only ever
 *read* (its execution's recorded closure); a settled job whose execution never closed gets its old
 execution closed as abandoned and a **new** reserved retry job (``retry_of``, its own execution key
-and reservation, fenced settlement). Agents never call this module; the orchestrator does.
+and reservation, fenced settlement). Namespacing (§N): every execution carries the job book's
+namespace (campaign/arm/split/profile) in its identity and record, and every evidence lookup uses
+the namespace's resolver, so another namespace's closure is never reused and its receipts never
+count here; within a namespace, settled work is read, not re-run. Agents never call this module;
+the orchestrator does.
 """
 from __future__ import annotations
 
@@ -163,6 +167,7 @@ class Pipeline:
                  wall_reservation: int = 600, families: tuple[str, ...] | None = None,
                  guard=None, memory_bytes: int | None = None):
         self.adm, self.store, self.book, self.domain = admission, store, book, domain
+        self.namespace = book.namespace           # §N: executions and evidence are scoped to it
         self.memory_bytes = memory_bytes          # None: from the distance budget (see limits())
         self.guard = guard            # frozen-evaluator check before every verifier run (§4.3)
         self.caps, self.distance_budget = caps, distance_budget or {}
@@ -182,18 +187,20 @@ class Pipeline:
             if state == "dispatched":
                 raise JobError(f"{job} holds a live lease; run recover() before resuming")
             if state == "reserved":
-                done = self.adm.closed_report(name, inputs, self.domain, ekey)
-                if done is not None:                     # closed under another namespace's job
+                done = self.adm.closed_report(name, inputs, self.domain, ekey,
+                                              namespace=self.namespace)
+                if done is not None:                     # closed by this namespace's earlier job
                     self.book.cancel(job)
                     return done
                 return self._execute(job, name, inputs, ekey, identity)
             if state != "settled":                       # completed/failed/uncertain: charge it
                 self.book.settle(job)
-            done = self.adm.closed_report(name, inputs, self.domain, ekey)
+            done = self.adm.closed_report(name, inputs, self.domain, ekey, namespace=self.namespace)
             if done is not None and done.detail.get("error_type") != "abandoned":
                 return done                              # settled work is only ever read
             if done is None:
-                eid = self.adm.execution_id_for(name, inputs, self.domain, ekey)
+                eid = self.adm.execution_id_for(name, inputs, self.domain, ekey,
+                                                namespace=self.namespace)
                 if self.adm.ledger.execution(eid) is not None:
                     self.adm.abandon(eid, f"job {job} settled without a closure; retried")
             prev = job
@@ -229,9 +236,14 @@ class Pipeline:
         if identity:
             return self.adm.run_identity(name, inputs["presentation"], self.domain,
                                          idempotency_key=ekey, on_close=settle, limits=limits,
-                                         on_measure=measure)
+                                         on_measure=measure, namespace=self.namespace)
         return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=ekey,
-                                     on_close=settle, limits=limits, on_measure=measure)
+                                     on_close=settle, limits=limits, on_measure=measure,
+                                     namespace=self.namespace)
+
+    def resolver(self):
+        """Current authority from this namespace's executions only (§N)."""
+        return self.adm.resolver(self.domain, namespace=self.namespace)
 
     # -- evaluation --------------------------------------------------------------------------------
     def evaluate(self, proposal: Proposal, task: TaskSA | TaskSF) -> Evaluation:
@@ -246,13 +258,13 @@ class Pipeline:
         p_sha = self.store.put_json(pres.model_dump(mode="json"))
         ev = Evaluation("evaluated", presentation=p_sha)
         self._run("l1.css_algebra", {"presentation": p_sha}, f"l1:{p_sha}")
-        res = self.adm.resolver(self.domain)
+        res = self.resolver()
         facts = self._presentation_facts(res, p_sha)
         if facts.get("css_valid") != "verified":
             ev.facts = facts
             return self._verdicts(ev, task, DesignCandidate(C=p_sha))
         self._run("identity.code_sha", {"presentation": p_sha}, f"id:{p_sha}", identity=True)
-        res = self.adm.resolver(self.domain)
+        res = self.resolver()
         ev.code = (res.code_of(p_sha) or (None, None))[0]
         facts = self._presentation_facts(res, p_sha)
         t = task.targets
@@ -267,7 +279,7 @@ class Pipeline:
         candidate = DesignCandidate(C=p_sha)
         if isinstance(task, TaskSF) and not cheap_fail:
             candidate = self._evaluate_operation(proposal, task, p_sha, facts, candidate, ev)
-        ev.facts = {**facts, **self._distance_facts(self.adm.resolver(self.domain), ev.code)}
+        ev.facts = {**facts, **self._distance_facts(self.resolver(), ev.code)}
         return self._verdicts(ev, task, candidate)
 
     def _evaluate_operation(self, proposal, task: TaskSF, p_sha, facts, candidate, ev):
@@ -366,7 +378,7 @@ class Pipeline:
 
     def _verdicts(self, ev: Evaluation, task, candidate: DesignCandidate) -> Evaluation:
         ev.candidate = self.store.put_json(candidate.model_dump(mode="json"))
-        res = self.adm.resolver(self.domain)
+        res = self.resolver()
         ev.satisfies = res.satisfies_task(candidate, task).status
         for req in res.requirement_names(task):
             st = res.target_refuted(candidate, task, req).status
