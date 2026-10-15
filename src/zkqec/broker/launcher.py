@@ -26,6 +26,7 @@ MITMDUMP = REPO / ".venv-broker" / "bin" / "mitmdump"
 ADDON = Path(__file__).resolve().with_name("addon.py")
 POLICY_MODULE = Path(__file__).resolve().with_name("policy.py")
 BASE_POLICY = REPO / "configs" / "broker" / "policy.json"
+PRICES = REPO / "configs" / "broker" / "prices.json"
 CA_CERT_NAME = "mitmproxy-ca-cert.pem"
 
 
@@ -84,7 +85,9 @@ class Broker:
         self.mitmdump = mitmdump
         self.port: int | None = None
         self.proc: subprocess.Popen[bytes] | None = None
-        for d in (self.root, self.confdir, self.state, self.state / "grants", self.state / "blocked"):
+        self.prices = PRICES
+        for d in (self.root, self.confdir, self.state, self.state / "grants", self.state / "blocked",
+                  self.state / "issued"):
             d.mkdir(parents=True, exist_ok=True)
             os.chmod(d, 0o700)
         doc = json.loads(Path(base_policy).read_text())
@@ -163,8 +166,10 @@ class Broker:
                     max_input_bytes=ceilings.max_input_bytes, max_output_tokens=ceilings.max_output_tokens,
                     expires_unix=time.time() + ceilings.ttl_seconds)
         P.parse_grant(g.to_json())
-        _atomic_write(self.state / "grants" / (P.token_digest(token) + ".json"),
-                      json.dumps(g.to_json(), sort_keys=True).encode())
+        body = json.dumps(g.to_json(), sort_keys=True).encode()
+        # The issued copy outlives revocation: it is the sealed record of the job's ceilings (§M).
+        _atomic_write(self.state / "issued" / f"{job_id}.json", body)
+        _atomic_write(self.state / "grants" / (P.token_digest(token) + ".json"), body)
         return token
 
     def revoke(self, token: str) -> None:
@@ -211,7 +216,30 @@ class Broker:
         return {"mitmdump": str(self.mitmdump), "addon_sha256": sha256_file(ADDON),
                 "policy_module_sha256": sha256_file(POLICY_MODULE),
                 "policy_sha256": sha256_file(self.policy_path), "ca_cert_sha256": sha256_file(self.ca_cert)
-                if self.ca_cert.exists() else None, "mitmproxy_version": mitmproxy_version(self.mitmdump)}
+                if self.ca_cert.exists() else None, "mitmproxy_version": mitmproxy_version(self.mitmdump),
+                "prices_sha256": sha256_file(self.prices)}
+
+    def export_evidence(self, dest: str | os.PathLike[str]) -> dict[str, Any]:
+        """Copy the campaign's broker evidence into ``dest`` for sealing (§M): the log, the effective
+        policy, the declared prices, every issued grant, the blocked markers and a broker manifest
+        (``broker-manifest.json``: :meth:`manifest` plus the sha256 of every exported file). The log
+        holds sanitized metadata only; the seal secret-scans every exported file."""
+        dest = Path(dest)
+        for d in (dest, dest / "grants", dest / "blocked"):
+            d.mkdir(parents=True, exist_ok=True)
+        files = {"broker-log.jsonl": self.log_path, "policy.json": self.policy_path,
+                 "prices.json": self.prices}
+        for sub in ("issued", "blocked"):
+            for f in sorted((self.state / sub).glob("*.json")):
+                files[f"{'grants' if sub == 'issued' else sub}/{f.name}"] = f
+        shas = {}
+        for rel, src in sorted(files.items()):
+            data = Path(src).read_bytes() if Path(src).exists() else b""
+            (dest / rel).write_bytes(data)
+            shas[rel] = hashlib.sha256(data).hexdigest()
+        out = {**self.manifest(), "files": shas}
+        (dest / "broker-manifest.json").write_text(json.dumps(out, indent=2, sort_keys=True))
+        return out
 
     def remove_ca_key(self) -> None:
         """End of campaign: delete the CA private key material."""

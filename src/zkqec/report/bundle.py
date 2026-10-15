@@ -14,7 +14,9 @@ through the archive.
 
 A bundle holds the campaign's complete transitive evidence: manifest (with CAS refs and the ledger
 head), a consistent ledger snapshot (which carries the frozen campaign, evaluation membership and
-settlement events), every stored artifact, the report, and any call records / broker logs.
+settlement events), every stored artifact, the report, the call records and, for a live campaign,
+the broker evidence (``broker/``: sanitized log, effective policy, declared prices, issued grants,
+markers, broker manifest).
 ``audit_bundle`` rebuilds everything in an empty directory from the archived runtime + wheels only
 (pip ``--no-index``), then runs the inner audit inside a bwrap network namespace: chain + apply
 invariants + projections + event-referenced artifact hashes (``Admission.verify``), every stored
@@ -22,7 +24,13 @@ artifact and redaction record re-hashed, every candidate component and call-reco
 reference traversed, the operational job tables reconciled with the ``job_settled`` events and the
 frozen caps, call-record usage reconciled with the settled measurements, byte-level replay of every
 execution, the §I control suite re-run from the frozen campaign's inputs with byte-identical evidence
-required, and the report lint against the ledger only.
+required, the broker evidence reconciled with the frozen manifest, the call records and the
+settlements (:func:`audit_broker`), and the report lint against the ledger only.
+
+The confirmation runs after sealing. Its settlement and the campaign's final totals are published
+next to the bundle as ``<bundle sha256>.confirmation.json`` (:func:`confirmation_supplement`): the
+ledger events appended after the sealed head, hash-chained from it, so :func:`check_confirmation`
+verifies them against the bundle alone (Codex M1 milestone review B6).
 """
 from __future__ import annotations
 
@@ -233,10 +241,11 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
 
 
 def audit_bundle(bundle: Path, archive: Path | None = None, workdir: Path | None = None,
-                 offline: bool = True) -> dict[str, Any]:
+                 offline: bool = True, supplement: Path | None = None) -> dict[str, Any]:
     """Reconstruct in an empty directory from the bundle file alone and run the inner audit.
 
-    v2 bundles embed their closures; ``archive`` is consulted only for v1 bundles."""
+    v2 bundles embed their closures; ``archive`` is consulted only for v1 bundles. A confirmation
+    ``supplement`` is checked against the bundle as well."""
     workdir = Path(workdir or tempfile.mkdtemp(prefix="zkqec-audit-")).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     if any(workdir.iterdir()):
@@ -279,7 +288,143 @@ def audit_bundle(bundle: Path, archive: Path | None = None, workdir: Path | None
         result = {"ok": False, "problems": [f"inner audit failed: {proc.stderr[-2000:]}"]}
     result["workdir"] = str(workdir)
     result["offline"] = offline
+    if supplement is not None:
+        extra = [f"confirmation: {p}" for p in check_confirmation(bundle, supplement)]
+        result["problems"] = list(result.get("problems", [])) + extra
+        result["ok"] = bool(result.get("ok")) and not extra
     return result
+
+
+# --- confirmation supplement (§K, §M) ---------------------------------------------------------------
+CONFIRMATION_FORMAT = "zkqec-confirmation-v1"
+
+
+def confirmation_supplement(adm, campaign_id: str, entry: dict, job_id: str, totals: dict,
+                            audit: dict) -> dict[str, Any]:
+    """The confirmation's settlement and the final totals, linked to the sealed bundle: every event
+    appended after the sealed ledger head (hash-chained from it) plus the totals per unit."""
+    head = entry["ledger_head"]
+    events = [{"seq": e.seq, "prev_hash": e.prev_hash, "hash": e.hash, "kind": e.kind,
+               "payload": e.payload} for e in adm.ledger.events() if e.seq > head["seq"]]
+    last = adm.ledger.head()
+    return {"format": CONFIRMATION_FORMAT, "campaign_id": campaign_id,
+            "bundle_sha256": entry["bundle_sha256"], "bundle_ledger_head": head,
+            "confirmation_job": job_id, "events": events,
+            "ledger_head": {"seq": last[0], "hash": last[1]},
+            "audit": {"ok": bool(audit.get("ok")), "problems": list(audit.get("problems", []))[:50]},
+            "final_totals": totals}
+
+
+def publish_confirmation(entry: dict, doc: dict) -> tuple[Path, str]:
+    """Publish the supplement next to the bundle (durably, secret-scanned); return (path, sha256)."""
+    from zkqec.contracts import canonical_json
+    from zkqec.store import SecretDetected
+    from zkqec.store.sanitize import DEFAULT_SANITIZER
+    if DEFAULT_SANITIZER.detect_obj(doc):
+        raise SecretDetected("refusing to publish a confirmation supplement with secret-like content")
+    data = canonical_json(doc)
+    path = Path(entry["path"]).with_name(f"{entry['bundle_sha256']}.confirmation.json")
+    atomic_write_bytes(path, data)
+    return path, hashlib.sha256(data).hexdigest()
+
+
+def _bundle_members(bundle: Path, names: set[str], dest: Path) -> dict[str, Path]:
+    """Stream the bundle once and extract only ``names`` (regular files) into ``dest``."""
+    out: dict[str, Path] = {}
+    with open(bundle, "rb") as f:
+        reader = zstandard.ZstdDecompressor().stream_reader(f)
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
+            for m in tar:
+                if m.name in names and m.isfile():
+                    target = dest / Path(m.name).name
+                    with open(target, "wb") as fout:
+                        shutil.copyfileobj(tar.extractfile(m), fout)
+                    out[m.name] = target
+    return out
+
+
+def check_confirmation(bundle: Path, supplement: Path) -> list[str]:
+    """A confirmation supplement against its sealed bundle: same bundle hash and sealed head, events
+    chained from that head, exactly the frozen confirmation job settled under the settlement rule,
+    and final totals equal to the sealed settlements plus the supplement's."""
+    from zkqec.admission.ledger import event_hash
+    from zkqec.contracts import UNITS, UsageError, check_usage
+    from zkqec.contracts.jobs import charge_for
+    try:
+        doc = json.loads(Path(supplement).read_text())
+    except (OSError, ValueError) as exc:
+        return [f"supplement unreadable: {type(exc).__name__}"]
+    if not isinstance(doc, dict) or doc.get("format") != CONFIRMATION_FORMAT:
+        return ["supplement has an unknown format"]
+    problems: list[str] = []
+    sha = _sha_file(bundle)
+    if bundle.name != f"{sha}.tar.zst" or doc.get("bundle_sha256") != sha:
+        problems.append("supplement does not name this bundle's sha256")
+    with tempfile.TemporaryDirectory() as td:
+        got = _bundle_members(bundle, {"bundle/manifest.json", "bundle/ledger.db"}, Path(td))
+        if len(got) != 2:
+            return problems + ["bundle lacks its manifest or ledger"]
+        manifest = json.loads(got["bundle/manifest.json"].read_text())
+        conn = sqlite3.connect(f"file:{got['bundle/ledger.db']}?mode=ro", uri=True)
+        try:
+            sealed = [(k, json.loads(p)) for k, p in conn.execute(
+                "SELECT kind, payload FROM events ORDER BY seq")]
+            confirm_jobs = [r[0] for r in conn.execute(
+                "SELECT job_id FROM ops_jobs WHERE kind='confirm' AND state='reserved'")]
+        finally:
+            conn.close()
+    cid = manifest.get("campaign_id")
+    head = manifest.get("ledger_head") or {}
+    if doc.get("campaign_id") != cid or doc.get("bundle_ledger_head") != head:
+        problems.append("supplement names another campaign or sealed ledger head")
+    frozen = next((p for k, p in sealed if k == "campaign_frozen" and p.get("campaign_id") == cid), None)
+    if frozen is None:
+        return problems + ["the sealed ledger has no frozen campaign"]
+    prev, seq = head.get("hash"), head.get("seq", 0)
+    settled = []
+    for ev in doc.get("events") or []:
+        seq += 1
+        if ev.get("seq") != seq or ev.get("prev_hash") != prev \
+                or ev.get("hash") != event_hash(prev, ev.get("kind"), ev.get("payload")):
+            problems.append(f"supplement event {ev.get('seq')} does not chain from the sealed head")
+            break
+        prev = ev["hash"]
+        if ev["kind"] != "job_settled":
+            problems.append(f"supplement event {seq} is a {ev['kind']}, not a settlement")
+            continue
+        settled.append(ev["payload"])
+    if doc.get("ledger_head") != {"seq": seq, "hash": prev}:
+        problems.append("supplement ledger head is not its last event")
+    want = {u: float((frozen.get("confirmation") or {}).get(u, 0.0)) for u in UNITS}
+    confirm = [p for p in settled if p.get("kind") == "confirm"]
+    if len(settled) != 1 or len(confirm) != 1:
+        problems.append(f"supplement settles {len(settled)} jobs, not exactly the confirmation")
+    for p in confirm:
+        if p.get("campaign_id") != cid or p.get("namespace") != frozen.get("namespace") \
+                or p.get("job_id") not in confirm_jobs or p.get("job_id") != doc.get("confirmation_job"):
+            problems.append("supplement settles a job that is not the sealed confirmation job")
+        if p.get("reservation") != want:
+            problems.append("confirmation settlement reservation differs from the frozen one")
+        try:
+            rule = charge_for(p.get("from_state"), p.get("reservation") or {},
+                              check_usage(p.get("actual")))
+        except (UsageError, TypeError, ValueError):
+            rule = None
+        if rule != p.get("charged"):
+            problems.append("confirmation charge does not follow the settlement rule (§K)")
+    if not (doc.get("audit") or {}).get("ok"):
+        problems.append("the confirmation audit did not pass")
+    spent = {u: 0.0 for u in UNITS}
+    for p in [p for k, p in sealed if k == "job_settled" and p.get("campaign_id") == cid] + settled:
+        for u in UNITS:
+            spent[u] += float((p.get("charged") or {}).get(u, 0.0))
+    totals = doc.get("final_totals") or {}
+    for u in UNITS:
+        t = totals.get(u) or {}
+        if abs(float(t.get("spent", -1)) - spent[u]) > 1e-9 or float(t.get("open", -1)) != 0.0:
+            problems.append(f"final totals for {u} differ from the sealed and confirmation "
+                            "settlements (or leave a reservation open)")
+    return problems
 
 
 def replay_executions(adm, reg, store) -> tuple[list[str], int, int]:
@@ -394,6 +539,127 @@ def audit_campaign(adm, store, campaign_id: str) -> list[str]:
     return problems
 
 
+BROKER_PINS = ("addon_sha256", "policy_module_sha256", "policy_sha256", "prices_sha256",
+               "ca_cert_sha256", "mitmproxy_version")
+BROKER_SUMMARY = ("upstream_requests", "model_requests", "blocked", "models", "declared_tools", "usage",
+                  "usage_records", "usage_missing", "failed")
+
+
+def audit_broker(adm, store, campaign_id: str, broker_dir: Path) -> list[str]:
+    """The sealed broker evidence against the frozen manifest, the call records and the settlements
+    (§J5, §K, §M): the broker the campaign froze is the broker whose files were sealed; each call's
+    model requests and usage are reconstructed from the sealed log (the authoritative telemetry) and
+    must equal its call record and its settled measurement; incomplete usage must have settled
+    uncertain; each call's issued grant is the per-request derivation of its reservation and the log
+    shows it respected; a broker job without a call is an orphan."""
+    from zkqec.agents.providers import call_ceilings
+    from zkqec.broker.launcher import summarize_job
+    from zkqec.contracts import Reservation
+
+    camp = adm.ledger.campaign(campaign_id)
+    manifest = store.get_json(camp["manifest"]) if camp else {}
+    frozen = manifest.get("broker") if isinstance(manifest, dict) else None
+    broker_dir = Path(broker_dir)
+    if not frozen:
+        return ["broker evidence sealed for a campaign that froze no broker"] \
+            if broker_dir.exists() else []
+    if not (broker_dir / "broker-manifest.json").is_file():
+        return ["the frozen manifest names a broker but the bundle holds no broker evidence"]
+    problems: list[str] = []
+    bm = json.loads((broker_dir / "broker-manifest.json").read_text())
+    listed = bm.get("files") or {}
+    present = {str(p.relative_to(broker_dir)) for p in broker_dir.rglob("*") if p.is_file()}
+    for rel in sorted(present - set(listed) - {"broker-manifest.json"}):
+        problems.append(f"{rel}: not listed in the broker manifest")
+    for rel, sha in sorted(listed.items()):
+        f = broker_dir / rel
+        if not f.is_file() or f.is_symlink() or _sha_file(f) != sha:
+            problems.append(f"{rel}: missing or differs from the broker manifest")
+    for key in BROKER_PINS:
+        if bm.get(key) != frozen.get(key):
+            problems.append(f"broker {key} differs from the frozen manifest")
+    for rel, key in (("policy.json", "policy_sha256"), ("prices.json", "prices_sha256")):
+        if not (broker_dir / rel).is_file() or _sha_file(broker_dir / rel) != frozen.get(key):
+            problems.append(f"{rel} is not the frozen {key}")
+    records, last = [], 0
+    for n, line in enumerate((broker_dir / "broker-log.jsonl").read_bytes().splitlines(), 1):
+        try:
+            rec = json.loads(line)
+            assert isinstance(rec, dict) and rec.get("seq", 0) > last
+        except (ValueError, AssertionError):
+            problems.append(f"broker log line {n} is unreadable or out of sequence")
+            continue
+        last = rec["seq"]
+        records.append(rec)
+        if rec.get("event") == "broker_start" and rec.get("policy_sha256") != frozen.get("policy_sha256"):
+            problems.append(f"broker log line {n}: broker started under another policy")
+    by_job: dict[str, list[dict]] = {}
+    for rec in records:
+        if rec.get("job_id"):
+            by_job.setdefault(rec["job_id"], []).append(rec)
+    calls: set[str] = set()
+    for s in adm.ledger.settlements(campaign_id):
+        if s["kind"] != "propose" or not s["result"]:
+            continue
+        tag = f"job {s['job_id']}"
+        try:
+            rec = store.get_json(s["result"])
+        except Exception:                                        # noqa: BLE001 (audit_campaign)
+            continue
+        sj = rec.get("sandbox_job_id") if isinstance(rec, dict) else None
+        if not isinstance(sj, str) or not sj:
+            problems.append(f"{tag}: its call record names no broker job")
+            continue
+        calls.add(sj)
+        summ = summarize_job(by_job.get(sj, []))
+        mine = rec.get("broker") if isinstance(rec.get("broker"), dict) else {}
+        for key in BROKER_SUMMARY:
+            if mine.get(key) != summ[key]:
+                problems.append(f"{tag}: call record broker {key} differs from the sealed broker log")
+        actual = s["actual"] or {}
+        if "requests" in actual and actual["requests"] != float(summ["model_requests"]):
+            problems.append(f"{tag}: settled requests differ from the sealed broker log")
+        complete = summ["usage"] != "unknown" and summ["usage_missing"] == 0
+        if complete:
+            u = summ["usage"]
+            tokens = {"input_tokens": float(u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                                            + u.get("cache_read_input_tokens", 0)),
+                      "output_tokens": float(u.get("output_tokens", 0))}
+            if summ["model_requests"] and any(actual.get(k) != v for k, v in tokens.items()):
+                problems.append(f"{tag}: settled tokens differ from the sealed broker usage")
+        elif summ["model_requests"] and (s["from_state"] != "uncertain"
+                                         or {"input_tokens", "output_tokens"} & set(actual)):
+            problems.append(f"{tag}: usage is incomplete in the broker log but the call did not "
+                            "settle uncertain at its reservation")
+        try:
+            grant = json.loads((broker_dir / "grants" / f"{sj}.json").read_text())
+        except (OSError, ValueError):
+            problems.append(f"{tag}: no issued grant for broker job {sj}")
+            continue
+        r = s["reservation"]
+        try:
+            c = call_ceilings(Reservation(usd=r["usd"], requests=int(r["requests"]),
+                                          input_tokens=int(r["input_tokens"]),
+                                          output_tokens=int(r["output_tokens"]),
+                                          wall_seconds=int(r["wall_seconds"]),
+                                          cpu_seconds=int(r["cpu_seconds"])))
+            want = (c.max_model_requests, c.max_total_requests, c.max_input_bytes, c.max_output_tokens)
+        except Exception:                                        # noqa: BLE001
+            want = None
+        if want != tuple(grant.get(k) for k in ("max_model_requests", "max_total_requests",
+                                                "max_input_bytes", "max_output_tokens")):
+            problems.append(f"{tag}: issued grant is not the per-request derivation of its reservation")
+        allowed = [x for x in by_job.get(sj, []) if x.get("decision") == "allow"
+                   and x.get("event") in ("request", "ws_frame") and x.get("model_request")]
+        if len(allowed) > grant.get("max_model_requests", 0) or any(
+                (x.get("input_bytes") or 0) > grant.get("max_input_bytes", 0)
+                or (x.get("max_output_tokens") or 0) > grant.get("max_output_tokens", 0) for x in allowed):
+            problems.append(f"{tag}: the sealed broker log shows a request beyond its grant")
+    for sj in sorted(set(by_job) - calls):
+        problems.append(f"broker job {sj} has broker records but no settled call")
+    return problems
+
+
 def audit_inner(bundle_dir: str) -> dict[str, Any]:
     """Inside the reconstructed environment: verify ledger, store and accounting, replay
     executions, reproduce the recorded controls, lint the report (all from the bundle's ledger)."""
@@ -418,6 +684,8 @@ def audit_inner(bundle_dir: str) -> dict[str, Any]:
             problems.append("ledger head differs from the sealed manifest (truncation or tamper)")
         problems += [f"store: {p}" for p in store.verify_all()]
         problems += audit_campaign(adm, store, manifest["campaign_id"])
+        problems += [f"broker: {p}" for p in audit_broker(adm, store, manifest["campaign_id"],
+                                                          b / "broker")]
         replay_problems, replayed, identities = replay_executions(adm, reg, store)
         problems += replay_problems
         # scratch beside the bundle: the audit workdir is the only writable path offline

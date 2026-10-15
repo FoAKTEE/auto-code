@@ -1,11 +1,14 @@
 """Live campaign driver: campaign slice + broker + deadline supervisor + sandboxed Claude provider.
 
+The broker is handed to :func:`run_campaign`, which pins it in the frozen manifest (§O) and seals its
+evidence (log, effective policy, declared prices, issued grants, broker manifest) with the bundle
+(§M; Codex M1 milestone review B6).
+
 Codex is not K0-qualified on this host (qualification 20261015T105932Z: tools declared through
 ``additional_tools``), so live K0 campaigns use the Claude provider only (D16).
 """
 from __future__ import annotations
 
-import json
 import re
 import time
 from pathlib import Path
@@ -38,12 +41,9 @@ def run_live(cfg: CampaignConfig, run_root: Path, *, deadline_seconds: int = 360
         provider = ClaudeCallProvider(cfg.model, broker=broker, slice_=slice_,
                                       jobs_root=Path(f"/tmp/zkq-{ident}"), effort=cfg.effort)
         # Stop dispatching early enough to seal and confirm before the supervisor's hard deadline.
-        out = run_campaign(cfg, provider, Path(run_root),
-                           deadline_seconds=max(0, deadline_seconds - LIVE_SEAL_MARGIN_SECONDS))
-        out["broker_manifest"] = broker.manifest()
-        (Path(out["run_dir"]) / "broker-manifest.json").write_text(
-            json.dumps(out["broker_manifest"], indent=2, sort_keys=True, default=str))
-        return out
+        # The broker is pinned in the frozen manifest and its evidence is sealed with the bundle.
+        return run_campaign(cfg, provider, Path(run_root), broker=broker,
+                            deadline_seconds=max(0, deadline_seconds - LIVE_SEAL_MARGIN_SECONDS))
     finally:
         sup.disarm()
         broker.stop()

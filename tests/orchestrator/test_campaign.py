@@ -228,3 +228,77 @@ def test_every_call_retains_exact_inputs_and_raw_outputs(tmp_path):
         assert store.get_bytes(arts["output_text"]) == output.encode()   # malformed kept too
         assert store.get_bytes(arts["raw_stdout"]).startswith(b"raw stdout for ")
     assert events and events[0]["artifacts"] == store.get_json(results[1])["artifacts"]
+
+
+# --- Codex M1 milestone review B6: call inputs are durable and referenced before dispatch ----------
+class CrashingDouble(ReplayProviderDouble):
+    """The orchestrator dies while the call is in flight."""
+
+    def call(self, *, job_id, system_prompt, request, schema, reservation):
+        self.sent = (system_prompt, request, schema)
+        raise KeyboardInterrupt("orchestrator killed mid-call")
+
+
+def test_call_inputs_survive_a_crash_during_the_call(tmp_path):
+    import sqlite3
+    from zkqec.store import ArtifactStore
+    prov = CrashingDouble([])
+    with pytest.raises(KeyboardInterrupt):
+        run_campaign(cfg(), prov, tmp_path, require_clean=False, seal_bundle=False)
+    conn = sqlite3.connect(tmp_path / "t1" / "ledger.db")
+    ((state, intent),) = conn.execute("SELECT state, input_sha FROM ops_jobs WHERE kind='propose'")
+    conn.close()
+    assert state == "dispatched"                     # recovery turns it uncertain (full charge)
+    store = ArtifactStore(tmp_path / "t1" / "store")
+    doc = store.get_json(intent)
+    system_prompt, request, schema = prov.sent
+    assert doc["kind"] == "zkqec.call_inputs/1" and doc["task_id"] == "sa-secret-id"
+    assert doc["reservation"] == cfg().per_call.model_dump(mode="json")
+    arts = doc["artifacts"]
+    assert store.get_bytes(arts["request"]) == request.encode()
+    assert store.get_bytes(arts["system_prompt"]) == system_prompt.encode()
+    assert json.loads(store.get_bytes(arts["schema"])) == schema
+
+
+def test_call_records_name_their_input_intent(tmp_path):
+    import sqlite3
+    from zkqec.store import ArtifactStore
+    run_campaign(cfg(), ReplayProviderDouble([GOOD]), tmp_path, require_clean=False, seal_bundle=False)
+    conn = sqlite3.connect(tmp_path / "t1" / "ledger.db")
+    ((intent, rec_sha),) = conn.execute("SELECT input_sha, result_sha FROM ops_jobs WHERE kind='propose'")
+    conn.close()
+    store = ArtifactStore(tmp_path / "t1" / "store")
+    rec = store.get_json(rec_sha)
+    assert rec["inputs"] == intent
+    assert {k: rec["artifacts"][k] for k in ("request", "system_prompt", "schema")} == \
+        store.get_json(intent)["artifacts"]
+
+
+def test_run_live_hands_its_broker_to_the_campaign(tmp_path, monkeypatch):
+    """The broker manifest and evidence are sealed by run_campaign, not written after it."""
+    import zkqec.orchestrator.live as live
+    seen = {}
+
+    class Stub:
+        def __init__(self, *a, **k):
+            self.switch_path = tmp_path / "OFF"
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(live, "CampaignSlice", Stub)
+    monkeypatch.setattr(live, "Broker", Stub)
+    monkeypatch.setattr(live, "DeadlineSupervisor", Stub)
+    monkeypatch.setattr(live, "ClaudeCallProvider", Stub)
+
+    def fake_run(cfg, provider, run_root, **kw):
+        seen.update(kw)
+        (Path(run_root) / cfg.campaign_id).mkdir()
+        return {"run_dir": str(Path(run_root) / cfg.campaign_id)}
+    monkeypatch.setattr(live, "run_campaign", fake_run)
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "configs" / "campaigns" / "m1-live.json"
+    out = live.run_live(CampaignConfig.model_validate_json(path.read_text()), tmp_path)
+    assert isinstance(seen.get("broker"), Stub)
+    assert sorted(p.name for p in (tmp_path / "m1-live-4").iterdir()) == []
+    assert "broker_manifest" not in out

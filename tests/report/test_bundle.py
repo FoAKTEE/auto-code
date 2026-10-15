@@ -59,3 +59,21 @@ def test_seal_and_offline_audit_roundtrip(tmp_path):
     entry2 = seal(run, "bundle-test", run / "ledger.db", run / "store",
                   md.replace("**verified**", "**verified (novel)**"), out_dir=out)
     assert not audit_bundle(Path(entry2["path"]), workdir=tampered)["ok"]
+
+
+@pytest.mark.slow
+def test_live_like_bundle_carries_broker_evidence_and_confirms_offline(tmp_path, monkeypatch):
+    """Codex M1 milestone review B6: a live-like campaign (production provider, real campaign broker
+    files, a CLI stand-in) seals its broker evidence, the offline audit reconciles it from the bundle
+    alone, and the confirmation supplement checks against the bundle."""
+    import zkqec.orchestrator.campaign as campaign
+    import zkqec.report.bundle as bundle_mod
+    from test_broker_evidence import run_live_like
+    orig = bundle_mod.seal
+    monkeypatch.setattr(campaign, "seal", lambda *a, **k: orig(*a, out_dir=tmp_path / "bundles", **k))
+    out, run, _ = run_live_like(tmp_path, monkeypatch, cid="slow-evid")
+    assert out["audit"]["ok"], out["audit"]
+    supp = Path(out["confirmation_supplement"]["path"])
+    assert out["confirmation_supplement"]["problems"] == []
+    assert bundle_mod.check_confirmation(Path(out["bundle"]["path"]), supp) == []
+    assert out["confirmation"]["cpu_seconds"] > 0 and out["confirmation"]["usd"] == 0

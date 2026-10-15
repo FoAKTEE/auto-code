@@ -7,8 +7,16 @@ actual usage (a ``job_settled`` event in the same transaction) → strict intake
 pipeline.evaluate → ``evaluation_recorded`` → stop when the task is satisfied or the proposal budget
 is spent → [``controls``: the §I control suite in a scratch directory, as a verifier-class job reserved
 at freeze; its evidence stored and recorded with ``controls_recorded``] → templated report (from the
-ledger only) → sealed bundle → offline audit (the Phase-1a confirmation: re-execution from the
-sealed bundle, the control suite included).
+ledger only) → [broker evidence exported] → sealed bundle → offline audit (the Phase-1a confirmation:
+re-execution from the sealed bundle, the control suite included) → confirmation supplement.
+
+Evidence order (§M; Codex M1 milestone review B6). A call's inputs (request bytes, system prompt,
+schema as sent) are stored durably and named by a ``call_inputs`` intent artifact, which is the job's
+``input_sha``, **before** the job is reserved and dispatched: a crash during the call keeps them. A
+live campaign's broker is pinned in the frozen manifest (§O) and its evidence (log, effective policy,
+declared prices, issued grants, markers, broker manifest) is exported into the run before sealing, so
+the bundle carries it. The confirmation runs after sealing; its settlement and the final totals are
+published next to the bundle as a supplement whose events chain from the sealed ledger head.
 """
 from __future__ import annotations
 
@@ -30,7 +38,8 @@ from ..firewall.lint import check_fingerprints, family_terms, lint_contract, lin
 from ..grammar import MANIFESTS, GrammarCaps
 from ..grammar.intake import parse_proposal
 from ..pipeline import Evaluation, Pipeline, build_registry, evaluator_domain
-from ..report.bundle import audit_bundle, seal
+from ..report.bundle import (audit_bundle, check_confirmation, confirmation_supplement,
+                             publish_confirmation, seal)
 from ..report.render import render
 from ..store import ArtifactStore
 from . import freeze
@@ -80,6 +89,17 @@ class Provider(Protocol):
 
     def call(self, *, job_id: str, system_prompt: str, request: str, schema: dict,
              reservation: Reservation) -> CallResult: ...
+
+
+class BrokerEvidence(Protocol):
+    """A campaign broker as evidence (``zkqec.broker.launcher.Broker``)."""
+
+    def manifest(self) -> dict[str, Any]: ...
+
+    def export_evidence(self, dest: Path) -> dict[str, Any]: ...
+
+
+CALL_INPUTS = "zkqec.call_inputs/1"
 
 
 def profile_key(profile: Profile) -> str:
@@ -133,7 +153,8 @@ def _task_view(task: TaskSA | TaskSF) -> dict[str, Any]:
 def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                  require_clean: bool = True, seal_bundle: bool = True,
                  archive: Path | None = None,
-                 deadline_seconds: float | None = None) -> dict[str, Any]:
+                 deadline_seconds: float | None = None,
+                 broker: BrokerEvidence | None = None) -> dict[str, Any]:
     started = time.monotonic()
     limits = [x for x in (cfg.deadline_seconds, deadline_seconds) if x is not None]
     deadline = started + min(limits) if limits else None
@@ -162,7 +183,8 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 "config": config, "domain": dom, "registry": reg.manifest(),
                 "git": gs, "contract_sha256": content_hash(contract),
                 "evaluator_fingerprint": guard.manifest(), "output_schema": schema_sha,
-                "provider": provider.name, "model": provider.model}
+                "provider": provider.name, "model": provider.model,
+                "broker": broker.manifest() if broker is not None else None}
     manifest_sha = store.put_json(manifest)
     (run / "manifest.json").write_bytes(store.get_bytes(manifest_sha))
     prof = profile_key(cfg.profile)
@@ -212,26 +234,34 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                     raise RuntimeError("rendered P-min request names a code family/construction")
                 check_evaluator("provider dispatch")          # typed abort before reserving
                 freeze.check_task(adm, cfg.campaign_id, task)   # §I mode 1: frozen task hash
+                # §M: the call's exact inputs are durable and named by the job's intent before it
+                # is reserved and dispatched; outputs are added to the call record afterwards.
+                inputs = {"request": store.put_bytes(request.encode(), "prompt"),
+                          "system_prompt": store.put_bytes(contract.encode(), "prompt"),
+                          "schema": store.put_bytes(schema_bytes, "json")}
+                intent = store.put_json({"kind": CALL_INPUTS, "campaign_id": cfg.campaign_id,
+                                         "task_id": task.task_id, "attempt": i,
+                                         "provider": provider.name, "model": provider.model,
+                                         "reservation": cfg.per_call.model_dump(mode="json"),
+                                         "artifacts": inputs})
+                for sha in (*inputs.values(), intent):
+                    store.ensure_durable(sha)
                 try:
                     job = book.reserve("propose", f"{task.task_id}:{i}", cfg.per_call,
-                                       input_sha=content_hash(request))
+                                       input_sha=intent)
                 except BudgetExceeded as e:
                     stop_reason[task.task_id] = f"budget: {e}"
                     break
                 gen = book.dispatch(job)
                 res = provider.call(job_id=job, system_prompt=contract, request=request,
                                     schema=schema, reservation=cfg.per_call)
-                # §M: every attempt retains its exact inputs and raw outputs as sanitized
-                # artifacts, referenced from the call record before settlement.
-                arts = {"request": store.put_bytes(request.encode(), "prompt"),
-                        "system_prompt": store.put_bytes(contract.encode(), "prompt"),
-                        "schema": store.put_bytes(schema_bytes, "json")}
+                arts = dict(inputs)
                 if res.text is not None:
                     arts["output_text"] = store.put_bytes(res.text.encode(), "response")
                 for name, data in sorted(res.raw.items()):
                     arts[f"raw_{name}"] = store.put_bytes(bytes(data), "response")
                 rec = {**res.record, "job_id": job, "outcome": res.outcome, "usage": res.usage,
-                       "request_sha256": content_hash(request), "artifacts": arts}
+                       "request_sha256": content_hash(request), "inputs": intent, "artifacts": arts}
                 rec_sha = store.put_json(rec)
                 # The sidecar is the sanitized, content-addressed bytes, never the original (§M).
                 (calls_dir / f"{task.task_id}-{i:03d}.json").write_bytes(store.get_bytes(rec_sha))
@@ -284,13 +314,18 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                            "totals": totals}
     if control_summary is not None:
         out["controls"] = control_summary
+    extra_dirs = {"calls": calls_dir}
+    if broker is not None:              # sealed with the bundle, never written after it (§M)
+        out["broker_manifest"] = broker.export_evidence(run / "broker")
+        extra_dirs["broker"] = run / "broker"
     if seal_bundle:
         kw = {"archive": archive} if archive else {}
         entry = seal(run, cfg.campaign_id, run / "ledger.db", run / "store", report_md,
-                     extra_dirs={"calls": calls_dir}, commit=gs["commit"], **kw)
-        audit, confirmation_charge = _confirm(run, cfg, prof, store, confirm_job, entry, kw)
+                     extra_dirs=extra_dirs, commit=gs["commit"], **kw)
+        audit, confirmation_charge, supplement = _confirm(run, cfg, prof, store, confirm_job,
+                                                          entry, kw)
         out.update(bundle=entry, audit={k: audit[k] for k in ("ok", "problems") if k in audit},
-                   confirmation=confirmation_charge)
+                   confirmation=confirmation_charge, confirmation_supplement=supplement)
     return out
 
 
@@ -332,11 +367,12 @@ def _run_controls(cfg: CampaignConfig, adm: Admission, store: ArtifactStore, boo
 
 
 def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, job: str,
-             entry: dict, kw: dict) -> tuple[dict, dict]:
+             entry: dict, kw: dict) -> tuple[dict, dict, dict]:
     """Phase-1a confirmation (§7.4): offline re-execution from the sealed bundle, run under the
     confirmation job reserved at freeze. Its dispatch and settlement happen after the bundle was
     sealed (the sealed ledger shows the reservation as reserved, not spent); the measured wall and
-    child CPU time are charged in the run ledger."""
+    child CPU time are charged in the run ledger, and the settlement event with the final totals is
+    published next to the bundle as a hash-linked confirmation supplement (§K, §M)."""
     adm = Admission(run / "ledger.db", store, build_registry(store))
     try:
         book = adm.job_book(cfg.campaign_id, profile=prof)
@@ -353,6 +389,9 @@ def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, jo
                      "usd": 0.0, "requests": 0.0, "input_tokens": 0.0, "output_tokens": 0.0}
             book.complete(job, gen, "completed" if audit.get("ok") else "failed", actual=usage)
             charged = book.settle(job)
+        doc = confirmation_supplement(adm, cfg.campaign_id, entry, job, book.totals(), audit)
     finally:
         adm.close()
-    return audit, charged
+    path, sha = publish_confirmation(entry, doc)
+    problems = check_confirmation(Path(entry["path"]), path)
+    return audit, charged, {"path": str(path), "sha256": sha, "problems": problems}
