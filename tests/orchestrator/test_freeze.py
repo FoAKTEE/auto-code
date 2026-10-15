@@ -167,3 +167,69 @@ def test_boundary_check_records_an_incident_before_the_abort(repo, tmp_path):
         assert _incidents(adm) == ["evaluator_changed"]
     finally:
         adm.close()
+
+
+# --- Codex M1 milestone review #14: the evaluator runs from a read-only snapshot (§O) --------------
+def _snapshot_of(repo, tmp_path):
+    """A snapshot directory (no git) holding the committed evaluator files and their marker."""
+    import shutil
+    snap = tmp_path / "snap"
+    shutil.copytree(repo, snap, ignore=shutil.ignore_patterns(".git"))
+    commit = git(repo, "rev-parse", "HEAD")
+    fp = freeze.commit_fingerprint(repo, commit)
+    (snap / freeze.SNAPSHOT_MARKER).write_text(json.dumps(
+        {"kind": freeze.SNAPSHOT_KIND, "commit": commit, "fingerprint": fp["sha256"],
+         "evaluator_closure": "e" * 64}))
+    return snap, commit
+
+
+def test_guard_in_a_snapshot_checks_the_marker_not_git(repo, tmp_path):
+    snap, commit = _snapshot_of(repo, tmp_path)
+    guard = freeze.EvaluatorGuard(snap, commit=commit, check_imports=False)   # no git repo here
+    assert guard.manifest()["snapshot"]["commit"] == commit
+    guard.check("provider dispatch")
+    with pytest.raises(freeze.EvaluatorChanged, match="snapshot"):
+        freeze.EvaluatorGuard(snap, commit="0" * 40, check_imports=False)
+    (snap / "src/zkqec/a.py").write_text("A = 9\n")
+    with pytest.raises(freeze.EvaluatorChanged):
+        guard.check("verifier l2")
+    with pytest.raises(freeze.EvaluatorChanged, match="snapshot"):
+        freeze.EvaluatorGuard(snap, commit=commit, check_imports=False)
+
+
+def test_every_boundary_check_asserts_the_module_origin(tmp_path):
+    import sys
+    import types
+    guard = freeze.EvaluatorGuard(freeze.REPO)               # this process imports zkqec from REPO
+    guard.check("start")
+    rogue = types.ModuleType("zkqec._rogue_for_test")
+    rogue.__file__ = str(tmp_path / "rogue.py")
+    sys.modules[rogue.__name__] = rogue
+    try:
+        with pytest.raises(freeze.EvaluatorChanged, match="outside"):
+            guard.check("controls")
+    finally:
+        del sys.modules[rogue.__name__]
+    guard.check("confirmation")
+
+
+def test_the_import_guard_refuses_zkqec_modules_from_outside_the_snapshot(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "zkqec").mkdir(parents=True)
+    (outside / "zkqec" / "__init__.py").write_text("")
+    (outside / "zkqec" / "extra.py").write_text("X = 1\n")
+    finder = freeze.SnapshotImportGuard(freeze.REPO / "src")
+    with pytest.raises(ImportError, match="non-snapshot"):
+        finder.find_spec("zkqec.extra", [str(outside / "zkqec")])
+    assert finder.find_spec("zkqec.pipeline", [str(freeze.REPO / "src" / "zkqec")]) is not None
+    assert finder.find_spec("json", None) is None              # not ours to judge
+
+
+def test_runtime_facts_pin_python_cli_broker_and_dependencies():
+    facts = freeze.runtime_facts()
+    py = facts["python"]
+    assert py["version"].startswith("3.10") and len(py["executable_sha256"]) == 64
+    assert set(facts["claude_cli"]) >= {"path", "sha256"}
+    assert set(facts["broker"]) >= {"mitmdump", "mitmproxy_version", "addon_sha256",
+                                    "policy_module_sha256", "policy_sha256", "prices_sha256"}
+    assert facts["dependencies"]["lock_sha256"] and facts["dependencies"]["distributions"]
