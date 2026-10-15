@@ -53,3 +53,20 @@
   (X1↔X2, Z1↔Z2), allowed class qubit_permutation, n_max 40, k_min 2, d_min 3.
 - Deterministic positive fixtures (no LLM): S-A — bicycle_chain(3,7) [[42,6,6]] as explicit_sparse against
   (n_max 50, k_min 6, d_min 6, w_max 8); S-F — B's verified permutation fixture.
+
+## 2026-10-15 — M1 live slice, Codex review, hardening, acceptance evidence
+- M0 qualification (`runs/qualify/20261015T105932Z`): Claude K0-OK; Codex not tool-free (G6); slice CPU quota
+  unenforceable (G7). Re-qualified on the streaming broker with the production-schema property:
+  `runs/qualify/20261015T123410Z`, 33 qualified / 3 unqualified.
+- m1-live-1: 8 launch failures (draft-2020-12 `$schema` URI in the designer schema), $0. m1-live-2: both tasks met
+  on proposal 1 ([[60,8,6]], [[14,2,3]] + SWAP), $0.652 charged; one call retried after a buffered response (I2).
+  Both pre-hardening, not acceptance evidence.
+- Codex review of the committed M1 code: block (3 blockers, 14 majors), all accepted
+  (`notes/reviews/M1-triage-partial.md`); fixed test-first in 19 commits (`notes/reviews/M1-hardening.md`).
+- Lead fixes: streaming broker (daf36b4), list-price table (eed11b3), production-schema qualification (9da3430),
+  §K reservation floor (3f046ed), BLAS pinning; bundle index with offline re-audit (`results/bundles/`).
+- P1a control suite (20 controls, 0/37, 0/24) recorded by campaigns and reproduced by the audit
+  (`notes/build/controls.md`). Feasibility tables (548 rows, 51 codes) and D10 ranges (G8).
+- m1-live-3 on hardened code (7d8c36d): both tasks met on proposal 1, $0.360, 2 requests, controls recorded,
+  bundle v2 audits offline from the file alone. Postmortem: `notes/postmortems/M1-slice.md`.
+- Next: Codex M1 milestone review → `notes/reviews/M1-triage.md`; Phase 1b proceeds only under D4.
