@@ -1,7 +1,8 @@
 # M1 post-mortem — minimal live vertical slice
 
-Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs: m1-live-1, m1-live-2 (pre-hardening,
-`single-implementation, non-evaluation`, not acceptance evidence) and m1-live-3 (hardened code, the acceptance run).
+Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..5, all `single-implementation,
+non-evaluation`. m1-live-5 (second hardening round, run from the read-only evaluator snapshot) is the acceptance run;
+the earlier runs are superseded or failed (§1).
 Everything below is algebra-level (D11).
 
 ## 1. Outcome
@@ -11,6 +12,10 @@ Everything below is algebra-level (D11).
 | m1-live-1 | pre-hardening | 8/8 launch failures, 0 model requests | 0 | 0 | — | ok |
 | m1-live-2 | pre-hardening | both tasks `target_met` on proposal 1 | 0.652 charged (0.290 measured) | 4 | 919 s | ok |
 | m1-live-3 | hardened, 7d8c36d (§4) | both tasks `target_met` on proposal 1; P1a controls 0/37 false authorizations, 0/24 false rejections | 0.360 (measured) | 2 | 168 s | ok (bundle v2, self-contained) |
+| m1-live-4 | round 2, snapshot, addb11b | both tasks `target_met`; control suite refused in snapshot mode (I9) → no control summary | 0.295 | 2 | — | **fails** (controls required) |
+| m1-live-5 | round 2, snapshot, 9458710 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (evidence byte-identical to m1-live-3) | 0.678 | 2 | 331 s | ok, confirmation supplement linked |
+
+Cumulative M1 live spend $2.19 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
 
 S-A (m1-live-2 and m1-live-3): [[60,8,6]], w=6, deg=6, d_X=d_Z=6 certified exactly at t=3. m1-live-3 proposed the
 identical candidate (`1016c96ed5f742fc`). S-F: a [[14,2,3]] code (w=4, deg=6) with a qubit permutation verified by L3
@@ -77,6 +82,25 @@ mis-triaged the §O snapshot import (P1a) as an M2 item. *Lessons:* qualify fail
 writes), not only the happy path; a hardening fix needs its own adversarial review before the next live run;
 check every deferral against the contract's phase marker.
 
+**I8. Zero mtimes kept the broker addon from loading in the snapshot.** The first m1-live-4 launch stopped before
+any model request ("broker did not become ready", $0): the evaluator closure tar stores mtime 0 and mitmproxy loads a
+script only once its mtime exceeds its initial `last_mtime = 0.0`. The snapshot tests had run the CLI in `--dry-run`
+only, which never starts the broker. *Fix:* snapshot entries carry the commit time; a zero-mtime snapshot is refused;
+a test starts the real broker from a snapshot (addb11b).
+
+**I9. The control suite was refused in snapshot mode (m1-live-4).** The evaluator-tamper control's fingerprint guard
+over its scratch tree tripped the new rule "a guard must be over the running snapshot", so no control summary was
+recorded and the campaign's audit failed — the B3 fix working as intended. *Fix:* the rule binds only guards over the
+running evaluator; a test runs the whole suite with an active snapshot and requires byte-identical evidence (997f355).
+
+**I10. A test run made real model calls.** A second m1-live-3 bundle (`294db0eb…`, sealed 11:20 at evaluator commit
+813fa62) holds a real campaign: 2 Claude requests, $0.205. The lead's test of the §K refusal called the real
+`run_live` and relied on the reservation check to raise; when the zero-request case was added test-first, the check
+passed and the test ran a live campaign that sealed into the production archive. *Fix:* the sandbox runner refuses real
+credential files while `ZKQEC_FORBID_LIVE=1`, which `tests/conftest.py` sets for every test run (fac66a1); the bundle
+is quarantined in `zkqec-archive/_incidents/`. *Lesson:* a refusal test must stub every side effect, and live paths
+need a suite-wide barrier, not a per-test one.
+
 ## 3. Model performance (single samples — not an evaluation)
 
 | call | output tokens | wall | CLI-reported list price | outcome |
@@ -85,6 +109,12 @@ check every deferral against the contract's phase marker.
 | m1-live-2 sf | 2,069 | 19 s | 0.0524 | [[14,2,3]] + SWAP |
 | m1-live-3 sa | 14,044 | 129 s | 0.3064 | [[60,8,6]] (same candidate) |
 | m1-live-3 sf | 2,105 | 20 s | 0.0531 | [[14,2,3]] + SWAP |
+| m1-live-5 sa | 31,956 (ceiling 32,000) | 291 s | 0.6398 | [[60,8,6]] (same candidate, third time) |
+| m1-live-5 sf | 1,851 | 17 s | 0.0377 | [[14,2,3]] + SWAP (same code as m1-live-2) |
+
+The S-A answer is the identical proposal in all three hardened-era runs and the S-F code recurs, which is consistent
+with recall of a fixed construction; known-code labelling waits for M4. The m1-live-5 S-A call came within 44 tokens
+of its per-request output ceiling: P1b reservations need headroom above 32k output tokens for effort `high`.
 
 Context for S-A only: the B1 random two-block search hit the (n≤60, k≥8, d≥6, w≤6, deg≤6) target in 2 of 1,500
 samples. One sample per arm supports no comparison (H3/H4 need the P1b paired design).
@@ -102,12 +132,21 @@ samples. One sample per arm supports no comparison (H3/H4 need the P1b paired de
   task: d_min ≤ 7 to n 200, 8–9 to n 99, 10–11 to n 55) and opt-in Tier B (600 s × 32 GiB) in `notes/DECISIONS.md`
   G8. Both live targets sit well inside Tier A (S-A t=3, M=36,051 per sector).
 - BLAS pinning (I6).
+- Second hardening round after the milestone review (8979593..94f79e3; `notes/reviews/M1-hardening-2-E1.md`,
+  `-E2.md`): fail-closed broker (B1) with the qualification property `J1.log_failure_fail_closed`
+  (`runs/qualify/20261015T200053Z`, 34 qualified / 3 unqualified), complete-message usage (B2), control pass/fail
+  enforced by the audit (B3), namespaced executions (B4), bounded verifier/identity/control/confirmation children
+  (B5), sealed broker evidence and the confirmation supplement (B6), ancestor fsync (B7), invocation-total token
+  reservations (B8), full operational replay (#7), campaigns run from a read-only evaluator snapshot (#14), plus the
+  lead's fixes for I8–I10.
 
 ## 5. Cost telemetry and the Phase-1b projection (D4/D5)
 
 All list-price charges in M1 are reproduced exactly by `configs/broker/prices.json` × broker usage. One Opus 5.5
-(effort high) proposal cost $0.05 (S-F, ~2k output tokens) to $0.31 (S-A, ~14k output tokens); the §K reservation
-per call is $1.92. Projection, assuming M2–M4 tasks cost at most the m1-live-3 S-A call and ≤ 1.3× for skeptic,
+(effort high) proposal cost $0.04–0.05 (S-F, ~2k output tokens) to $0.24–0.64 (S-A, 12k–32k output tokens); the
+§K reservation per call is $1.92. The projection below uses the m1-live-3 S-A cost ($0.31); at the m1-live-5 cost
+($0.64) it doubles (smoke ≈ $13, pilot ≈ $240), above both caps — the reservation-enforced caps still bind, so the
+pilot would complete fewer proposals, and M3 must measure per-role costs before the pilot is sized. Projection, assuming M2–M4 tasks cost at most the m1-live-3 S-A call and ≤ 1.3× for skeptic,
 route and commentator calls (Sonnet/Opus) with Designer-B on the Codex subscription (no list price): M3 smoke of
 ≤ 8 tasks × 2 proposals ≈ 8 × 2 × 0.31 × 1.3 ≈ $6.5 (cap $10); P1b dev pilot of 24 tasks × 2 arms × 6 proposals
 ≈ 24 × 2 × 6 × 0.31 × 1.3 ≈ $116 (cap $150). Harder D10 targets lengthen thinking; the hard bound remains the cap
