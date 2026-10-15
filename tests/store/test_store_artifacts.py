@@ -141,3 +141,37 @@ def test_crash_after_rename_needs_ensure_durable(tmp_path, monkeypatch):
         store.ensure_durable(sha)                  # admission calls this before any commit
     monkeypatch.undo()
     store.ensure_durable(sha)
+
+
+# --- Codex M1 review #16: durability through every created ancestor ------------------------------
+def test_retry_after_crash_between_shard_mkdir_and_parent_fsync_syncs_ancestors(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path / "store")
+    obj = {"crash": "first-shard"}
+    sha = content_hash(obj)
+    real = artifacts_mod._fsync_dir
+
+    def boom(path):
+        raise OSError("injected crash after the first shard mkdir")
+    monkeypatch.setattr(artifacts_mod, "_fsync_dir", boom)
+    with pytest.raises(OSError):
+        store.put_json(obj)
+    first, second = store._shard_dirs(sha)
+    assert first.is_dir() and not second.exists()          # crashed before the parent fsync
+    synced = []
+    monkeypatch.setattr(artifacts_mod, "_fsync_dir", lambda p: (synced.append(p), real(p)))
+    assert store.put_json(obj) == sha
+    # the retry must re-establish the directory entries of every ancestor up to the store root
+    assert {str(second), str(first), str(store.root)} <= set(synced)
+    synced.clear()
+    store.ensure_durable(sha)
+    assert {str(second), str(first), str(store.root)} <= set(synced)
+
+
+def test_republish_of_existing_artifact_reestablishes_durability(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path / "store")
+    sha = store.put_json({"again": 1})
+    synced = []
+    real = artifacts_mod._fsync_dir
+    monkeypatch.setattr(artifacts_mod, "_fsync_dir", lambda p: (synced.append(p), real(p)))
+    assert store.put_json({"again": 1}) == sha
+    assert str(store.root) in synced and str(store.path_for(sha).parent) in synced

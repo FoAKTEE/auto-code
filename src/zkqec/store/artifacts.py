@@ -3,10 +3,13 @@
 Layout: ``root/ab/cd/<sha256>`` where ``ab``/``cd`` are the first two byte pairs of the hash.
 
 Publication order (§L): write a temporary file *in the destination directory* → fsync the file →
-``os.replace`` onto the final name → fsync the directory. A failure at any step leaves no file under
-the final name (or, after the rename, a complete file whose durability :meth:`ensure_durable` can
-re-establish); the admission service calls :meth:`ensure_durable` on every artifact an event
-references before it commits, so no event can reference an artifact that is not durably published.
+``os.replace`` onto the final name → fsync the directory, then fsync every ancestor directory up to
+the store root (a retry after a crash between a shard ``mkdir`` and its parent fsync must
+re-establish that entry too). A failure at any step leaves no file under the final name (or, after
+the rename, a complete file whose durability :meth:`ensure_durable` re-establishes through the whole
+chain file → shard → shard → root); re-publishing an existing artifact does the same. The admission
+service calls :meth:`ensure_durable` on every artifact an event references before it commits, so no
+event can reference an artifact that is not durably published.
 
 Reads verify the content hash, refuse symlinks and non-regular files (artifact or shard directory),
 and are capped in bytes.
@@ -25,6 +28,7 @@ from typing import Any, Iterator
 
 from zkqec.contracts import canonical_json
 
+from .durable import makedirs_durable
 from .sanitize import DEFAULT_SANITIZER, SANITIZER_VERSION, Sanitizer, SecretDetected
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -93,7 +97,7 @@ class ArtifactStore:
     def __init__(self, root: str | os.PathLike, *, max_bytes: int = DEFAULT_MAX_BYTES,
                  sanitizer: Sanitizer = DEFAULT_SANITIZER):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        makedirs_durable(self.root)
         self.max_bytes = int(max_bytes)
         self.sanitizer = sanitizer
 
@@ -167,9 +171,17 @@ class ArtifactStore:
         dest_dir = self._check_shards(sha, create=True)
         dest = dest_dir / sha
         if os.path.lexists(dest):
-            self.verify(sha)          # idempotent re-publish; a corrupt or unsafe file is an error
+            # idempotent re-publish; a corrupt or unsafe file is an error, and durability is
+            # re-established (the earlier publication may have crashed before its fsyncs)
+            self.ensure_durable(sha)
             return
         self._atomic_write(dest_dir, dest, data)
+        self._sync_ancestors(sha)
+
+    def _sync_ancestors(self, sha: str) -> None:
+        first, _ = self._shard_dirs(sha)
+        _fsync_dir(str(first))
+        _fsync_dir(str(self.root))
 
     def _atomic_write(self, dest_dir: Path, dest: Path, data: bytes) -> None:
         fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=dest_dir)
@@ -266,7 +278,7 @@ class ArtifactStore:
         self.get_bytes(sha)
 
     def ensure_durable(self, sha: str) -> None:
-        """Verify the artifact, then fsync it and its shard directories (§L step 4 re-established)."""
+        """Verify the artifact, then fsync it, its shard directories and the store root (§L)."""
         self.verify(sha)
         path = self.path_for(sha)
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -274,9 +286,8 @@ class ArtifactStore:
             _fsync_file(fd)
         finally:
             os.close(fd)
-        first, second = self._shard_dirs(sha)
-        _fsync_dir(str(second))
-        _fsync_dir(str(first))
+        _fsync_dir(str(self._shard_dirs(sha)[1]))
+        self._sync_ancestors(sha)
 
     def redactions(self, sha: str) -> list[dict]:
         """Redaction records filed against an artifact (rule names and counts, never secrets)."""

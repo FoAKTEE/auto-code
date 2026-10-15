@@ -29,6 +29,8 @@ from typing import Any
 
 import zstandard
 
+from ..store.durable import atomic_copy, atomic_write_bytes, atomic_writer, makedirs_durable
+
 ARCHIVE = Path(os.environ.get("ZKQEC_ARCHIVE", "/data/haiyangw/claude/zkqec-archive"))
 RUNTIME_DIR = Path(os.environ.get(
     "ZKQEC_RUNTIME", "/data/haiyangw/claude/zkqec-runtime/python/cpython-3.10.22-linux-x86_64-gnu"))
@@ -44,6 +46,8 @@ def _sha_file(path: Path) -> str:
 
 
 def _tar_zst(src_dir: Path, out: Path, arcname: str) -> None:
+    """Deterministic tar (sorted, zeroed owners/mtimes) + zstd, published durably at ``out``
+    (temp in the destination directory → fsync → rename → fsync directory; §L)."""
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
         for p in sorted(src_dir.rglob("*")):
@@ -54,11 +58,8 @@ def _tar_zst(src_dir: Path, out: Path, arcname: str) -> None:
                     tar.addfile(info, f)
             else:
                 tar.addfile(info)
-    tmp = out.with_suffix(".tmp")
-    with open(tmp, "wb") as f:
+    with atomic_writer(out) as f:
         f.write(zstandard.ZstdCompressor(level=10).compress(raw.getvalue()))
-        f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, out)
 
 
 def _untar_zst(path: Path, dest: Path) -> None:
@@ -70,18 +71,19 @@ def _untar_zst(path: Path, dest: Path) -> None:
 
 
 def _cas_put(tmp_file: Path, meta: dict, archive: Path) -> str:
+    """Publish a closure into the CAS through a destination-filesystem temp (never a move)."""
     sha = _sha_file(tmp_file)
-    (archive / "cas").mkdir(parents=True, exist_ok=True)
     dst = archive / "cas" / f"{sha}.tar.zst"
-    if not dst.exists():
-        shutil.move(str(tmp_file), dst)
-    (archive / "cas" / f"{sha}.json").write_text(json.dumps({**meta, "sha256": sha}, indent=2))
+    if not (dst.is_file() and _sha_file(dst) == sha):
+        atomic_copy(tmp_file, dst)
+    atomic_write_bytes(archive / "cas" / f"{sha}.json",
+                       json.dumps({**meta, "sha256": sha}, indent=2).encode())
     return sha
 
 
 def ensure_closures(archive: Path = ARCHIVE, *, commit: str | None = None) -> dict[str, str]:
     """Runtime, wheelhouse and evaluator-snapshot closures in the CAS (cached by content)."""
-    archive.mkdir(parents=True, exist_ok=True)
+    makedirs_durable(archive)
     cache = archive / "cas" / "closures-index.json"
     index = json.loads(cache.read_text()) if cache.exists() else {}
     lock_sha = _sha_file(REPO / "requirements.lock")
@@ -126,7 +128,7 @@ def ensure_closures(archive: Path = ARCHIVE, *, commit: str | None = None) -> di
             f = td / "ev.tar.zst"; _tar_zst(ev, f, "evaluator")
             index[key] = _cas_put(f, {"kind": "evaluator", "git_commit": commit}, archive)
         out["evaluator"] = index[key]
-    cache.write_text(json.dumps(index, indent=2, sort_keys=True))
+    atomic_write_bytes(cache, json.dumps(index, indent=2, sort_keys=True).encode())
     return {**out, "git_commit": commit, "lock_sha256": lock_sha}
 
 
@@ -150,11 +152,11 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
         manifest = {"campaign_id": campaign_id, "ledger_head": {"seq": head[0], "hash": head[1]},
                     "closures": closures, "format": "zkqec-bundle-v1"}
         (b / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
-        out_dir = archive / "bundles" / campaign_id; out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = archive / "bundles" / campaign_id
         tmp = Path(td) / "bundle.tar.zst"; _tar_zst(b, tmp, "bundle")
         sha = _sha_file(tmp)
         final = out_dir / f"{sha}.tar.zst"
-        shutil.move(str(tmp), final)
+        atomic_copy(tmp, final)          # destination temp + fsync + rename + dir fsync (§L)
     entry = {"campaign_id": campaign_id, "bundle_sha256": sha, "path": str(final),
              "ledger_head": manifest["ledger_head"], "closures": closures}
     return entry
