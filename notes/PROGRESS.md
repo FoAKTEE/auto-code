@@ -78,3 +78,8 @@
 - m1-live-4 (snapshot): targets met, controls refused → audit fails (not evidence). m1-live-5 (snapshot, 9458710):
   both targets met, controls passed 0/37, 0/24, supplement linked, $0.68; cumulative M1 live $2.19 of $5.
 - Next: Codex re-review → `notes/reviews/M1-triage-2.md`; Phase 1b only under D4.
+- Codex re-review: BLOCK (N1 nested bounded workers escape the enclosing kill; N2–N5; stale projection) →
+  `notes/reviews/M1-triage-2.md`; third hardening round by E3 (92dcf66..c8089ed); re-qualified
+  `runs/qualify/20261015T213850Z` (34 / 3); full suite 795 passed.
+- m1-live-6 (snapshot, 6e7e610): both targets met, controls passed, required supplement linked, $0.33; cumulative
+  M1 live $2.52 of $5. Next: Codex re-review of round 3 → `notes/reviews/M1-triage-3.md`.

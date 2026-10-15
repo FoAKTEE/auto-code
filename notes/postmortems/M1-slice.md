@@ -1,7 +1,7 @@
 # M1 post-mortem — minimal live vertical slice
 
-Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..5, all `single-implementation,
-non-evaluation`. m1-live-5 (second hardening round, run from the read-only evaluator snapshot) is the acceptance run;
+Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..6, all `single-implementation,
+non-evaluation`. m1-live-6 (third hardening round, run from the read-only evaluator snapshot) is the acceptance run;
 the earlier runs are superseded or failed (§1).
 Everything below is algebra-level (D11).
 
@@ -13,9 +13,10 @@ Everything below is algebra-level (D11).
 | m1-live-2 | pre-hardening | both tasks `target_met` on proposal 1 | 0.652 charged (0.290 measured) | 4 | 919 s | ok |
 | m1-live-3 | hardened, 7d8c36d (§4) | both tasks `target_met` on proposal 1; P1a controls 0/37 false authorizations, 0/24 false rejections | 0.360 (measured) | 2 | 168 s | ok (bundle v2, self-contained) |
 | m1-live-4 | round 2, snapshot, addb11b | both tasks `target_met`; control suite refused in snapshot mode (I9) → no control summary | 0.295 | 2 | — | **fails** (controls required) |
-| m1-live-5 | round 2, snapshot, 9458710 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (evidence byte-identical to m1-live-3) | 0.678 | 2 | 331 s | ok, confirmation supplement linked |
+| m1-live-5 | round 2, snapshot, 9458710 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (evidence byte-identical to m1-live-3); superseded by the re-review (N1–N5) | 0.678 | 2 | 331 s | ok, confirmation supplement linked |
+| m1-live-6 | round 3, snapshot, 6e7e610 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence) | 0.332 | 2 | 160 s | ok, required supplement linked |
 
-Cumulative M1 live spend $2.19 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
+Cumulative M1 live spend $2.52 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
 
 S-A (m1-live-2 and m1-live-3): [[60,8,6]], w=6, deg=6, d_X=d_Z=6 certified exactly at t=3. m1-live-3 proposed the
 identical candidate (`1016c96ed5f742fc`). S-F: a [[14,2,3]] code (w=4, deg=6) with a qubit permutation verified by L3
@@ -101,6 +102,14 @@ credential files while `ZKQEC_FORBID_LIVE=1`, which `tests/conftest.py` sets for
 is quarantined in `zkqec-archive/_incidents/`. *Lesson:* a refusal test must stub every side effect, and live paths
 need a suite-wide barrier, not a per-test one.
 
+**I11. The re-review blocked M1 a third time** (`notes/reviews/M1-codex-rereview.md`, triage `M1-triage-2.md`):
+nested bounded workers created their own process groups and survived the enclosing wall kill (N1, blocker); complete
+framing with a missing counter counted as zero usage (N2); the audit replay ignored completion usage and settlement
+source (N3); the final audit could omit the confirmation supplement (N4); NaN totals passed (N5); the Phase-1b
+projection was stale. Third hardening round 92dcf66..c8089ed; re-qualified `runs/qualify/20261015T213850Z`; m1-live-6.
+*Lesson:* composing two individually sound mechanisms (bounded children, nested inside bounded children) needs its
+own adversarial test.
+
 ## 3. Model performance (single samples — not an evaluation)
 
 | call | output tokens | wall | CLI-reported list price | outcome |
@@ -111,6 +120,8 @@ need a suite-wide barrier, not a per-test one.
 | m1-live-3 sf | 2,105 | 20 s | 0.0531 | [[14,2,3]] + SWAP |
 | m1-live-5 sa | 31,956 (ceiling 32,000) | 291 s | 0.6398 | [[60,8,6]] (same candidate, third time) |
 | m1-live-5 sf | 1,851 | 17 s | 0.0377 | [[14,2,3]] + SWAP (same code as m1-live-2) |
+| m1-live-6 sa | 12,097 | 112 s | 0.2675 | [[60,8,6]] (same candidate, fourth time) |
+| m1-live-6 sf | 2,669 | 25 s | 0.0644 | [[14,2,3]] + SWAP |
 
 The S-A answer is the identical proposal in all three hardened-era runs and the S-F code recurs, which is consistent
 with recall of a fixed construction; known-code labelling waits for M4. The m1-live-5 S-A call came within 44 tokens
@@ -169,8 +180,9 @@ the smoke telemetry and resized before any pilot dispatch.
   (timeout, never false evidence). Before any concurrent dispatch (M3) workers move to a clean-exec or forkserver
   start with controlled inherited handles.
 - `RLIMIT_AS` bounds the address space a child adds after fork, not its resident set or an aggregate.
-- Nested bounded workers must stay inside the enclosing worker's kill scope (review N1; fixed in the third
-  hardening round).
+- Nested bounded workers stay in the enclosing job's process group (N1, 92dcf66); a nested run at its own deadline
+  kills only its direct child, whose own subprocesses live until the enclosing job ends; CPU of a descendant that
+  exits on its own after its parent died is neither measured nor detected.
 - The snapshot isolates evaluator code; the runtime dependencies (`.venv` site-packages, `.venv-broker`) are trusted,
   hash-recorded in the manifest, not copied into the snapshot (§O trust boundary).
 - Admission still accepts `limits=None` for direct API use and the standalone audit replays inline; production
