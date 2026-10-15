@@ -255,7 +255,8 @@ class JobBook:
                 "generation, reservation, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, self.campaign, kind, idem_key, input_sha, retry_of, "reserved", 0,
                  json.dumps(want, sort_keys=True), _now(), _now()))
-            self._log(job_id, "reserved", 0, {"reservation": want, "retry_of": retry_of})
+            self._log(job_id, "reserved", 0, {"reservation": want, "retry_of": retry_of, "kind": kind,
+                                              "idem_key": idem_key, "input_sha": input_sha})
             return job_id
 
     def dispatch(self, job_id: str) -> int:
@@ -409,21 +410,65 @@ class JobBook:
                                 (self.campaign, idem_key)).fetchone()
         return None if row is None else row[0]
 
+    # ops_log event -> (states it may follow, resulting state, generation step)
+    _HISTORY = {"reserved": ((None,), "reserved", 0), "dispatched": (("reserved",), "dispatched", 1),
+                "completed": (("dispatched",), "completed", 0), "failed": (("dispatched",), "failed", 0),
+                "uncertain": (("dispatched",), "uncertain", 0),
+                "expired": (("dispatched",), "uncertain", 1),
+                "recovered_uncertain": (("dispatched",), "uncertain", 1),
+                "settled": (("completed", "failed", "uncertain"), "settled", 0),
+                "cancelled": (("reserved",), "settled", 0)}
+
     def audit(self) -> list[str]:
-        """Replay ops_log and compare with ops_jobs (final state and generation per job)."""
-        last: dict[str, tuple[str, int]] = {}
-        for job_id, event, gen in self.conn.execute(
-                "SELECT job_id, event, generation FROM ops_log WHERE job_id IN "
-                "(SELECT job_id FROM ops_jobs WHERE campaign=?) ORDER BY seq", (self.campaign,)):
-            state = {"recovered_uncertain": "uncertain", "expired": "uncertain",
-                     "cancelled": "settled"}.get(event, event)
-            last[job_id] = (state, gen)
-        problems = []
-        for job_id, state, gen, res, actual in self.conn.execute(
-                "SELECT job_id, state, generation, reservation, actual FROM ops_jobs WHERE campaign=?",
-                (self.campaign,)):
-            if last.get(job_id) != (state, gen):
-                problems.append(f"{job_id}: table {(state, gen)} != log {last.get(job_id)}")
+        """Replay ops_log through the job state machine and compare with ops_jobs (Codex M1
+        milestone review #7): every job's history starts with the reservation it holds (kind, key,
+        input hash, reservation and retry as recorded), follows the allowed transitions with
+        monotone generations, and ends in the table's state, generation, result and charge;
+        an ops_log record of a job that has no operational row is an orphan."""
+        problems: list[str] = []
+        rows = {r[0]: r for r in self.conn.execute(
+            "SELECT job_id, kind, idem_key, input_sha, retry_of, state, generation, reservation, "
+            "actual, result_sha, outcome FROM ops_jobs WHERE campaign=?", (self.campaign,))}
+        known = {j for j, in self.conn.execute("SELECT job_id FROM ops_jobs")}
+        replay: dict[str, list] = {}
+        for job_id, event, gen, detail in self.conn.execute(
+                "SELECT job_id, event, generation, detail FROM ops_log ORDER BY seq"):
+            if job_id not in known:
+                problems.append(f"ops_log records job {job_id} ({event}) that has no operational job")
+                continue
+            if job_id not in rows:
+                continue
+            try:
+                d = json.loads(detail)
+            except ValueError:
+                d = None
+            state, g, last = replay.get(job_id, [None, 0, {}])
+            rule = self._HISTORY.get(event)
+            if rule is None or state not in rule[0] or not isinstance(d, dict) \
+                    or gen != (0 if event == "reserved" else g + rule[2]):
+                problems.append(f"{job_id}: ops_log transition {state} -> {event} (generation "
+                                f"{gen}) is not allowed")
+                rule = rule or ((), state, 0)
+            if event == "reserved" and isinstance(d, dict):
+                _, kind, idem, input_sha, retry_of, *_ = rows[job_id]
+                mine = {"reservation": json.loads(rows[job_id][7]), "retry_of": retry_of, "kind": kind,
+                        "idem_key": idem, "input_sha": input_sha}
+                if any(k in d and d[k] != v for k, v in mine.items()):
+                    diff = sorted(k for k, v in mine.items() if k in d and d[k] != v)
+                    problems.append(f"{job_id}: operational row differs from its reservation "
+                                    f"record in {diff}")
+            if isinstance(d, dict) and event in ("completed", "failed", "uncertain"):
+                last = {**last, "result_sha": d.get("result_sha")}
+            if isinstance(d, dict) and event == "settled":
+                last = {**last, "charged": d.get("charged")}
+            replay[job_id] = [rule[1], gen, last]
+        for job_id, row in sorted(rows.items()):
+            _, kind, idem, input_sha, retry_of, state, gen, res, actual, result, outcome = row
+            state_log, gen_log, last = replay.get(job_id, [None, None, {}])
+            if (state_log, gen_log) != (state, gen):
+                problems.append(f"{job_id}: table {(state, gen)} != log {(state_log, gen_log)}")
+            if "result_sha" in last and last["result_sha"] != result:
+                problems.append(f"{job_id}: result differs from its completion record")
             for name, text in (("reservation", res), ("charge", actual)):
                 try:
                     ok = text is None or _finite_charge(json.loads(text))

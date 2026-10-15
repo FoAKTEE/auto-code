@@ -536,6 +536,151 @@ def audit_campaign(adm, store, campaign_id: str) -> list[str]:
             problems.append(f"job {s['job_id']}: broker request count differs from the charge")
     book = JobBook.for_namespace(adm.ledger.conn, camp["namespace"])
     problems += book.reconcile(settlements, camp["caps"], confirmation=camp["confirmation"])
+    problems += audit_operations(adm, store, campaign_id)
+    return problems
+
+
+def _unit_dict(d: dict) -> dict[str, float]:
+    from zkqec.contracts import UNITS
+    return {u: float(d.get(u, 0.0)) for u in UNITS}
+
+
+def audit_operations(adm, store, campaign_id: str) -> list[str]:
+    """The campaign's operational intents against the frozen campaign (Codex M1 milestone review
+    #7; §K, §L, §M): the frozen confirmation and control reservations exist exactly once with their
+    frozen reservations; every proposal job is an attempt of a frozen task under the frozen per-call
+    reservation, and its input hash names the ``call_inputs`` intent its call record cites (request,
+    system prompt and schema as sent, the frozen schema and contract); every verifier job names an
+    execution with its inputs; every evaluation cites a settled call record with the same artifacts
+    and a proposal that re-parses from that call's output. Anything else is an orphan."""
+    from zkqec.contracts import content_hash
+    from zkqec.contracts import Profile
+    from zkqec.grammar.intake import parse_proposal
+    from zkqec.orchestrator.campaign import CALL_INPUTS, grammar_for
+
+    camp = adm.ledger.campaign(campaign_id)
+    cfg = camp.get("config") or {}
+    conn = adm.ledger.conn
+    keys = ("job_id", "kind", "idem_key", "input_sha", "state", "reservation")
+    rows = [dict(zip(keys, r)) for r in conn.execute(
+        f"SELECT {', '.join(keys)} FROM ops_jobs WHERE campaign=? ORDER BY created_at",
+        (camp["namespace"],))]
+    for r in rows:
+        r["reservation"] = _unit_dict(json.loads(r["reservation"]))
+    settled = {s["job_id"]: s for s in adm.ledger.settlements(campaign_id)}
+    problems: list[str] = []
+    try:
+        manifest = store.get_json(camp["manifest"])
+    except Exception as exc:                                     # noqa: BLE001
+        return [f"frozen manifest {camp['manifest']}: {type(exc).__name__}"]
+
+    def required(what: str, match, reservation: dict | None) -> None:
+        found = [r for r in rows if match(r)]
+        if len(found) != 1:
+            problems.append(f"the frozen {what} reservation has no operational job"
+                            if not found else f"the frozen {what} reservation has {len(found)} jobs")
+        elif reservation is not None and found[0]["reservation"] != _unit_dict(reservation):
+            problems.append(f"job {found[0]['job_id']}: the {what} reservation differs from the frozen one")
+
+    if camp.get("confirmation") is not None:
+        required("confirmation", lambda r: r["kind"] == "confirm", camp["confirmation"])
+    verifier = {"wall_seconds": cfg.get("verifier_wall_seconds", 0),
+                "cpu_seconds": cfg.get("verifier_cpu_seconds", 0)}
+    if cfg.get("controls"):
+        key = f"controls:{cfg['controls']}"
+        required(key, lambda r: r["idem_key"] == key and r["kind"] == "verify", verifier)
+    tasks = {t["task_id"] for t in camp["tasks"]}
+    executions: dict[tuple[str, str], int] = {}
+    for issuer, inputs in conn.execute("SELECT issuer, inputs FROM executions"):
+        k = (issuer, content_hash(json.loads(inputs)))
+        executions[k] = executions.get(k, 0) + 1
+    results: dict[str, dict] = {}
+    for r in rows:
+        job, idem = r["job_id"], r["idem_key"]
+        if r["kind"] == "confirm" or idem == f"controls:{cfg.get('controls')}":
+            continue
+        if r["kind"] == "verify":
+            if r["reservation"] != _unit_dict(verifier):
+                problems.append(f"job {job}: verifier reservation differs from the frozen ceilings")
+            if (idem.split(":", 1)[0], r["input_sha"]) not in executions:
+                problems.append(f"job {job}: verifier job {idem!r} names no execution with its inputs")
+            continue
+        if r["kind"] != "propose":
+            problems.append(f"job {job}: a {r['kind']} job is not part of this campaign's plan")
+            continue
+        task, _, attempt = idem.rpartition(":")
+        if task not in tasks or not attempt.isdigit() \
+                or int(attempt) >= int(cfg.get("max_proposals_per_task", 0)):
+            problems.append(f"job {job}: {idem!r} is not an attempt of a frozen task")
+            continue
+        if "per_call" in cfg and r["reservation"] != _unit_dict(cfg["per_call"]):
+            problems.append(f"job {job}: reservation differs from the frozen per-call reservation")
+        s = settled.get(job)
+        if s is None or not s["result"]:
+            continue                                  # unsettled: flagged by the reconciliation
+        try:
+            rec = store.get_json(s["result"])
+        except Exception:                                        # noqa: BLE001 (traversed above)
+            continue
+        results[s["result"]] = rec
+        if "inputs" not in rec:                       # pre-intent records: the request hash itself
+            if r["input_sha"] != rec.get("request_sha256"):
+                problems.append(f"job {job}: input hash differs from its call record's request")
+            continue
+        if rec["inputs"] != r["input_sha"]:
+            problems.append(f"job {job}: input hash is not the call-inputs intent its record cites")
+            continue
+        try:
+            intent = store.get_json(r["input_sha"])
+            arts = intent["artifacts"]
+            request = store.get_bytes(arts["request"]).decode()
+            contract = store.get_bytes(arts["system_prompt"]).decode()
+        except Exception as exc:                                 # noqa: BLE001
+            problems.append(f"job {job}: input intent {r['input_sha']}: {type(exc).__name__}")
+            continue
+        want = {"kind": CALL_INPUTS, "campaign_id": campaign_id, "task_id": task,
+                "attempt": int(attempt), "reservation": cfg.get("per_call")}
+        if any(intent.get(k) != v for k, v in want.items()) or {k: rec["artifacts"].get(k) for k in arts} != arts:
+            problems.append(f"job {job}: input intent does not match its call record or attempt")
+        if content_hash(request) != rec.get("request_sha256") \
+                or arts.get("schema") != manifest.get("output_schema") \
+                or content_hash(contract) != manifest.get("contract_sha256"):
+            problems.append(f"job {job}: inputs as sent differ from the frozen schema, contract or "
+                            "recorded request")
+    families = tuple(grammar_for(Profile.model_validate(cfg["profile"]))) if "profile" in cfg else None
+    for ev in adm.ledger.evaluations(campaign_id):
+        if not ev["call_record"] or not ev["source"].startswith("designer:"):
+            continue
+        rec = results.get(ev["call_record"])
+        if rec is None:
+            problems.append(f"evaluation {ev['evaluation_id'][:12]}: cites no settled call record")
+            continue
+        if ev["artifacts"] != rec.get("artifacts"):
+            problems.append(f"evaluation {ev['evaluation_id'][:12]}: artifacts differ from its call")
+        try:
+            schema = json.loads(store.get_bytes(manifest["output_schema"]))
+            text = store.get_bytes(rec["artifacts"]["output_text"]).decode()
+            again = parse_proposal(text, schema=schema, families=families).model_dump(mode="json")
+            same = again == store.get_json(ev["proposal"])
+        except Exception:                                        # noqa: BLE001
+            same = False
+        if not same:
+            problems.append(f"evaluation {ev['evaluation_id'][:12]}: its proposal does not re-parse "
+                            "from the call's output")
+    return problems
+
+
+def audit_sidecars(calls_dir: Path, adm, campaign_id: str) -> list[str]:
+    """Each call-record sidecar is the stored bytes of a settled call's record, and each settled
+    call has its sidecar (§M; orphan operational records, #7)."""
+    if not calls_dir.is_dir():
+        return []
+    results = {s["result"] for s in adm.ledger.settlements(campaign_id)
+               if s["kind"] == "propose" and s["result"]}
+    found = {_sha_file(p): p.name for p in sorted(calls_dir.glob("*.json"))}
+    problems = [f"calls/{name}: not the record of a settled call" for sha, name in sorted(found.items())
+                if sha not in results]
+    problems += [f"settled call record {sha} has no sidecar" for sha in sorted(results - set(found))]
     return problems
 
 
@@ -686,6 +831,7 @@ def audit_inner(bundle_dir: str) -> dict[str, Any]:
         problems += audit_campaign(adm, store, manifest["campaign_id"])
         problems += [f"broker: {p}" for p in audit_broker(adm, store, manifest["campaign_id"],
                                                           b / "broker")]
+        problems += audit_sidecars(b / "calls", adm, manifest["campaign_id"])
         replay_problems, replayed, identities = replay_executions(adm, reg, store)
         problems += replay_problems
         # scratch beside the bundle: the audit workdir is the only writable path offline

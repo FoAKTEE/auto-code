@@ -243,3 +243,80 @@ def test_autonomy_and_cost_sections_come_from_ledger_events(camp):
     assert "- owner: pause — paused for broker maintenance" in md
     spent = sum(s["charged"]["cpu_seconds"] for s in adm.ledger.settlements("c3"))
     assert spent == book.totals()["cpu_seconds"]["spent"] and f"| {spent:g} |" in md
+
+
+# --- Codex M1 milestone review #7: the audit replays the complete operational history -------------
+def _ops(run, sql, *args):
+    conn = sqlite3.connect(run / "ledger.db", isolation_level=None)
+    try:
+        return conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+
+def test_codex_repro_edited_input_hashes_and_a_deleted_confirmation_fail_the_audit(ran):
+    """The milestone repro: proposal input_sha values changed and the reserved confirmation job
+    deleted from a copy of the ledger gave verify=True and audit_campaign=[]."""
+    _, run, adm, store = ran
+    other = adm.ledger.campaign("t1")["manifest"]                    # a valid, unrelated artifact
+    _ops(run, "UPDATE ops_jobs SET input_sha=? WHERE kind='propose'", other)
+    (confirm,) = _ops(run, "SELECT job_id FROM ops_jobs WHERE kind='confirm'")
+    _ops(run, "DELETE FROM ops_jobs WHERE kind='confirm'")
+    assert adm.verify().ok                                 # the hash chain cannot see ops tables
+    problems = audit_campaign(adm, store, "t1")
+    jobs = [j for j, in _ops(run, "SELECT job_id FROM ops_jobs WHERE kind='propose'")]
+    for job in jobs:
+        assert any(job in p and "input" in p for p in problems), problems
+    assert any("confirmation" in p and "no operational job" in p for p in problems), problems
+    assert any(confirm[0] in p and "ops_log" in p for p in problems), problems   # orphan history
+
+
+def test_each_input_hash_must_name_the_intent_of_its_call(ran):
+    _, run, adm, store = ran
+    (job, intent), *_ = _ops(run, "SELECT job_id, input_sha FROM ops_jobs WHERE kind='propose' "
+                                  "ORDER BY created_at")
+    # a call_inputs intent of the right shape, but not the one this call recorded
+    forged = store.put_json({**store.get_json(intent), "attempt": 7})
+    _ops(run, "UPDATE ops_jobs SET input_sha=? WHERE job_id=?", forged, job)
+    problems = audit_campaign(adm, store, "t1")
+    assert any(job in p and "input" in p for p in problems), problems
+
+
+def test_reservations_must_be_the_frozen_ones(ran):
+    _, run, adm, store = ran
+    _ops(run, "UPDATE ops_jobs SET reservation=? WHERE kind='confirm'",
+         json.dumps({"usd": 0.0, "requests": 0, "input_tokens": 0, "output_tokens": 0,
+                     "wall_seconds": 1, "cpu_seconds": 1}))
+    problems = audit_campaign(adm, store, "t1")
+    assert any("confirmation" in p for p in problems), problems
+
+
+def test_orphan_operational_records_are_flagged(ran):
+    _, run, adm, store = ran
+    conn = sqlite3.connect(run / "ledger.db", isolation_level=None)
+    conn.execute("INSERT INTO ops_log (job_id, event, generation, detail, at) VALUES "
+                 "(?, 'reserved', 0, '{}', 'x')", ("e" * 32,))
+    conn.execute("INSERT INTO ops_jobs (job_id, campaign, kind, idem_key, input_sha, retry_of, state, "
+                 "generation, reservation, created_at, updated_at) SELECT ?, campaign, kind, "
+                 "'sa-unfrozen:0', input_sha, NULL, 'reserved', 0, reservation, created_at, "
+                 "updated_at FROM ops_jobs WHERE kind='propose' LIMIT 1", ("d" * 32,))
+    conn.close()
+    problems = audit_campaign(adm, store, "t1")
+    assert any("e" * 32 in p and "no operational job" in p for p in problems), problems
+    assert any("d" * 32 in p and "not an attempt of a frozen task" in p for p in problems), problems
+
+
+def test_an_out_of_order_operational_history_is_flagged(ran):
+    _, run, adm, store = ran
+    (job,) = _ops(run, "SELECT job_id FROM ops_jobs WHERE kind='propose' ORDER BY created_at LIMIT 1")
+    detail = _ops(run, "SELECT detail FROM ops_log WHERE job_id=? AND event='settled'", job[0])[0][0]
+    conn = sqlite3.connect(run / "ledger.db", isolation_level=None)
+    conn.execute("INSERT INTO ops_log (job_id, event, generation, detail, at) "
+                 "SELECT job_id, 'dispatched', generation + 1, '{}', at FROM ops_log WHERE "
+                 "job_id=? AND event='settled'", (job[0],))
+    conn.execute("INSERT INTO ops_log (job_id, event, generation, detail, at) "
+                 "SELECT job_id, 'settled', generation, ?, at FROM ops_log WHERE "
+                 "job_id=? AND event='settled'", (detail, job[0]))
+    conn.close()
+    problems = audit_campaign(adm, store, "t1")
+    assert any(job[0] in p and "settled -> dispatched" in p for p in problems), problems

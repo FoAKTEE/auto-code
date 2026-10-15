@@ -108,3 +108,17 @@ def test_sealed_bundle_reproduces_its_controls_offline(campaign, tmp_path):
     result = audit_bundle(Path(entry["path"]), workdir=tmp_path / "audit")
     assert result["ok"], result["problems"]
     assert result["controls_reproduced"] == 1 and result["offline"]
+
+
+def test_the_controls_reservation_must_be_on_record(run):
+    """Codex M1 milestone review #7: the frozen config's controls job is part of the operational
+    history the audit replays; deleting it (and its event-free trace) is flagged."""
+    import sqlite3
+    from zkqec.report.bundle import audit_campaign
+    conn = sqlite3.connect(run / "ledger.db", isolation_level=None)
+    conn.execute("DELETE FROM ops_jobs WHERE idem_key='controls:p1a'")
+    conn.close()
+    adm, store = opened(run)
+    with adm:
+        problems = audit_campaign(adm, store, "ctl")
+    assert any("controls:p1a" in p and "no operational job" in p for p in problems), problems
