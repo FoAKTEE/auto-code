@@ -1,10 +1,18 @@
 # prompt/ — plans for owner review before the build starts
 
-- `00-master-prompt.md` — the self-prompt Claude will follow for the full build (draft; see §14 for the
-  decisions that need your answer, §0 for a one-page summary).
-- `reviews/codex-independent-analysis.md` — Codex (gpt-6-astra, max) blind analysis of the mission and
-  reference workflows, written without seeing the master prompt.
-- `reviews/codex-prompt-review.md` — Codex review of the master prompt.
-- `reviews/TRIAGE.md` — how each Codex finding was handled (accepted / changed / rejected with reason).
+Read in this order:
+1. `00-master-prompt.md` — the self-prompt Claude will follow (v0.3). §0 is a one-page summary; §14 lists the
+   decisions that need your answer (D1–D16, defaults in bold).
+2. `01-technical-contracts.md` — binding semantics (§A–§O): typed propositions and entailment, design-candidate
+   contract, distance certification, code identity/novelty, theorem registry, logical-action verification,
+   circuit level (Phase 2), statistics, controls, sandbox/egress launch contract, budgets, transactions,
+   artifact retention, namespacing, environment freeze.
+3. `reviews/TRIAGE.md` — disposition of every review finding on v0.2.
+
+Reviews (Codex gpt-6-astra, reasoning max, read-only):
+- `reviews/codex-independent-analysis.md` — blind analysis of the mission and reference workflows (did not see
+  the prompt).
+- `reviews/codex-prompt-review.md` — review of v0.2 (35 findings).
+- `reviews/codex-prompt-review-v0.3.md` — review of v0.3 (when present).
 
 Supporting analyses of the reference workflows: `notes/ref-analysis/{qa,chandra,question-gen}.md`.
