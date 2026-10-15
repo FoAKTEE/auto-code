@@ -39,7 +39,7 @@ from zkqec.store import check_sha
 from .evidence import (IdentityRecord, ReceiptRecord, atoms_of, current_identities,
                        current_receipts, find_conflicts, guarantee_rank, weakest)
 
-TASK_REQUIREMENTS = ("n_max", "k_min", "d_min", "w_max", "deg_max", "operation")
+TASK_REQUIREMENTS = ("css_valid", "n_max", "k_min", "d_min", "w_max", "deg_max", "operation")
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,11 @@ class Resolver:
         self._codes: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
         for rec in current_identities(identities, domain):
             self._codes[rec.presentation][rec.code].append(rec.identity_id)
+
+    def current(self) -> dict[str, "Receipt"]:
+        """Read-only copy of the receipts that currently carry authority in this domain
+        (non-revoked, non-quarantined, not in an unquarantined conflict)."""
+        return dict(self._receipts)
 
     # -- identity --------------------------------------------------------------------------------
     def code_of(self, presentation: str) -> tuple[str, str] | None:
