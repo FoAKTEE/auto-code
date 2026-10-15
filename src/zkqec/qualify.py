@@ -51,6 +51,7 @@ CLAUDE_MODEL = "claude-haiku-5-5"
 CODEX_MODEL = "gpt-6-astra"
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"],
           "additionalProperties": False}
+DESIGNER_SCHEMA = REPO / "roles" / "designer" / "output.schema.json"   # the production output contract
 ROLE = "You are a calculator. Reply only with JSON that matches the output schema."
 PROMPT = "What is 2+3?"
 PROBE_ENV = {**L.COMMON_ENV, "PATH": "/usr/bin:/bin"}
@@ -520,8 +521,9 @@ class Qualifier:
     # ==============================================================================================
     def live_claude(self) -> None:
         if not self.live:
-            for pid in ("J1.claude_call", "J2.claude_tool_free", "J2.structured_output_claude", "K.input_bound",
-                        "K.output_ceiling", "K.reservation", "J5.telemetry", "J1.telemetry_endpoints"):
+            for pid in ("J1.claude_call", "J2.claude_tool_free", "J2.structured_output_claude",
+                        "J3.production_schema_claude", "K.input_bound", "K.output_ceiling", "K.reservation",
+                        "J5.telemetry", "J1.telemetry_endpoints"):
                 self.add(Property(pid, pid, "-", "live test", Check(None, "not run (--no-live)"), Check(None, "not run")))
             return
         spec = L.CallSpec("claude", CLAUDE_MODEL, ROLE, PROMPT, SCHEMA, max_budget_usd=0.05, max_output_tokens=1024)
@@ -577,6 +579,32 @@ class Qualifier:
             Check(ok and schema_ok, f"structured_output={so} validates against the schema", [self.ev_job(res)]),
             Check(not schema_bad and caps_rejected, "an invalid instance fails validation; oversize/deep/"
                   "non-regular outputs are rejected before parsing", [{"caps_rejected": caps_rejected}])))
+        # m1-live-1: the CLI refused the production schema at startup on every launch. Launching with the
+        # exact production schema under a zero-model-request grant proves acceptance at no cost: an
+        # accepted schema reaches the broker as a model request carrying output_config (then blocked).
+        prod = json.loads(DESIGNER_SCHEMA.read_text())
+        zero = Ceilings(0, 8, 400_000, 1024, 120)
+        res_p, recs_p = self.cli_call("claude_prodschema", L.claude_call(L.CallSpec(
+            "claude", CLAUDE_MODEL, ROLE, PROMPT, prod, max_budget_usd=0.05, max_output_tokens=1024)),
+            "claude", CLAUDE_MODEL, zero, wall=120)
+        res_d, recs_d = self.cli_call("claude_draftschema", L.claude_call(L.CallSpec(
+            "claude", CLAUDE_MODEL, ROLE, PROMPT,
+            {"$schema": "https://json-schema.org/draft/2020-12/schema", **prod},
+            max_budget_usd=0.05, max_output_tokens=1024)), "claude", CLAUDE_MODEL, zero, wall=120)
+        msgs = lambda recs: [r for r in recs if r.get("event") == "request" and r.get("path") == "/v1/messages"]  # noqa: E731
+        reached = [r for r in msgs(recs_p) if r.get("output_field") == "present"
+                   and r.get("reason") == "model_request_ceiling"]
+        self.add(Property(
+            "J3.production_schema_claude", "Claude accepts the production designer output schema", "§J3",
+            f"The CLI is launched with {DESIGNER_SCHEMA.relative_to(REPO)} under a zero-request grant: an "
+            "accepted schema reaches the broker as a /v1/messages request with an output schema, blocked before "
+            "forwarding (no charge).",
+            Check(bool(reached) and summarize_job(recs_p)["model_requests"] == 0,
+                  f"{len(reached)} schema-bearing request(s) reached the broker and were blocked (model_request_ceiling)",
+                  [self.ev_job(res_p)]),
+            Check(not msgs(recs_d) and res_d.outcome != "completed",
+                  f"the same schema with a draft 2020-12 $schema URI is refused by the CLI before any request "
+                  f"(outcome {res_d.outcome}, /v1/messages requests {len(msgs(recs_d))})", [self.ev_job(res_d)])))
         in_bytes = summ["max_input_bytes_seen"]
         self.add(Property(
             "K.input_bound", "Input bound enforced at the broker (live)", "§K",
