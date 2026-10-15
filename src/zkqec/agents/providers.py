@@ -1,9 +1,10 @@
 """Production providers: sandboxed call-mode CLI invocations through the qualified broker (§J, §K).
 
 ``ClaudeCallProvider`` is the only K0-qualified provider (qualification 20261015T105932Z: Claude runs
-tool-free; Codex declares tools via ``additional_tools`` and is K0-unenforced, D16). Ceilings are
-derived from the job's reservation and enforced at the broker (requests, input bytes, output tokens)
-and by the CLI (``--max-budget-usd``); the scope's wall time bounds the call. Usage comes from the
+tool-free; Codex declares tools via ``additional_tools`` and is K0-unenforced, D16). The job's
+reservation is the invocation total; per-request ceilings (total ÷ requests) are derived from it and
+enforced at the broker (requests, input bytes, output tokens) and by the CLI (``max_tokens``,
+retries, ``--max-budget-usd``); the scope's wall time bounds the call. Usage comes from the
 broker log (authoritative for tokens/requests) and the CLI JSON (list-price USD). The reservation
 must cover the maximum charge of those ceilings under the declared price table
 (:func:`check_reservation`, enforced before a live campaign starts). Incomplete
@@ -30,22 +31,31 @@ PRICES = Path(__file__).resolve().parents[3] / "configs" / "broker" / "prices.js
 
 
 class ReservationBelowBound(ValueError):
-    """A per-call USD reservation that does not cover the §K maximum charge of its ceilings."""
+    """A per-call reservation that does not cover the §K maximum charge of its ceilings (or that
+    reserves no model request)."""
 
 
 def call_ceilings(reservation: Reservation) -> Ceilings:
-    """Broker ceilings of one call, derived from its reservation (the only derivation)."""
-    return Ceilings(max_model_requests=max(1, reservation.requests),
-                    max_total_requests=max(1, reservation.requests) + 4,
-                    max_input_bytes=reservation.input_tokens,           # bytes ≥ tokens (§K)
-                    max_output_tokens=reservation.output_tokens,
+    """Broker ceilings of one call, derived from its reservation (the only derivation).
+
+    A reservation is the **invocation total** (Codex M1 milestone review B8): every request the grant
+    allows (the call plus its CLI retries) gets ``total // requests`` input bytes (bytes ≥ tokens, §K)
+    and output tokens, so the allowed requests together never exceed the reserved units. A live call
+    needs at least one reserved model request."""
+    n = reservation.requests
+    if n < 1:
+        raise ReservationBelowBound("a live call reserves at least one model request (requests >= 1)")
+    return Ceilings(max_model_requests=n, max_total_requests=n + 4,
+                    max_input_bytes=reservation.input_tokens // n,
+                    max_output_tokens=reservation.output_tokens // n,
                     ttl_seconds=reservation.wall_seconds + 60)
 
 
 def reservation_floor(model: str, reservation: Reservation, prices: dict | None = None) -> float | None:
-    """§K maximum total charge of one call: model-request ceiling × (input bound × the highest input
-    price of any tier, cache writes included, + output ceiling × the highest output price), from the
-    declared price table. None when the model has no declared price."""
+    """§K maximum total charge of one call: the reserved input total × the highest input price of any
+    tier (cache writes included) + the reserved output total × the highest output price, from the
+    declared price table. It covers the broker's ceilings (``call_ceilings``: requests × ⌊total ÷
+    requests⌋ ≤ total), which are checked against it. None when the model has no declared price."""
     table = prices if prices is not None else json.loads(PRICES.read_text())
     row = table.get("models", {}).get(model) or {}
     p_in = [v for k, v in row.items() if k.startswith(("input", "cache_write")) and v is not None]
@@ -55,7 +65,8 @@ def reservation_floor(model: str, reservation: Reservation, prices: dict | None 
     c = call_ceilings(reservation)
     grant = Grant("bound", "claude", frozenset([model]), c.max_model_requests, c.max_total_requests,
                   c.max_input_bytes, c.max_output_tokens, 0)
-    return reservation_bound(grant, max(p_in), max(p_out))
+    totals = (reservation.input_tokens * max(p_in) + reservation.output_tokens * max(p_out)) / 1e6
+    return max(totals, reservation_bound(grant, max(p_in), max(p_out)))
 
 
 def check_reservation(model: str, reservation: Reservation) -> float:
@@ -80,10 +91,10 @@ class ClaudeCallProvider:
 
     def call(self, *, job_id: str, system_prompt: str, request: str, schema: dict,
              reservation: Reservation) -> CallResult:
-        ceil = call_ceilings(reservation)
+        ceil = call_ceilings(reservation)               # raises before any grant or launch
         spec = CallSpec("claude", self.model, system_prompt, request, schema, effort=self.effort,
-                        max_budget_usd=reservation.usd, max_output_tokens=reservation.output_tokens,
-                        max_retries=max(0, reservation.requests - 1))
+                        max_budget_usd=reservation.usd, max_output_tokens=ceil.max_output_tokens,
+                        max_retries=ceil.max_model_requests - 1)
         launch = claude_call(spec)
         # AF_UNIX socket paths are limited to 108 bytes: the sandbox job (and its broker grant) use a
         # 16-hex prefix of the job id under a short host jobs root.
