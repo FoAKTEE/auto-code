@@ -1,0 +1,14 @@
+# reference repos (contain nested git repos; read-only inputs)
+ref-code/
+# working campaign directories and local envs
+runs/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# secrets
+*.env
+key.env
