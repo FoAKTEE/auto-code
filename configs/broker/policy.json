@@ -1,0 +1,39 @@
+{
+  "_comment": "zkqec egress broker base policy (contracts J1). Exact (host, method, anchored path) allowlist per provider. quiet_block entries are known non-essential endpoints (telemetry/MCP discovery): they are refused with 403 but do not fail the job. Anything else not allowlisted is refused AND fails the job closed. Campaign fields (campaign, log_path, state_dir, dispatch_disabled_path, deadline_unix) are filled in per campaign by zkqec.broker.launcher.",
+  "schema": "zkqec.broker.policy/1",
+  "max_body_bytes": 8388608,
+  "providers": {
+    "claude": {
+      "hosts": ["api.anthropic.com"],
+      "endpoints": [
+        {"host": "api.anthropic.com", "method": "POST", "path": "^/v1/messages$", "kind": "model", "body": "anthropic_messages"}
+      ],
+      "quiet_block": [
+        {"host": "api.anthropic.com", "method": "GET", "path": "^/api/oauth/profile$"},
+        {"host": "api.anthropic.com", "method": "GET", "path": "^/v1/mcp_servers$"}
+      ],
+      "allowed_tools": ["StructuredOutput", "DeferredToolPlaceholder"],
+      "allowed_body_keys": ["context_management", "diagnostics", "max_tokens", "messages", "metadata", "model",
+                            "output_config", "safeguards", "stream", "system", "thinking", "tools"],
+      "ws_client_frame_types": []
+    },
+    "codex": {
+      "hosts": ["chatgpt.com"],
+      "endpoints": [
+        {"host": "chatgpt.com", "method": "GET", "path": "^/backend-api/codex/responses$", "kind": "websocket", "frames": "openai_responses_ws"},
+        {"host": "chatgpt.com", "method": "POST", "path": "^/backend-api/codex/responses$", "kind": "model", "body": "openai_responses"},
+        {"host": "chatgpt.com", "method": "GET", "path": "^/backend-api/codex/models$", "kind": "aux"},
+        {"host": "chatgpt.com", "method": "GET", "path": "^/backend-api/wham/accounts/check$", "kind": "aux"},
+        {"host": "chatgpt.com", "method": "GET", "path": "^/backend-api/wham/settings/user$", "kind": "aux"}
+      ],
+      "quiet_block": [
+        {"host": "chatgpt.com", "method": "POST", "path": "^/backend-api/codex/analytics-events/events$"},
+        {"host": "ab.chatgpt.com"}
+      ],
+      "allowed_tools": [],
+      "allowed_body_keys": ["client_metadata", "generate", "include", "input", "model", "parallel_tool_calls",
+                            "prompt_cache_key", "reasoning", "store", "stream", "text", "tool_choice", "tools", "type"],
+      "ws_client_frame_types": ["response.create"]
+    }
+  }
+}

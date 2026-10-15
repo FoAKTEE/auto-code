@@ -1,0 +1,12 @@
+{
+  "_comment": "Declared price table for reservations (contracts K). USD per million tokens. M0 values: claude-haiku-5-5 was derived from two claude CLI total_cost_usd reports on 2026-10-15 (cache write 1h, cache read) and must be replaced by the official list price table before M1 live runs. Codex runs on a ChatGPT subscription: no list price is declared, so its monetary reservation is unknown and only request/token ceilings apply.",
+  "schema": "zkqec.prices/1",
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "models": {
+    "claude-haiku-5-5": {"input": 0.10, "cache_write": 0.20, "cache_read": 0.01, "output": 0.50,
+                          "source": "derived-from-cli-reports-2026-10-15"},
+    "gpt-6-astra": {"input": null, "cache_write": null, "cache_read": null, "output": null,
+                     "source": "subscription; not declared"}
+  }
+}
