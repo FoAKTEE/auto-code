@@ -302,3 +302,68 @@ def test_run_live_hands_its_broker_to_the_campaign(tmp_path, monkeypatch):
     assert isinstance(seen.get("broker"), Stub)
     assert sorted(p.name for p in (tmp_path / "m1-live-4").iterdir()) == []
     assert "broker_manifest" not in out
+
+
+# --- Codex M1 milestone review B5: controls and confirmation run bounded by their reservations -----
+def _fake_closures(archive, tmp):
+    import zkqec.report.bundle as bundle_mod
+    closures = {}
+    for kind in ("runtime", "wheelhouse", "evaluator"):
+        src = tmp / f"src-{kind}"
+        src.mkdir()
+        (src / "f.txt").write_text(kind)
+        bundle_mod._tar_zst(src, tmp / f"{kind}.tar.zst", kind)
+        closures[kind] = bundle_mod._cas_put(tmp / f"{kind}.tar.zst", {"kind": kind}, archive)
+    return {**closures, "git_commit": "0" * 40, "lock_sha256": "1" * 64}
+
+
+def test_a_control_suite_beyond_its_wall_reservation_is_killed_and_fails(tmp_path, monkeypatch):
+    import time as _time
+    from zkqec.admission import Admission
+    from zkqec.controls import p1a
+    from zkqec.pipeline import build_registry
+    from zkqec.store import ArtifactStore
+    first = p1a.CONTROL_SETS["p1a"][0].name
+    orig = p1a._run_control
+
+    def stuck(c, root, inputs):
+        if c.name == first:
+            _time.sleep(30)
+        return orig(c, root, inputs)
+    monkeypatch.setattr(p1a, "_run_control", stuck)
+    t0 = _time.monotonic()
+    out = run_campaign(cfg(controls="p1a", verifier_wall_seconds=4, verifier_cpu_seconds=4,
+                           max_proposals_per_task=1),
+                       ReplayProviderDouble(["not json"]), tmp_path, require_clean=False,
+                       seal_bundle=False)
+    assert _time.monotonic() - t0 < 25                       # killed at its ceiling, not waited for
+    c = out["controls"]
+    assert c["ok"] is False and c["passed"] is False and "wall_exceeded" in c["error"]
+    store = ArtifactStore(tmp_path / "t1" / "store")
+    with Admission(tmp_path / "t1" / "ledger.db", store, build_registry(store)) as adm:
+        (s,) = [s for s in adm.ledger.settlements("t1") if s["idem_key"] == "controls:p1a"]
+    assert s["from_state"] == "failed" and 4 <= s["charged"]["wall_seconds"] < 10
+    assert "**FAILED**" in (tmp_path / "t1" / "report.md").read_text()
+
+
+def test_the_confirmation_audit_is_killed_at_its_reservation(tmp_path, monkeypatch):
+    import time as _time
+    import zkqec.orchestrator.campaign as campaign
+    import zkqec.report.bundle as bundle_mod
+    archive = tmp_path / "archive"
+    closures = _fake_closures(archive, tmp_path)
+    monkeypatch.setattr(bundle_mod, "ensure_closures", lambda *a, **k: closures)
+
+    def slow_audit(*a, **k):
+        _time.sleep(30)
+        return {"ok": True, "problems": []}
+    monkeypatch.setattr(campaign, "audit_bundle", slow_audit)
+    conf = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0, wall_seconds=2,
+                       cpu_seconds=2)
+    t0 = _time.monotonic()
+    out = run_campaign(cfg(confirmation=conf), ReplayProviderDouble([GOOD]), tmp_path / "runs",
+                       require_clean=False, archive=archive)
+    assert _time.monotonic() - t0 < 25
+    assert out["audit"]["ok"] is False and "wall_exceeded" in out["audit"]["problems"][0]
+    assert 2 <= out["confirmation"]["wall_seconds"] < 10
+    assert out["confirmation_supplement"]["problems"] == ["the confirmation audit did not pass"]

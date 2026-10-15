@@ -21,7 +21,6 @@ published next to the bundle as a supplement whose events chain from the sealed 
 from __future__ import annotations
 
 import json
-import resource
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -32,12 +31,14 @@ from pydantic import Field
 
 from .. import controls
 from ..admission import Admission
+from ..exec import Limits, run_bounded
 from ..contracts import (CampaignLabel, Frozen, Profile, Proposal, Reservation, TaskSA, TaskSF,
                          content_hash)
 from ..firewall.lint import check_fingerprints, family_terms, lint_contract, lint_request
 from ..grammar import MANIFESTS, GrammarCaps
 from ..grammar.intake import parse_proposal
-from ..pipeline import Evaluation, Pipeline, build_registry, evaluator_domain
+from ..pipeline import (DEFAULT_MEMORY_BYTES, MEMORY_SLACK_BYTES, Evaluation, Pipeline,
+                        build_registry, evaluator_domain)
 from ..report.bundle import (audit_bundle, check_confirmation, confirmation_supplement,
                              publish_confirmation, seal)
 from ..report.render import render
@@ -334,42 +335,74 @@ def _verifier_reservation(cfg: CampaignConfig) -> Reservation:
                        wall_seconds=cfg.verifier_wall_seconds, cpu_seconds=cfg.verifier_cpu_seconds)
 
 
+def _limits(cfg: CampaignConfig, reservation: Reservation) -> Limits:
+    """Bounded-child ceilings of a job (B5): CPU and wall from its reservation, memory headroom as
+    for verifier runs (the distance budget's ``max_memory_bytes`` or the default, plus slack)."""
+    memory = int(cfg.distance_budget.get("max_memory_bytes", DEFAULT_MEMORY_BYTES)) + MEMORY_SLACK_BYTES
+    return Limits(cpu_seconds=max(1, reservation.cpu_seconds),
+                  wall_seconds=max(1, reservation.wall_seconds), memory_bytes=memory)
+
+
+def _suite(control_set: str, scratch: Path, inputs: Any) -> dict[str, Any]:
+    """The control suite inside its bounded child: a suite failure comes back as a value, so the
+    evidence it produced survives the process boundary."""
+    try:
+        return {"evidence": controls.run_suite(control_set, scratch, inputs)}
+    except Exception as exc:                                       # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                "partial": getattr(exc, "evidence", None)}
+
+
 def _run_controls(cfg: CampaignConfig, adm: Admission, store: ArtifactStore, book, job: str,
                   scratch: Path) -> dict[str, Any]:
-    """§I controls after dispatch and before sealing, as the verifier-class job reserved at freeze
-    (#13 pattern: measured CPU and wall charged). Inputs come from the frozen campaign; the evidence
-    goes through the sanitizing store and ``controls_recorded`` commits with the job's settlement.
-    ``ok`` says the suite ran to completion; ``passed`` is its pass result (k = 0, j = 0, no outcome
-    mismatch). A failing suite keeps the evidence it produced: a failure record (``FAILED_KIND``,
-    with the completed controls) is the failed job's settled result and a ``controls_failed``
-    incident names it (Codex M1 milestone review B3)."""
+    """§I controls after dispatch and before sealing, as the verifier-class job reserved at freeze.
+    The suite runs in a bounded child whose CPU and wall ceilings are that job's reservation (Codex
+    M1 milestone review B5); the child's measured CPU and wall are charged, and any outcome other
+    than ``ok`` (CPU, wall or memory exceeded, crashed) is a failed suite, never a pass. Inputs come
+    from the frozen campaign; the evidence goes through the sanitizing store and
+    ``controls_recorded`` commits with the job's settlement. ``ok`` says the suite ran to
+    completion; ``passed`` is its pass result (k = 0, j = 0, no outcome mismatch). A failing suite
+    keeps the evidence it produced: a failure record (``FAILED_KIND``, with the completed controls)
+    is the failed job's settled result and a ``controls_failed`` incident names it (B3)."""
     gen = book.dispatch(job)
     t0, w0 = time.process_time(), time.monotonic()
+    measured: dict[str, float] = {}
 
     def settle(state: str, result: str | None = None) -> None:
-        usage = {"cpu_seconds": max(0.0, time.process_time() - t0),
-                 "wall_seconds": max(0.0, time.monotonic() - w0)}
+        usage = measured or {"cpu_seconds": max(0.0, time.process_time() - t0),
+                             "wall_seconds": max(0.0, time.monotonic() - w0)}
         book.complete(job, gen, state, actual=usage, result_sha=result)
         book.settle(job)
+    error, partial, evidence = None, None, None
     try:
         inputs = controls.campaign_inputs(adm, store, cfg.campaign_id)
-        evidence = controls.run_suite(cfg.controls, scratch, inputs)
-        sha = store.put_json(evidence)
+        res = run_bounded(_suite, cfg.controls, scratch, inputs,
+                          limits=_limits(cfg, _verifier_reservation(cfg)))
+        measured.update(cpu_seconds=res.cpu_seconds + max(0.0, time.process_time() - t0),
+                        wall_seconds=max(res.wall_seconds, time.monotonic() - w0))
+        if not res.ok:
+            error = f"{res.outcome}: {res.detail.get('message', res.detail.get('error_type', ''))}"[:400]
+        elif "error" in res.value:
+            error, partial = res.value["error"], res.value["partial"]
+        else:
+            evidence = res.value["evidence"]
+            sha = store.put_json(evidence)
     except Exception as exc:                                       # noqa: BLE001
         error = f"{type(exc).__name__}: {str(exc)[:300]}"
-        failure = getattr(exc, "evidence", None) or {
-            "kind": controls.FAILED_KIND, "control_set": cfg.controls,
-            "failed": {"control": None, "error": error}, "partial": {"controls": []}}
+    if error is not None:
+        failure = partial or {"kind": controls.FAILED_KIND, "control_set": cfg.controls,
+                              "failed": {"control": None, "error": error},
+                              "partial": {"controls": []}}
         try:
             sha = store.put_json(failure)
         except Exception:                                          # noqa: BLE001
             sha = store.put_json({"kind": controls.FAILED_KIND, "control_set": cfg.controls,
-                                  "failed": {"control": None, "error": type(exc).__name__},
+                                  "failed": {"control": None, "error": error.split(":")[0]},
                                   "partial": {"controls": []}})
         settle("failed", sha)
         adm.open_incident("controls_failed", {"campaign_id": cfg.campaign_id,
                                               "control_set": cfg.controls,
-                                              "error": type(exc).__name__, "evidence": sha})
+                                              "error": error.split(":")[0][:64], "evidence": sha})
         return {"control_set": cfg.controls, "ok": False, "passed": False, "evidence": sha,
                 "error": error}
     rows = evidence["results"]
@@ -386,22 +419,32 @@ def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, jo
              entry: dict, kw: dict) -> tuple[dict, dict, dict]:
     """Phase-1a confirmation (§7.4): offline re-execution from the sealed bundle, run under the
     confirmation job reserved at freeze. Its dispatch and settlement happen after the bundle was
-    sealed (the sealed ledger shows the reservation as reserved, not spent); the measured wall and
-    child CPU time are charged in the run ledger, and the settlement event with the final totals is
-    published next to the bundle as a hash-linked confirmation supplement (§K, §M)."""
+    sealed (the sealed ledger shows the reservation as reserved, not spent); it runs in a bounded
+    child under the confirmation reservation, the child's measured wall and CPU time are charged in
+    the run ledger, and the settlement event with the final totals is published next to the bundle
+    as a hash-linked confirmation supplement (§K, §M)."""
     adm = Admission(run / "ledger.db", store, build_registry(store))
     try:
         book = adm.job_book(cfg.campaign_id, profile=prof)
         gen = book.dispatch(job)
         w0 = time.monotonic()
-        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         audit: dict[str, Any] = {"ok": False, "problems": ["confirmation did not complete"]}
+        usage = {"wall_seconds": float(cfg.confirmation.wall_seconds),
+                 "cpu_seconds": float(cfg.confirmation.cpu_seconds)}
         try:
-            audit = audit_bundle(Path(entry["path"]), workdir=run / "audit", **kw)
+            # B5: the re-execution (and every process it starts) runs in a bounded child whose
+            # CPU and wall ceilings are the confirmation reservation; its measured usage
+            # (wait4: the child and its reaped descendants) is charged; non-ok is a failure.
+            res = run_bounded(audit_bundle, Path(entry["path"]), workdir=run / "audit",
+                              limits=_limits(cfg, cfg.confirmation), **kw)
+            usage = res.usage()
+            if res.ok and isinstance(res.value, dict):
+                audit = res.value
+            else:
+                audit = {"ok": False, "problems": [
+                    f"confirmation {res.outcome}: {res.detail.get('message', '')}"[:400]]}
         finally:
-            c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-            usage = {"wall_seconds": time.monotonic() - w0,
-                     "cpu_seconds": (c1.ru_utime + c1.ru_stime) - (c0.ru_utime + c0.ru_stime),
+            usage = {**usage, "wall_seconds": max(usage["wall_seconds"], time.monotonic() - w0),
                      "usd": 0.0, "requests": 0.0, "input_tokens": 0.0, "output_tokens": 0.0}
             book.complete(job, gen, "completed" if audit.get("ok") else "failed", actual=usage)
             charged = book.settle(job)
