@@ -1,0 +1,251 @@
+"""M1 evaluation pipeline: registered verifier adapters + candidate evaluation through admission.
+
+Flow for one proposal (prompt §7 step 3, appendix §B, §C, §F):
+  L0/grammar build → store presentation → L1 (css_algebra) → identity (code_sha) →
+  L2 (distance at the half-weight the task needs: certify d ≥ d_min ⇔ exclusion through d_min−1,
+  so t = ⌈(d_min−1)/2⌉) → [S-F] L3 (logical_action) → DesignCandidate → resolver verdicts.
+
+Every verifier run is a job in the :class:`JobBook`; its settlement commits inside the admission's
+closing transaction. Agents never call this module; the orchestrator does.
+"""
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+
+from .admission import Admission, VerifierRegistry
+from .admission.registry import ArtifactInput
+from .contracts import (DesignCandidate, LogicalBasis, OperationRef, PhysicalOperation, Presentation,
+                        Proposal, Reservation, SignedPauliImages, TaskSA, TaskSF, content_hash)
+from .contracts.registry import REGISTRY_VERSION
+from .grammar import GrammarCaps, MalformedProposal, build
+from .grammar.errors import UnsupportedFamily
+from .identity import code_sha
+from .orchestrator.jobs import JobBook
+from .store import ArtifactStore
+from .verify import DistanceBudget, analyze, certify_distance, implements
+from .verify.logical_action import MalformedInput, UnsupportedInput
+
+KERNEL_VERSION = "kernel-0.1.0+1"
+PIPELINE_VERSION = "1.0.0"
+
+
+def _dense(p: Presentation) -> tuple[np.ndarray, np.ndarray]:
+    out = []
+    for m in (p.hx, p.hz):
+        a = np.zeros(m.shape, dtype=np.uint8)
+        for i, j in m.entries:
+            a[i, j] = 1
+        out.append(a)
+    return out[0], out[1]
+
+
+def build_registry(store: ArtifactStore) -> VerifierRegistry:
+    """The frozen evaluator: thin adapters from hash-verified artifact bytes to zkqec.verify."""
+    sink = store.put_json
+    reg = VerifierRegistry()
+
+    def l1(presentation: ArtifactInput):
+        return analyze(Presentation.model_validate(presentation.json()), artifact_sink=sink)
+
+    def l2(presentation: ArtifactInput, params: ArtifactInput):
+        pres, cfg = Presentation.model_validate(presentation.json()), params.json()
+        hx, hz = _dense(pres)
+        budget = DistanceBudget(**cfg.get("budget", {}))
+        return certify_distance(hx, hz, int(cfg["half_weight"]), artifact_sink=sink, budget=budget)
+
+    def l3(presentation: ArtifactInput, basis: ArtifactInput, operation: ArtifactInput,
+           target: ArtifactInput, spec: ArtifactInput):
+        return implements(Presentation.model_validate(presentation.json()),
+                          LogicalBasis.model_validate(basis.json()),
+                          PhysicalOperation.model_validate(operation.json()),
+                          SignedPauliImages.model_validate(target.json()),
+                          tuple(spec.json()["logical_qubits"]), artifact_sink=sink)
+
+    def ident(presentation: ArtifactInput):
+        hx, hz = _dense(Presentation.model_validate(presentation.json()))
+        return code_sha(hx, hz)
+
+    reg.register("l1.css_algebra", "1.0.0", l1)
+    reg.register("l2.distance", "1.0.0", l2)
+    reg.register("l3.logical_action", "1.0.0", l3)
+    reg.register_identity("identity.code_sha", "1.0.0", ident)
+    return reg
+
+
+def evaluator_domain(reg: VerifierRegistry) -> str:
+    """Domain hash: the evaluator identity (verifier versions, kernel, predicate registry)."""
+    return content_hash({"registry": reg.manifest(), "kernel": KERNEL_VERSION,
+                         "predicates": REGISTRY_VERSION, "pipeline": PIPELINE_VERSION})
+
+
+def half_weight_for(d_min: int) -> int:
+    return max(0, math.ceil((d_min - 1) / 2))
+
+
+@dataclass
+class Evaluation:
+    """Facts about one evaluated proposal (rendered into verdict-free digests)."""
+    outcome: str                          # malformed_proposal | unsupported | evaluated
+    detail: dict[str, Any] = field(default_factory=dict)
+    presentation: str | None = None
+    code: str | None = None
+    candidate: str | None = None
+    satisfies: str = "unknown"            # verified | unknown (derived predicate)
+    refuted: dict[str, str] = field(default_factory=dict)
+    facts: dict[str, Any] = field(default_factory=dict)
+
+
+class Pipeline:
+    def __init__(self, admission: Admission, store: ArtifactStore, book: JobBook, domain: str, *,
+                 caps: GrammarCaps, distance_budget: dict | None = None, cpu_reservation: int = 600):
+        self.adm, self.store, self.book, self.domain = admission, store, book, domain
+        self.caps, self.distance_budget = caps, distance_budget or {}
+        self.cpu_reservation = cpu_reservation
+
+    # -- one verifier run = one settled job -------------------------------------------------------
+    def _run(self, name: str, inputs: dict[str, str], key: str):
+        res = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0, wall_seconds=0,
+                          cpu_seconds=self.cpu_reservation)
+        job = self.book.reserve("verify", f"{name}:{key}", res, input_sha=content_hash(inputs))
+        if self.book.state(job) == "settled":            # idempotent replay of a finished job
+            return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=key)
+        gen = self.book.dispatch(job)
+        t0 = time.process_time()
+
+        def settle(outcome: str) -> None:
+            cpu = max(0.0, time.process_time() - t0)
+            self.book.complete(job, gen, "completed" if outcome == "admitted" else "failed",
+                               actual={"cpu_seconds": cpu})
+            self.book.settle(job)
+        return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=key, on_close=settle)
+
+    # -- evaluation --------------------------------------------------------------------------------
+    def evaluate(self, proposal: Proposal, task: TaskSA | TaskSF) -> Evaluation:
+        try:
+            pres, _, _ = build(proposal, self.caps)
+        except UnsupportedFamily as e:
+            return Evaluation("unsupported", {"reason": str(e)})
+        except MalformedProposal as e:
+            return Evaluation("malformed_proposal", {"reason": str(e)})
+        p_sha = self.store.put_json(pres.model_dump(mode="json"))
+        ev = Evaluation("evaluated", presentation=p_sha)
+        self._run("l1.css_algebra", {"presentation": p_sha}, f"l1:{p_sha}")
+        res = self.adm.resolver(self.domain)
+        facts = self._presentation_facts(res, p_sha)
+        if facts.get("css_valid") != "verified":
+            ev.facts = facts
+            return self._verdicts(ev, task, DesignCandidate(C=p_sha))
+        self.adm.run_identity("identity.code_sha", p_sha, self.domain, idempotency_key=f"id:{p_sha}")
+        res = self.adm.resolver(self.domain)
+        ev.code = (res.code_of(p_sha) or (None, None))[0]
+        facts = self._presentation_facts(res, p_sha)
+        t = task.targets
+        cheap_fail = (facts["n"] > t.n_max or (facts["k"] is not None and facts["k"] < t.k_min)
+                      or (t.w_max is not None and facts["max_check_weight"] > t.w_max)
+                      or (t.deg_max is not None and facts["max_qubit_degree"] > t.deg_max))
+        if not cheap_fail and (facts["k"] or 0) >= 1:
+            params = self.store.put_json({"half_weight": half_weight_for(t.d_min),
+                                          "budget": self.distance_budget})
+            self._run("l2.distance", {"presentation": p_sha, "params": params},
+                      f"l2:{p_sha}:{params}")
+        candidate = DesignCandidate(C=p_sha)
+        if isinstance(task, TaskSF) and not cheap_fail:
+            candidate = self._evaluate_operation(proposal, task, p_sha, facts, candidate, ev)
+        ev.facts = {**facts, **self._distance_facts(self.adm.resolver(self.domain), ev.code)}
+        return self._verdicts(ev, task, candidate)
+
+    def _evaluate_operation(self, proposal, task: TaskSF, p_sha, facts, candidate, ev):
+        w = proposal.witnesses or {}
+        try:
+            if "basis" in w:
+                basis = LogicalBasis(presentation=p_sha, lx=tuple(map(tuple, w["basis"]["lx"])),
+                                     lz=tuple(map(tuple, w["basis"]["lz"])))
+                b_sha = self.store.put_json(basis.model_dump(mode="json"))
+            else:
+                b_sha = facts.get("canonical_basis")
+                if b_sha is None:
+                    ev.detail["operation"] = "no basis available"
+                    return candidate
+            op = PhysicalOperation(n=facts["n"], **(w.get("operation") or {}))
+            lq = tuple(int(q) for q in w.get("logical_qubits", range(task.k_req)))
+        except (ValueError, TypeError, KeyError) as e:
+            ev.detail["operation"] = f"malformed witness: {e}"
+            return candidate
+        if not op.operation_classes <= set(task.hardware.allowed_operations):
+            ev.detail["operation"] = f"operation class {sorted(op.operation_classes)} not allowed"
+            return candidate
+        o_sha = self.store.put_json(op.model_dump(mode="json"))
+        tgt_sha = self.store.put_json(task.target_action.model_dump(mode="json"))
+        spec = self.store.put_json({"logical_qubits": list(lq)})
+        self._run("l3.logical_action", {"presentation": p_sha, "basis": b_sha, "operation": o_sha,
+                                         "target": tgt_sha, "spec": spec}, f"l3:{o_sha}:{b_sha}:{tgt_sha}:{spec}")
+        ref = OperationRef(target_action=tgt_sha, circuit=o_sha, basis=b_sha, logical_qubits=lq)
+        return DesignCandidate(C=p_sha, L=b_sha, G=(ref,))
+
+    # -- facts & verdicts -----------------------------------------------------------------------
+    def _presentation_facts(self, res, p_sha) -> dict[str, Any]:
+        """Verifier-established facts about a presentation and its code (current receipts only)."""
+        facts: dict[str, Any] = {"n": None, "k": None, "max_check_weight": None,
+                                 "max_qubit_degree": None, "css_valid": "unknown",
+                                 "canonical_basis": None}
+        code = (res.code_of(p_sha) or (None, None))[0]
+        for r in res.current().values():
+            pr = r.proposition
+            if pr.subject == p_sha:
+                if pr.predicate == "css_valid":
+                    facts["css_valid"] = r.status
+                elif r.status != "verified":
+                    continue
+                elif pr.predicate == "block_length_eq":
+                    facts["n"] = pr.args["n"]
+                elif pr.predicate == "max_check_weight_eq":
+                    facts["max_check_weight"] = pr.args["w"]
+                elif pr.predicate == "max_qubit_degree_eq":
+                    facts["max_qubit_degree"] = pr.args["q"]
+            elif (pr.predicate == "dimension_eq" and r.status == "verified" and code is not None
+                  and pr.subject == code):
+                facts["k"] = pr.args["k"]
+                if r.artifacts:
+                    facts["canonical_basis"] = r.artifacts[0]
+        if code is None and facts["css_valid"] == "verified":
+            # Before the identity is recorded, k is read from this presentation's L1 execution.
+            for r in res.current().values():
+                if r.proposition.predicate == "dimension_eq" and p_sha in r.input_hashes:
+                    facts["k"] = r.proposition.args["k"]
+                    facts["canonical_basis"] = r.artifacts[0] if r.artifacts else None
+        return facts
+
+    def _distance_facts(self, res, code) -> dict[str, Any]:
+        """Certified distance interval per sector, via the resolver (incl. the derived ``both``):
+        [largest verified lower bound, smallest verified upper bound]; None when absent."""
+        if code is None:
+            return {}
+        from .contracts import Proposition
+        values = sorted({r.proposition.args["d"] for r in res.current().values()
+                         if r.proposition.subject == code
+                         and r.proposition.predicate in ("distance_lower_bound", "distance_upper_bound")})
+
+        def ok(pred, sector, d):
+            return res.status(Proposition(predicate=pred, subject_type="code", subject=code,
+                                          args={"sector": sector, "d": d})).status == "verified"
+        out = {}
+        for sector in ("X", "Z", "both"):
+            lows = [d for d in values if ok("distance_lower_bound", sector, d)]
+            highs = [d for d in values if ok("distance_upper_bound", sector, d)]
+            out[f"d_{sector}"] = [max(lows) if lows else None, min(highs) if highs else None]
+        return out
+
+    def _verdicts(self, ev: Evaluation, task, candidate: DesignCandidate) -> Evaluation:
+        ev.candidate = self.store.put_json(candidate.model_dump(mode="json"))
+        res = self.adm.resolver(self.domain)
+        ev.satisfies = res.satisfies_task(candidate, task).status
+        for req in res.requirement_names(task):
+            st = res.target_refuted(candidate, task, req).status
+            if st != "unknown":
+                ev.refuted[req] = st
+        return ev
