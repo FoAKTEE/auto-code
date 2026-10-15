@@ -1,11 +1,12 @@
 """Minimal M1 campaign runner (prompt §7; appendix §J3, §K, §L, §M, §N).
 
 freeze (clean evaluator tree, manifest, ``campaign_frozen`` ledger event) → per task: request
-(task + verdict-free digest + grammar manifest), syntactic request screening, reserve → dispatch →
-provider call (call mode, no tools) → settle with actual usage (a ``job_settled`` event in the same
-transaction) → strict intake → pipeline.evaluate → ``evaluation_recorded`` → stop when the task is
-satisfied or the proposal budget is spent → templated report (from the ledger only) → sealed bundle
-→ offline audit (the Phase-1a confirmation: re-execution from the sealed bundle).
+(task + verdict-free digest + grammar manifest), syntactic request screening, evaluator-fingerprint
+and frozen-task checks, reserve → dispatch → provider call (call mode, no tools) → settle with
+actual usage (a ``job_settled`` event in the same transaction) → strict intake → frozen-task check →
+pipeline.evaluate → ``evaluation_recorded`` → stop when the task is satisfied or the proposal budget
+is spent → templated report (from the ledger only) → sealed bundle → offline audit (the Phase-1a
+confirmation: re-execution from the sealed bundle).
 """
 from __future__ import annotations
 
@@ -173,14 +174,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     except BaseException:
         adm.close()
         raise
-    def check_evaluator(boundary: str) -> None:
-        try:
-            guard.check(boundary)
-        except freeze.EvaluatorChanged as exc:
-            adm.open_incident("evaluator_changed", {"boundary": boundary[:100],
-                                                    "detail": str(exc)[:400]})
-            raise
-
+    check_evaluator = freeze.boundary_check(guard, adm)
     families = tuple(grammar_for(cfg.profile))
     pipe = Pipeline(adm, store, book, dom, caps=GrammarCaps(max_n=cfg.max_n),
                     distance_budget=cfg.distance_budget, families=families,
@@ -208,6 +202,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 if cfg.profile.prompt == "P-min" and family_terms(request):
                     raise RuntimeError("rendered P-min request names a code family/construction")
                 check_evaluator("provider dispatch")          # typed abort before reserving
+                freeze.check_task(adm, cfg.campaign_id, task)   # §I mode 1: frozen task hash
                 try:
                     job = book.reserve("propose", f"{task.task_id}:{i}", cfg.per_call,
                                        input_sha=content_hash(request))
@@ -256,6 +251,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                                              f"failures; see {calls_dir}")
                     continue
                 p_sha = store.put_json(proposal.model_dump(mode="json"))
+                freeze.check_task(adm, cfg.campaign_id, task)
                 ev = pipe.evaluate(proposal, task)
                 history.append(ev)
                 if ev.candidate is not None:

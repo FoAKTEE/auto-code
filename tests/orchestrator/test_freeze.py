@@ -94,3 +94,76 @@ def test_campaign_aborts_when_the_evaluator_changes_mid_run(tmp_path, monkeypatc
     manifest = json.loads((tmp_path / "t1" / "manifest.json").read_text())
     assert "src/zkqec/pipeline.py" in manifest["evaluator_fingerprint"]["files"]
     assert "roles/designer/output.schema.json" in manifest["evaluator_fingerprint"]["files"]
+
+
+# --- §I mode 1: a task that differs from the frozen task aborts with an integrity record ----------
+def _frozen(tmp_path, task):
+    from zkqec.admission import Admission
+    from zkqec.pipeline import build_registry
+    from zkqec.store import ArtifactStore
+    store = ArtifactStore(tmp_path / "store")
+    adm = Admission(tmp_path / "ledger.db", store, build_registry(store))
+    adm.freeze_campaign("c1", namespace="c1", config={}, tasks=[task.model_dump(mode="json")],
+                        caps={}, labels=[], domain="0" * 64, manifest=store.put_json({}))
+    return adm
+
+
+def _incidents(adm):
+    return [e.payload["category"] for e in adm.ledger.events() if e.kind == "incident_opened"]
+
+
+def test_a_task_differing_from_the_frozen_task_aborts_with_an_integrity_record(tmp_path):
+    from zkqec.contracts import StructuralTargets, TaskSA
+    task = TaskSA(task_id="sa-1", targets=StructuralTargets(n_max=7, k_min=1, d_min=5))
+    adm = _frozen(tmp_path, task)
+    try:
+        freeze.check_task(adm, "c1", task)                      # unchanged: proceeds
+        assert _incidents(adm) == []
+        weaker = TaskSA(task_id="sa-1", targets=StructuralTargets(n_max=7, k_min=1, d_min=3))
+        unknown = TaskSA(task_id="sa-2", targets=task.targets)
+        for presented in (weaker, unknown):
+            with pytest.raises(freeze.TaskMutated):
+                freeze.check_task(adm, "c1", presented)
+        assert _incidents(adm) == ["task_mutated", "task_mutated"]
+    finally:
+        adm.close()
+
+
+def test_campaign_aborts_when_its_task_is_mutated_mid_run(tmp_path):
+    """A task changed in memory after the freeze (here by the provider double, as a buggy component
+    could) is caught before the proposal is evaluated: typed abort, incident, no evaluation."""
+    import sqlite3
+    from test_campaign import GOOD, ReplayProviderDouble, cfg
+    from zkqec.orchestrator.campaign import run_campaign
+    config = cfg()
+    task = config.tasks[0]
+
+    class MutatingDouble(ReplayProviderDouble):
+        def call(self, **kw):
+            object.__setattr__(task.targets, "d_min", 5)        # the chain(3,7) code has d = 6
+            return super().call(**kw)
+    with pytest.raises(freeze.TaskMutated):
+        run_campaign(config, MutatingDouble([GOOD]), tmp_path, require_clean=False,
+                     seal_bundle=False)
+    conn = sqlite3.connect(tmp_path / "t1" / "ledger.db")
+    kinds = [k for k, in conn.execute("SELECT kind FROM events ORDER BY seq")]
+    cats = [json.loads(p)["category"] for p, in conn.execute(
+        "SELECT payload FROM events WHERE kind='incident_opened'")]
+    conn.close()
+    assert cats == ["task_mutated"] and "evaluation_recorded" not in kinds
+    assert not any(k == "execution_opened" for k in kinds)        # nothing was verified
+
+
+def test_boundary_check_records_an_incident_before_the_abort(repo, tmp_path):
+    from zkqec.contracts import StructuralTargets, TaskSA
+    adm = _frozen(tmp_path, TaskSA(task_id="sa-1", targets=StructuralTargets(n_max=7, k_min=1,
+                                                                           d_min=3)))
+    try:
+        check = freeze.boundary_check(freeze.EvaluatorGuard(repo, check_imports=False), adm)
+        check("verifier l1")
+        (repo / "src/zkqec/a.py").write_text("A = 3\n")
+        with pytest.raises(freeze.EvaluatorChanged):
+            check("verifier l2")
+        assert _incidents(adm) == ["evaluator_changed"]
+    finally:
+        adm.close()

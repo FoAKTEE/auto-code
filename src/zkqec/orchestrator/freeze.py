@@ -7,6 +7,10 @@ imported ``zkqec`` package must be the fingerprinted tree. :meth:`EvaluatorGuard
 it before every provider dispatch and every verifier batch; any difference is a typed abort
 (:class:`EvaluatorChanged`). This is the M1 control: importing the evaluator from an extracted,
 read-only snapshot with a controlled ``sys.path`` (§O) is an M2 residual.
+
+The frozen *task* is checked the same way (§I mode 1): :func:`check_task` compares the task about to
+be dispatched or evaluated with the task frozen under its id in the ledger's ``campaign_frozen``
+event; any difference opens a ``task_mutated`` incident and is a typed abort (:class:`TaskMutated`).
 """
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ import hashlib
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..contracts import content_hash
 
@@ -25,6 +29,10 @@ FINGERPRINT_KIND = "zkqec-evaluator-fingerprint-v1"
 
 class EvaluatorChanged(RuntimeError):
     """The evaluator differs from the frozen fingerprint or from the recorded commit."""
+
+
+class TaskMutated(RuntimeError):
+    """A task presented for dispatch or evaluation differs from the campaign's frozen task."""
 
 
 def _excluded(rel: str) -> bool:
@@ -125,3 +133,32 @@ class EvaluatorGuard:
         if now["sha256"] != self.frozen["sha256"]:
             raise EvaluatorChanged(f"{boundary}: evaluator changed since the freeze: "
                                    f"{diff(self.frozen, now)}")
+
+
+def boundary_check(guard: EvaluatorGuard, adm) -> Callable[[str], None]:
+    """The campaign's check at every dispatch boundary: on any evaluator change, record an
+    ``evaluator_changed`` incident in the ledger, then abort (:class:`EvaluatorChanged`)."""
+    def check(boundary: str) -> None:
+        try:
+            guard.check(boundary)
+        except EvaluatorChanged as exc:
+            adm.open_incident("evaluator_changed", {"boundary": boundary[:100],
+                                                    "detail": str(exc)[:400]})
+            raise
+    return check
+
+
+def check_task(adm, campaign_id: str, task) -> None:
+    """Abort with an integrity record unless ``task`` equals (canonical JSON) the task frozen under
+    its id in the campaign's ``campaign_frozen`` event (§I mode 1: task mutated mid-campaign)."""
+    camp = adm.ledger.campaign(campaign_id)
+    frozen = {t["task_id"]: t for t in (camp or {}).get("tasks", [])}.get(task.task_id)
+    presented = content_hash(task.model_dump(mode="json"))
+    if frozen is not None and content_hash(frozen) == presented:
+        return
+    adm.open_incident("task_mutated", {
+        "campaign_id": campaign_id, "task_id": str(task.task_id)[:64],
+        "frozen_sha256": None if frozen is None else content_hash(frozen),
+        "presented_sha256": presented})
+    raise TaskMutated(f"task {str(task.task_id)[:64]!r} differs from the task frozen in campaign "
+                      f"{campaign_id}")
