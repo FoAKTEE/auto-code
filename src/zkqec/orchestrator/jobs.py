@@ -12,8 +12,11 @@ Lifecycle: ``reserved → dispatched → {completed | uncertain | failed} → se
   the external action (CLI, verifier). A crash after this point leaves the job ``dispatched``;
   ``recover`` turns it into ``uncertain``, which keeps its full reservation.
 * ``complete`` is fenced by the generation: stale or duplicate completions are rejected.
-* ``settle`` reconciles: completed/failed jobs are charged their actual usage (an overrun beyond the
-  reservation is charged in full and flagged); uncertain jobs are charged their full reservation.
+* ``complete`` accepts usage only as finite, non-negative numbers per known unit (NaN, inf, bools
+  and strings are refused). A unit that is absent is *unmeasured*, never zero.
+* ``settle`` reconciles (:func:`charge_for`): completed/failed jobs are charged their measured usage
+  per unit and the full reservation for every unmeasured unit (an overrun beyond the reservation is
+  charged in full and flagged); uncertain jobs are charged their full reservation.
 * All methods can run inside the ledger's open transaction (e.g. from ``Admission.run_verifier``'s
   ``on_close`` hook) so admission and settlement commit atomically; otherwise they open their own
   ``BEGIN IMMEDIATE`` transaction.
@@ -21,6 +24,7 @@ Lifecycle: ``reserved → dispatched → {completed | uncertain | failed} → se
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -75,6 +79,35 @@ class IllegalTransition(JobError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def check_usage(actual: dict | None) -> dict[str, float] | None:
+    """Typed usage: known units only, each a finite non-negative int/float (not bool)."""
+    if actual is None:
+        return None
+    if not isinstance(actual, dict):
+        raise JobError(f"usage must be a dict of units, got {type(actual).__name__}")
+    out = {}
+    for unit, v in actual.items():
+        if unit not in UNITS:
+            raise JobError(f"unknown usage unit {unit!r}")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+            raise JobError(f"usage {unit}={v!r} must be a finite non-negative number")
+        out[unit] = float(v)
+    return out
+
+
+def charge_for(state: str, reservation: dict, actual: dict | None) -> dict[str, float]:
+    """Settlement rule: uncertain or unmeasured ⇒ the reservation; measured units ⇒ the measure."""
+    if state == "uncertain" or actual is None:
+        return {u: float(reservation.get(u, 0.0)) for u in UNITS}
+    return {u: float(actual[u]) if u in actual else float(reservation.get(u, 0.0)) for u in UNITS}
+
+
+def _finite_charge(d: object) -> bool:
+    return isinstance(d, dict) and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
+        for v in d.values())
 
 
 def _res_dict(r: Reservation) -> dict:
@@ -200,10 +233,7 @@ class JobBook:
                 raise StaleCompletion(f"{job_id}: generation {generation} != current {gen}")
             if state != "dispatched":
                 raise DuplicateCompletion(f"{job_id}: already {state}")
-            if actual is not None:
-                bad = set(actual) - set(UNITS)
-                if bad or any(float(v) < 0 for v in actual.values()):
-                    raise JobError(f"invalid actual usage {actual}")
+            actual = check_usage(actual)
             self._move(job_id, outcome, actual=json.dumps(actual, sort_keys=True) if actual else None,
                        outcome=outcome, result_sha=result_sha)
             self._log(job_id, outcome, gen, {"actual": actual, "result_sha": result_sha})
@@ -215,11 +245,7 @@ class JobBook:
             if state not in ("completed", "failed", "uncertain"):
                 raise IllegalTransition(f"{job_id}: cannot settle a {state} job")
             reservation = json.loads(res)
-            if state == "uncertain" or actual is None:
-                charged = reservation
-            else:
-                used = json.loads(actual)
-                charged = {u: float(used.get(u, 0.0)) for u in UNITS}
+            charged = charge_for(state, reservation, check_usage(json.loads(actual)) if actual else None)
             overrun = any(charged[u] > reservation.get(u, 0.0) + 1e-12 for u in UNITS)
             self._move(job_id, "settled", actual=json.dumps(charged, sort_keys=True),
                        overrun=int(overrun))
@@ -271,7 +297,15 @@ class JobBook:
                      "cancelled": "settled"}.get(event, event)
             last[job_id] = (state, gen)
         problems = []
-        for job_id, state, gen in self.conn.execute("SELECT job_id, state, generation FROM ops_jobs"):
+        for job_id, state, gen, res, actual in self.conn.execute(
+                "SELECT job_id, state, generation, reservation, actual FROM ops_jobs"):
             if last.get(job_id) != (state, gen):
                 problems.append(f"{job_id}: table {(state, gen)} != log {last.get(job_id)}")
+            for name, text in (("reservation", res), ("charge", actual)):
+                try:
+                    ok = text is None or _finite_charge(json.loads(text))
+                except ValueError:
+                    ok = False
+                if not ok:
+                    problems.append(f"{job_id}: {name} is not finite non-negative usage")
         return problems

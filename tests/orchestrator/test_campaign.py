@@ -96,3 +96,18 @@ def test_designer_schema_has_no_draft_uri():
     from pathlib import Path
     schema = json.loads((Path(__file__).resolve().parents[2] / "roles/designer/output.schema.json").read_text())
     assert "$schema" not in schema       # the Claude CLI validator rejects the 2020-12 meta-schema URI
+
+
+class TimeoutPartialUsageDouble(ReplayProviderDouble):
+    """A killed call that reports only partial telemetry (Codex M1 review #5)."""
+
+    def call(self, *, job_id, system_prompt, request, schema, reservation):
+        self.requests.append(json.loads(request))
+        return CallResult("timeout", None, {"requests": 1.0}, {"provider": "replay"})
+
+
+def test_interrupted_call_with_partial_usage_keeps_its_full_reservation(tmp_path):
+    out = run_campaign(cfg(max_proposals_per_task=1), TimeoutPartialUsageDouble([]), tmp_path,
+                       require_clean=False, seal_bundle=False)
+    assert out["totals"]["usd"]["spent"] == pytest.approx(0.2)
+    assert out["totals"]["requests"]["spent"] == pytest.approx(2)

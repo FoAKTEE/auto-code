@@ -151,3 +151,48 @@ def test_failing_settlement_rolls_back_the_admission(tmp_path):
         adm.ledger.conn.execute("SELECT name FROM sqlite_master WHERE name='receipts'").fetchone() else True
     assert book.state(j) == "dispatched"          # nothing settled; recovery will mark uncertain
     adm.close()
+
+
+# --- Codex M1 review #5: partial usage must not refund; NaN must not disable caps -------------------
+def test_partial_usage_does_not_refund_unmeasured_units(book):
+    j = book.reserve("propose", "k", R)
+    g = book.dispatch(j)
+    book.complete(j, g, "failed", actual={"requests": 1})
+    charged = book.settle(j)
+    assert charged["usd"] == 1.0                      # unmeasured: the reservation is retained
+    assert charged["requests"] == 1.0 and charged["output_tokens"] == 500
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0, True, "0.5", None])
+def test_non_finite_or_untyped_usage_is_rejected(book, bad):
+    from zkqec.orchestrator.jobs import JobError
+    j = book.reserve("propose", "k", R)
+    g = book.dispatch(j)
+    with pytest.raises(JobError):
+        book.complete(j, g, "completed", actual={"usd": bad})
+    assert book.state(j) == "dispatched"
+    book.complete(j, g, "completed", actual={"usd": 0.5})
+    book.settle(j)
+    assert book.totals()["usd"]["spent"] == 0.5
+
+
+def test_nan_cannot_open_room_beyond_the_cap(book):
+    j = book.reserve("propose", "k", R)
+    g = book.dispatch(j)
+    with pytest.raises(Exception):
+        book.complete(j, g, "completed", actual={"usd": float("nan")})
+    book.complete(j, g, "uncertain")
+    book.settle(j)
+    book.reserve("propose", "k2", R)
+    with pytest.raises(BudgetExceeded):
+        book.reserve("propose", "k3", R)              # 1 spent + 1 open + 1 > 2.5
+
+
+def test_audit_flags_non_finite_charges(book):
+    j = book.reserve("propose", "k", R)
+    g = book.dispatch(j)
+    book.complete(j, g, "completed", actual={"usd": 0.5})
+    book.settle(j)
+    book.conn.execute("UPDATE ops_jobs SET actual = ? WHERE job_id = ?",
+                      ('{"usd": NaN}', j))
+    assert any("finite" in p for p in book.audit())

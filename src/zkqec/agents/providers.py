@@ -93,6 +93,11 @@ class ClaudeCallProvider:
             usage["output_tokens"] = float(tokens.get("output_tokens", 0))
         if isinstance(cli, dict) and cli.get("total_cost_usd") is not None:
             usage["usd"] = float(cli["total_cost_usd"])
+        if summ["model_requests"] == 0 and not summ["failed"]:
+            # The broker logs every upstream request before forwarding it (§L): no model request
+            # forwarded establishes a zero model charge. Otherwise unmeasured units keep the
+            # reservation at settlement.
+            usage.update(usd=0.0, input_tokens=0.0, output_tokens=0.0)
         if res.outcome == "policy_blocked" or summ["failed"]:
             outcome = "policy_blocked"
         elif res.outcome == "timeout":

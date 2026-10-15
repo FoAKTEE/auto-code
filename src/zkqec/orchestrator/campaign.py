@@ -89,6 +89,18 @@ class LaunchFailures(RuntimeError):
     """Repeated provider launch failures: an infrastructure fault that stops the campaign."""
 
 
+# An interrupted, killed or blocked call may have been billed: it keeps its full reservation
+# (uncertain) unless complete accounting establishes the charge (§K). Only a call that never reached
+# the provider (launch failure, unsupported) settles as failed, still charging every unmeasured unit.
+UNCERTAIN_OUTCOMES = frozenset({"uncertain", "timeout", "resource_killed", "policy_blocked"})
+
+
+def outcome_state(outcome: str) -> str:
+    if outcome == "completed":
+        return "completed"
+    return "uncertain" if outcome in UNCERTAIN_OUTCOMES else "failed"
+
+
 def _task_view(task: TaskSA | TaskSF) -> dict[str, Any]:
     d = task.model_dump(mode="json")
     d.pop("task_id", None)                    # identifiers are not shown to proposers (§N)
@@ -156,7 +168,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                     launch_failures += 1
                 else:
                     launch_failures = 0
-                state = {"completed": "completed", "uncertain": "uncertain"}.get(res.outcome, "failed")
+                state = outcome_state(res.outcome)
                 book.complete(job, gen, state, actual=res.usage or None)
                 book.settle(job)
                 proposal = None
