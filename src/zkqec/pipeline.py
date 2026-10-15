@@ -6,10 +6,13 @@ Flow for one proposal (prompt §7 step 3, appendix §B, §C, §F):
   so t = ⌈(d_min−1)/2⌉) → [S-F] L3 (logical_action) → DesignCandidate → resolver verdicts.
 
 Every verifier and identity run is a job in the :class:`JobBook` with a CPU and a wall-clock
-reservation; the wall ceiling is enforced (exceeding it closes the execution as ``crashed`` with no
-receipt), L2 work is additionally bounded by its deterministic budgets (patterns, pairs, memory), and
-the measured CPU and wall time are charged. Settlement commits inside the admission's closing
-transaction (fenced by the lease generation). Recovery (§L): a settled job is only ever
+reservation, and runs in a bounded child (:func:`zkqec.exec.run_bounded`) whose ``RLIMIT_CPU`` and
+wall kill come from that reservation and whose ``RLIMIT_AS`` headroom is the distance budget's
+``max_memory_bytes`` (or :data:`DEFAULT_MEMORY_BYTES`) plus :data:`MEMORY_SLACK_BYTES`. Exceeding
+any limit closes the execution as ``crashed`` with no receipt; L2 work is additionally bounded by
+its deterministic budgets (patterns, pairs, memory). The measured CPU (the child's, from ``wait4``,
+plus this process's own) and wall time are charged. Settlement commits inside the admission's
+closing transaction (fenced by the lease generation). Recovery (§L): a settled job is only ever
 *read* (its execution's recorded closure); a settled job whose execution never closed gets its old
 execution closed as abandoned and a **new** reserved retry job (``retry_of``, its own execution key
 and reservation, fenced settlement). Agents never call this module; the orchestrator does.
@@ -28,6 +31,7 @@ from .admission.registry import ArtifactInput
 from .contracts import (DesignCandidate, LogicalBasis, OperationRef, PhysicalOperation, Presentation,
                         Proposal, Reservation, SignedPauliImages, TaskSA, TaskSF, content_hash)
 from .contracts.registry import REGISTRY_VERSION
+from .exec import Limits
 from .grammar import GrammarCaps, MalformedProposal, build
 from .grammar.errors import UnsupportedFamily
 from .grammar.intake import POLICY
@@ -40,6 +44,11 @@ from .verify.logical_action import MalformedInput, UnsupportedInput
 KERNEL_VERSION = "kernel-0.1.0+1"
 PIPELINE_VERSION = "1.0.0"
 MAX_ATTEMPTS = 3
+# §K memory ceiling of one bounded verifier/identity child: the address space it may add beyond what
+# it inherits. The declared default is the L2 default budget; the slack covers interpreter, allocator
+# and result-pickling overhead that the L2 preflight estimate does not model.
+DEFAULT_MEMORY_BYTES = DistanceBudget().max_memory_bytes
+MEMORY_SLACK_BYTES = 256 * 2**20
 
 
 class RetriesExhausted(JobError):
@@ -152,8 +161,9 @@ class Pipeline:
     def __init__(self, admission: Admission, store: ArtifactStore, book: JobBook, domain: str, *,
                  caps: GrammarCaps, distance_budget: dict | None = None, cpu_reservation: int = 600,
                  wall_reservation: int = 600, families: tuple[str, ...] | None = None,
-                 guard=None):
+                 guard=None, memory_bytes: int | None = None):
         self.adm, self.store, self.book, self.domain = admission, store, book, domain
+        self.memory_bytes = memory_bytes          # None: from the distance budget (see limits())
         self.guard = guard            # frozen-evaluator check before every verifier run (§4.3)
         self.caps, self.distance_budget = caps, distance_budget or {}
         self.cpu_reservation, self.wall_reservation = cpu_reservation, wall_reservation
@@ -189,24 +199,39 @@ class Pipeline:
             prev = job
         raise RetriesExhausted(f"{name}:{key}: no completed closure after {MAX_ATTEMPTS} attempts")
 
+    def limits(self) -> Limits:
+        """The bounded child's ceilings: CPU and wall from the job reservation; memory from the
+        distance budget's ``max_memory_bytes`` (or the declared default) plus the slack."""
+        memory = self.memory_bytes
+        if memory is None:
+            memory = int(self.distance_budget.get("max_memory_bytes", DEFAULT_MEMORY_BYTES)) \
+                + MEMORY_SLACK_BYTES
+        return Limits(cpu_seconds=self.cpu_reservation, wall_seconds=self.wall_reservation,
+                      memory_bytes=int(memory))
+
     def _execute(self, job: str, name: str, inputs: dict[str, str], ekey: str, identity: bool):
         if self.guard is not None:
             self.guard(f"verifier {name}")          # typed abort before dispatch on any change
+        limits = self.limits()
         gen = self.book.dispatch(job)
         t0, w0 = time.process_time(), time.monotonic()
+        child = {"cpu_seconds": 0.0}
+
+        def measure(res) -> None:
+            child["cpu_seconds"] = float(res.cpu_seconds)
 
         def settle(outcome: str) -> None:
-            usage = {"cpu_seconds": max(0.0, time.process_time() - t0),
+            usage = {"cpu_seconds": max(0.0, time.process_time() - t0) + child["cpu_seconds"],
                      "wall_seconds": max(0.0, time.monotonic() - w0)}
             self.book.complete(job, gen, "completed" if outcome == "admitted" else "failed",
                                actual=usage)
             self.book.settle(job)
         if identity:
             return self.adm.run_identity(name, inputs["presentation"], self.domain,
-                                         idempotency_key=ekey, on_close=settle,
-                                         wall_seconds=self.wall_reservation)
+                                         idempotency_key=ekey, on_close=settle, limits=limits,
+                                         on_measure=measure)
         return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=ekey,
-                                     on_close=settle, wall_seconds=self.wall_reservation)
+                                     on_close=settle, limits=limits, on_measure=measure)
 
     # -- evaluation --------------------------------------------------------------------------------
     def evaluate(self, proposal: Proposal, task: TaskSA | TaskSF) -> Evaluation:

@@ -4,8 +4,10 @@ Flow of :meth:`Admission.run_verifier` (§L "admission in one transaction"):
 
 1. read and hash-verify the input artifacts (the read set);
 2. append ``execution_opened`` (issuer, version, inputs, domain) and commit — *before* running;
-3. run the registered verifier **outside** the write lock; an exception or a malformed return value
-   closes the execution as ``crashed`` (status unknown), never as a verdict;
+3. run the registered verifier **outside** the write lock — in a bounded child when the caller
+   passes the job's ``limits`` (CPU, wall and memory enforced; :mod:`zkqec.exec`); an exception, an
+   exceeded limit or a malformed return value closes the execution as ``crashed`` (status
+   unknown), never as a verdict;
 4. ``BEGIN IMMEDIATE``: check the execution is still open (an identical repeat is a no-op, anything
    else is a duplicate completion), re-validate every referenced artifact (exists, regular file,
    hash, then fsync — so no event references an artifact that is not durably published), stamp each
@@ -18,8 +20,6 @@ changed or vanished) and raises :class:`AdmissionRefused`.
 from __future__ import annotations
 
 import re
-import signal
-import threading
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -28,6 +28,9 @@ from typing import Any, Callable, Iterable, Literal
 
 from zkqec.contracts import Receipt, VerifierResult, canonical_json, content_hash
 from zkqec.contracts.registry import REGISTRY_VERSION
+from zkqec.exec import BoundedResult, Limits, run_bounded
+from zkqec.exec.deadline import alarm_deadline
+from zkqec.exec.deadline import usable as deadline_usable
 from zkqec.store import (SANITIZER_VERSION, ArtifactNotFound, ArtifactStore, ArtifactTooLarge,
                          IntegrityError, SecretDetected, StoreError, check_sha)
 
@@ -49,23 +52,14 @@ class _WallDeadline(BaseException):
 
 @contextmanager
 def _wall_deadline(seconds: float | None):
-    """Wall-clock ceiling for one verifier call (§K). Enforced with SIGALRM in the main thread
-    when no other interval timer is active; otherwise the deterministic budgets and the campaign
-    cgroup slice bound the work."""
-    if (not seconds or threading.current_thread() is not threading.main_thread()
-            or not hasattr(signal, "setitimer") or signal.getitimer(signal.ITIMER_REAL)[0] > 0):
+    """In-process wall-clock ceiling for one unbounded verifier call (§K), enforced with SIGALRM in
+    the main thread and composed with any armed timer (the earliest deadline fires; the previous
+    timer is restored on exit). Bounded calls (``limits=``) are killed by the parent instead."""
+    if not seconds or not deadline_usable():
         yield
         return
-
-    def _fire(signum, frame):
-        raise _WallDeadline()
-    previous = signal.signal(signal.SIGALRM, _fire)
-    signal.setitimer(signal.ITIMER_REAL, float(seconds))
-    try:
+    with alarm_deadline(seconds, _WallDeadline):
         yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
 
 
 class AdmissionRefused(Exception):
@@ -137,14 +131,22 @@ class Admission:
     def run_verifier(self, name: str, inputs: dict[str, str], domain: str, *,
                      idempotency_key: str | None = None,
                      on_close: Callable[[str], None] | None = None,
-                     wall_seconds: float | None = None) -> ExecutionReport:
+                     wall_seconds: float | None = None, limits: Limits | None = None,
+                     on_measure: Callable[[BoundedResult], None] | None = None
+                     ) -> ExecutionReport:
         """Run a registered verifier and admit its results.
 
         ``on_close(outcome)`` runs INSIDE the closing write transaction (outcome ``admitted``,
         ``refused`` or ``crashed``) so operational job settlement and accounting commit atomically
         with the admission (appendix §L). It is not called for replayed executions.
-        ``wall_seconds`` is the job's wall-clock ceiling: exceeding it closes the execution as
-        ``crashed`` (``wall_timeout``) with no receipt — never a bound.
+
+        With ``limits`` (the job's reservation) the verifier runs in a bounded child
+        (:func:`zkqec.exec.run_bounded`: RLIMIT_CPU, RLIMIT_AS, wall kill); ``on_measure`` receives
+        the :class:`BoundedResult` (the child's measured CPU, wall and peak RSS) before the
+        closure. Any outcome but ``ok`` closes the execution as ``crashed`` (``cpu_exceeded``,
+        ``wall_exceeded``, ``memory_exceeded`` or the child's error type), with the measurement in
+        the closure detail and no receipt — never a bound. Without ``limits`` the verifier runs in
+        this process; ``wall_seconds`` is then an in-process SIGALRM ceiling (``wall_timeout``).
         """
         spec = self.registry.get(name, "verifier")
         loaded = self._load_inputs(inputs)
@@ -152,19 +154,40 @@ class Admission:
         done = self._replay(ex)
         if done is not None:
             return done
-        try:
-            with _wall_deadline(wall_seconds):
-                raw = spec.fn(**loaded)
-        except _WallDeadline:
-            return self._close_crashed(ex, "wall_timeout",
-                                       f"wall-clock ceiling of {wall_seconds} s reached", on_close)
-        except Exception as exc:                                    # noqa: BLE001
-            return self._close_crashed(ex, type(exc).__name__, str(exc), on_close)
+        raw, crashed = self._execute(ex, spec, loaded, wall_seconds, limits, on_measure, on_close)
+        if crashed is not None:
+            return crashed
         try:
             results = _revalidate_results(raw)
         except Exception as exc:                                    # noqa: BLE001
             return self._close_crashed(ex, "malformed_result", str(exc), on_close)
         return self._complete(ex, results, on_close)
+
+    def _execute(self, ex: dict, spec: Registered, loaded: dict[str, ArtifactInput],
+                 wall_seconds: float | None, limits: Limits | None,
+                 on_measure: Callable[[BoundedResult], None] | None,
+                 on_close: Callable[[str], None] | None) -> tuple[Any, ExecutionReport | None]:
+        """Run the issuer (bounded child or in-process); a failure is closed as ``crashed``."""
+        if limits is not None:
+            res = run_bounded(spec.fn, limits=limits, **loaded)
+            if on_measure is not None:
+                on_measure(res)
+            if res.ok:
+                return res.value, None
+            error = res.detail.get("error_type", res.outcome) if res.outcome == "crashed" \
+                else res.outcome
+            usage = {"cpu_seconds": res.cpu_seconds, "wall_seconds": res.wall_seconds,
+                     "peak_rss_bytes": res.peak_rss_bytes}
+            return None, self._close_crashed(ex, str(error), str(res.detail.get("message", "")),
+                                             on_close, extra={"usage": usage})
+        try:
+            with _wall_deadline(wall_seconds):
+                return spec.fn(**loaded), None
+        except _WallDeadline:
+            return None, self._close_crashed(ex, "wall_timeout", f"wall-clock ceiling of "
+                                             f"{wall_seconds} s reached", on_close)
+        except Exception as exc:                                    # noqa: BLE001
+            return None, self._close_crashed(ex, type(exc).__name__, str(exc), on_close)
 
     def _complete(self, ex: dict, results: Iterable[VerifierResult],
                   on_close: Callable[[str], None] | None = None) -> ExecutionReport:
@@ -188,11 +211,14 @@ class Admission:
     def run_identity(self, name: str, presentation: str, domain: str, *,
                      idempotency_key: str | None = None,
                      on_close: Callable[[str], None] | None = None,
-                     wall_seconds: float | None = None) -> ExecutionReport:
+                     wall_seconds: float | None = None, limits: Limits | None = None,
+                     on_measure: Callable[[BoundedResult], None] | None = None
+                     ) -> ExecutionReport:
         """Record ``presentation -> code`` as computed by a registered identity function.
 
         The mapping comes only from the function's return value and the issuer only from the
-        execution record; there is no API that accepts a caller-supplied mapping.
+        execution record; there is no API that accepts a caller-supplied mapping. ``limits`` and
+        ``on_measure`` bound and measure the computation as in :meth:`run_verifier`.
         """
         spec = self.registry.get(name, "identity")
         inputs = {"presentation": presentation}
@@ -201,14 +227,9 @@ class Admission:
         done = self._replay(ex)
         if done is not None:
             return done
-        try:
-            with _wall_deadline(wall_seconds):
-                code = spec.fn(**loaded)
-        except _WallDeadline:
-            return self._close_crashed(ex, "wall_timeout",
-                                       f"wall-clock ceiling of {wall_seconds} s reached", on_close)
-        except Exception as exc:                                    # noqa: BLE001
-            return self._close_crashed(ex, type(exc).__name__, str(exc), on_close)
+        code, crashed = self._execute(ex, spec, loaded, wall_seconds, limits, on_measure, on_close)
+        if crashed is not None:
+            return crashed
         try:
             check_sha(code)
         except ValueError as exc:
@@ -437,10 +458,11 @@ class Admission:
         return report
 
     def _close_crashed(self, ex: dict, error_type: str, message: str,
-                       on_close: Callable[[str], None] | None = None) -> ExecutionReport:
+                       on_close: Callable[[str], None] | None = None, *,
+                       extra: dict | None = None) -> ExecutionReport:
         sanitize = self.store.sanitizer.sanitize_text
         detail = {"error_type": sanitize(error_type[:100])[0],
-                  "message": sanitize(message[:MAX_MESSAGE])[0]}
+                  "message": sanitize(message[:MAX_MESSAGE])[0], **(extra or {})}
         with self.ledger.transaction():
             if self.ledger.closure(ex["execution_id"]) is not None:
                 raise DuplicateCompletion(f"execution {ex['execution_id']} is already closed")

@@ -24,9 +24,11 @@ hash, logical basis and certificate): the kernel encodes one syndrome bit per ch
 rows would widen every syndrome integer beyond the rank the memory estimate assumes. The preflight
 memory estimate is preprocessing (input copies, row reduction, CSS check, logical basis; estimated
 from the input shapes, whose size the grammar caps bound) plus the enumeration at the exact syndrome
-width; a refusal is ``budget_exhausted`` before any enumeration. Process-level memory is
-additionally bounded by the campaign cgroup slice (§J4); an OS kill is ``resource_killed``
-(``unknown``).
+width; a refusal is ``budget_exhausted`` before any enumeration. Process-level limits are the
+pipeline's: every L2 execution runs in a bounded child (:mod:`zkqec.exec`) with ``RLIMIT_AS`` from
+``max_memory_bytes``, ``RLIMIT_CPU`` and a wall kill from the job reservation; a ``MemoryError``
+caught here is ``resource_killed`` (``unknown``), one outside the enumeration closes the execution
+as crashed. ``max_seconds`` composes with any armed ``ITIMER_REAL`` (the earliest deadline fires).
 """
 from __future__ import annotations
 
@@ -40,6 +42,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from ..contracts import VerifierResult
+from ..exec.deadline import alarm_deadline
 from ..identity import code_sha
 from ..kernel import gf2
 from ..kernel.codes import CSSCode
@@ -132,20 +135,13 @@ class _Deadline(BaseException):
 
 @contextmanager
 def _deadline(seconds: float | None) -> Iterator[None]:
+    """``budget.max_seconds`` for one sector, composed with any armed timer: an earlier outer
+    deadline (e.g. admission's wall ceiling) still fires first, and it is restored on exit."""
     if seconds is None:
         yield
         return
-
-    def _fire(signum, frame):
-        raise _Deadline()
-
-    previous = signal.signal(signal.SIGALRM, _fire)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
+    with alarm_deadline(seconds, _Deadline):
         yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
 
 
 def _sector_matrices(hx: np.ndarray, hz: np.ndarray, sector: str) -> tuple[np.ndarray, np.ndarray]:
