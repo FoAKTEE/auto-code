@@ -6,6 +6,7 @@ Codex is not K0-qualified on this host (qualification 20261015T105932Z: tools de
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -22,9 +23,10 @@ def run_live(cfg: CampaignConfig, run_root: Path, *, deadline_seconds: int = 360
         raise ValueError("live K0 campaigns are qualified for the claude provider only (D16)")
     ops = Path(run_root) / f"{cfg.campaign_id}.ops"
     ops.mkdir(parents=True, exist_ok=False)
-    slice_ = CampaignSlice(cfg.campaign_id.replace(".", "-"), memory_max=memory_max, tasks_max=tasks_max)
+    ident = re.sub(r"[^A-Za-z0-9_]", "_", cfg.campaign_id)[:48]   # systemd/broker identifier rule
+    slice_ = CampaignSlice(ident, memory_max=memory_max, tasks_max=tasks_max)
     slice_.create()
-    broker = Broker(cfg.campaign_id.replace(".", "-"), ops, deadline_unix=time.time() + deadline_seconds)
+    broker = Broker(ident, ops, deadline_unix=time.time() + deadline_seconds)
     broker.start()
     sup = DeadlineSupervisor(slice_, broker.switch_path, time.time() + deadline_seconds)
     sup.arm()
