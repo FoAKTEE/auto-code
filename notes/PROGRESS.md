@@ -23,3 +23,10 @@
 - Prompt v0.3: phased plan (Phase 1 = M0 host qualification, M1 live slice, M2 verifier hardening, M3 agent runtime,
   M4 evaluation; algebra-level claims only), binding appendix `prompt/01-technical-contracts.md`, triage
   `prompt/reviews/TRIAGE.md`. Codex review of v0.3 launched. Build still waits for owner approval (D1–D16).
+- Codex review of v0.3 (`prompt/reviews/codex-prompt-review-v0.3.md`): "with changes"; 17 triage gaps + 12 new
+  findings (2 blockers: CONNECT cannot enforce API policy; no process isolation). Host check: codex enables
+  shell/multi-agent/apps/browser/computer-use/plugins by default.
+- Prompt v0.4: Phase 1a (M0 host qualification incl. TLS-inspecting broker, M1 narrowed live slice) approved first;
+  Phase 1b (M2–M4) continues only under D4 conditions; appendix v0.4 fixes distance completion rule (Steane t=2),
+  Singleton "if", sector-correct disjoint bound, predicate-keyed transport, revocation/quarantine, dispatch state
+  machine, fsync-dir publication, sanitize-before-hash, offline executable bundles, 15-mode control mapping.
