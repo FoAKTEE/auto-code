@@ -70,3 +70,11 @@
 - m1-live-3 on hardened code (7d8c36d): both tasks met on proposal 1, $0.360, 2 requests, controls recorded,
   bundle v2 audits offline from the file alone. Postmortem: `notes/postmortems/M1-slice.md`.
 - Next: Codex M1 milestone review → `notes/reviews/M1-triage.md`; Phase 1b proceeds only under D4.
+- Codex milestone review: BLOCK (B1 broker fail-open on log failure; majors B2–B8; #7, #13–#16 partial; the §O
+  snapshot import is P1a, the lead's deferral was wrong) → `notes/reviews/M1-triage.md`. Second hardening round by
+  two engineers (E1 evidence/accounting, E2 execution/isolation), 16 commits; lead fixes for the snapshot broker
+  (zero mtimes, I8), controls in snapshot mode (I9) and a live-call barrier for test runs after an unintended $0.205
+  test-suite campaign (I10). Re-qualified: `runs/qualify/20261015T200053Z` (34 / 3).
+- m1-live-4 (snapshot): targets met, controls refused → audit fails (not evidence). m1-live-5 (snapshot, 9458710):
+  both targets met, controls passed 0/37, 0/24, supplement linked, $0.68; cumulative M1 live $2.19 of $5.
+- Next: Codex re-review → `notes/reviews/M1-triage-2.md`; Phase 1b only under D4.
