@@ -69,7 +69,8 @@ def analyze_postselected_map(kraus: np.ndarray, target: np.ndarray,
     if not np.all(np.isfinite(k)) or not np.all(np.isfinite(u)) or tolerance <= 0:
         raise ValueError("Invalid map entries or tolerance.")
     d = k.shape[0]
-    if not np.allclose(u.conj().T @ u, np.eye(d), atol=tolerance):
+    # zkqec KD-1: rtol=0 so the declared tolerance is the whole tolerance.
+    if not np.allclose(u.conj().T @ u, np.eye(d), rtol=0.0, atol=tolerance):
         raise ValueError("Target must be unitary.")
     acceptance = k.conj().T @ k
     spectrum = np.linalg.eigvalsh(acceptance)
@@ -78,12 +79,17 @@ def analyze_postselected_map(kraus: np.ndarray, target: np.ndarray,
     c = np.trace(u.conj().T @ k)/d
     residual = float(np.linalg.norm(k-c*u, ord=2))
     spread = float(spectrum.max()-spectrum.min())
-    nonzero = abs(c) > tolerance
+    nonzero = abs(c) > 0.0
+    # zkqec KD-1: K = cU is a scale-free statement; judge the residual relative to |c| so a tiny
+    # Kraus operator cannot hide a large relative phase under an absolute tolerance.
+    relative_residual = residual/abs(c) if nonzero else None
     return {"state_independent_acceptance": spread <= tolerance,
             "acceptance_min": float(max(0, spectrum.min())),
             "acceptance_max": float(min(1, spectrum.max())),
-            "target_up_to_scalar": bool(nonzero and residual <= tolerance),
+            "target_up_to_scalar": bool(relative_residual is not None
+                                        and relative_residual <= tolerance),
             "scalar_abs_squared": float(abs(c)**2),
-            "operator_residual": residual, "acceptance_spread": spread,
+            "operator_residual": residual, "relative_residual": relative_residual,
+            "acceptance_spread": spread,
             "tolerance": tolerance, "evidence_level": "small_instance_numerical_check",
             "scope": "single_ideal_accepted_branch_not_noisy_protocol"}

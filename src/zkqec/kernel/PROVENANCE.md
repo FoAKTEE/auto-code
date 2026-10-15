@@ -13,7 +13,7 @@ except by a test-first patch recorded in the *Deviations* table, and every patch
 | `decoding.py` | `5c03e5e6ad40a054` | upstream |
 | `distance.py` | `f9c224f469354d22` | upstream |
 | `evidence.py` | `46b4ac0a2858da1d` | upstream |
-| `gadgets.py` | `7407055f734587b7` | upstream |
+| `gadgets.py` | `1b8a8e00484050ad` | **patched (KD-1)**; upstream `7407055f734587b7` |
 | `gf2.py` | `bfa0a3794264fc83` | upstream |
 | `__init__.py` | `78ad33482f566807` | upstream |
 | `__main__.py` | `79ee6f134c5c5193` | upstream |
@@ -33,4 +33,8 @@ are byte-identical copies; `tests/kernel_upstream/conftest.py` aliases `qecforge
 
 | id | file | change | failing test first | evaluator version |
 |---|---|---|---|---|
-| — | — | none yet | — | kernel-0.1.0+0 |
+| KD-1 | `gadgets.py` `analyze_postselected_map` | unitarity guard uses `rtol=0`; "target up to scalar" judged by the relative residual `‖K−cU‖₂/|c| ≤ tol`; reports `relative_residual` (None when c = 0) | `tests/kernel_patches/test_gadgets_patch.py` (3 failed before, pass after) | kernel-0.1.0+1 |
+| KD-2 | `schemas.TaskSpec` freezes `trotter_steps` | **superseded, not patched**: zkqec tasks are `zkqec.contracts.task` (no algorithm fields) | `tests/kernel_patches/test_superseded_components.py` | — |
+| KD-3 | `evidence.EvidenceLedger` accepts caller-labelled `verified` | **superseded**: `zkqec.admission` stamps issuers from execution records | same guard test | — |
+| KD-4 | `agents.Coordinator` conflates infeasible/unverified; trace written at end | **superseded**: zkqec orchestrator + typed outcomes + event log | same guard test | — |
+| KD-5 | demo operator bound 0.07 ⇒ observable bias 0.14 > 0.1 target | informational upstream finding; demo config only used by the byte-identical upstream tests | — | — |
