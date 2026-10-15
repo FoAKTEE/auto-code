@@ -20,7 +20,8 @@ from typing import Any, Literal, Protocol
 from pydantic import Field
 
 from ..admission import Admission
-from ..contracts import (Frozen, Profile, Proposal, Reservation, TaskSA, TaskSF, content_hash)
+from ..contracts import (CampaignLabel, Frozen, Profile, Proposal, Reservation, TaskSA, TaskSF,
+                         content_hash)
 from ..firewall.lint import check_fingerprints, family_terms, lint_contract, lint_request
 from ..grammar import MANIFESTS, GrammarCaps
 from ..grammar.intake import parse_proposal
@@ -54,8 +55,7 @@ class CampaignConfig(Frozen):
     confirmation: Reservation = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0,
                                             wall_seconds=1800, cpu_seconds=1800)
     deadline_seconds: int | None = Field(default=None, ge=0)   # campaign wall-clock deadline
-    labels: tuple[Literal["single-implementation", "non-evaluation", "K0-unenforced", "dev-only",
-                          "fixture"], ...] = ("single-implementation", "non-evaluation")
+    labels: tuple[CampaignLabel, ...] = ("single-implementation", "non-evaluation")
 
 
 @dataclass

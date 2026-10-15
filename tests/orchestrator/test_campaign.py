@@ -175,3 +175,19 @@ def test_campaign_deadline_stops_dispatch(tmp_path):
     out = run_campaign(cfg(), prov, tmp_path, require_clean=False, seal_bundle=False,
                        deadline_seconds=0)
     assert prov.requests == [] and out["stop"]["sa-secret-id"] == "deadline"
+
+
+def test_frozen_live_config_still_validates_and_its_labels_are_admissible(tmp_path):
+    """The committed live config must load under the closed label vocabulary (§A5 typed labels)."""
+    from pathlib import Path
+    from zkqec.admission import Admission
+    from zkqec.pipeline import build_registry
+    from zkqec.store import ArtifactStore
+    path = Path(__file__).resolve().parents[2] / "configs" / "campaigns" / "m1-live.json"
+    live = CampaignConfig.model_validate_json(path.read_text())
+    store = ArtifactStore(tmp_path / "s")
+    with Admission(tmp_path / "l.db", store, build_registry(store)) as adm:
+        adm.freeze_campaign(live.campaign_id, namespace=live.campaign_id, config={},
+                            tasks=[t.model_dump(mode="json") for t in live.tasks], caps=live.caps,
+                            labels=list(live.labels), domain="0" * 64,
+                            manifest=store.put_json({}))

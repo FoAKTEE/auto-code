@@ -4,7 +4,7 @@ Algorithm choice and step counts are *not* task fields (qecforge `TaskSpec.trott
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import Field, model_validator
 
@@ -12,6 +12,10 @@ from .base import Frozen
 from .design import SignedPauliImages
 
 OperationClass = Literal["qubit_permutation", "transversal_1q_clifford"]
+# Closed vocabulary of campaign labels rendered in authoritative reports (§A5, §11 M1, D16).
+CampaignLabel = Literal["single-implementation", "non-evaluation", "K0-unenforced", "dev-only",
+                        "fixture", "M1-live-slice"]
+CAMPAIGN_LABELS = frozenset(get_args(CampaignLabel))
 
 
 class HardwareDomain(Frozen):

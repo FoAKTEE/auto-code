@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
-from zkqec.contracts import (UNITS, Receipt, TaskSA, TaskSF, UsageError, canonical_json, charge_for,
+from zkqec.contracts import (CAMPAIGN_LABELS, UNITS, Receipt, TaskSA, TaskSF, UsageError, canonical_json, charge_for,
                              check_usage, content_hash)
 from zkqec.store import check_sha
 from zkqec.store.sanitize import DEFAULT_SANITIZER, SecretDetected
@@ -66,8 +66,7 @@ NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/-]{0,255}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-LABELS = frozenset({"single-implementation", "non-evaluation", "K0-unenforced", "dev-only",
-                    "fixture"})
+LABELS = CAMPAIGN_LABELS
 JOB_KINDS = frozenset({"propose", "verify", "falsify", "revise_route", "baseline", "confirm"})
 SETTLED_FROM = frozenset({"completed", "failed", "uncertain", "cancelled"})
 AUTONOMY_ACTIONS = frozenset({"pause", "resume", "abort", "rescope", "note"})
