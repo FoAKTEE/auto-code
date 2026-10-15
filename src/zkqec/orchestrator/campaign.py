@@ -66,6 +66,7 @@ class CallResult:
     text: str | None
     usage: dict[str, float] = field(default_factory=dict)
     record: dict[str, Any] = field(default_factory=dict)      # sanitized call record
+    raw: dict[str, bytes] = field(default_factory=dict)       # raw provider outputs (stdout, ...)
 
 
 class Provider(Protocol):
@@ -143,6 +144,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     if problems:
         raise RuntimeError(f"role contract checks failed: {problems}")
     schema = json.loads((REPO / "roles" / "designer" / "output.schema.json").read_text())
+    schema_bytes = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()  # as sent
     run = run_root / cfg.campaign_id
     run.mkdir(parents=True, exist_ok=False)
     store = ArtifactStore(run / "store")
@@ -215,8 +217,17 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 gen = book.dispatch(job)
                 res = provider.call(job_id=job, system_prompt=contract, request=request,
                                     schema=schema, reservation=cfg.per_call)
+                # §M: every attempt retains its exact inputs and raw outputs as sanitized
+                # artifacts, referenced from the call record before settlement.
+                arts = {"request": store.put_bytes(request.encode(), "prompt"),
+                        "system_prompt": store.put_bytes(contract.encode(), "prompt"),
+                        "schema": store.put_bytes(schema_bytes, "json")}
+                if res.text is not None:
+                    arts["output_text"] = store.put_bytes(res.text.encode(), "response")
+                for name, data in sorted(res.raw.items()):
+                    arts[f"raw_{name}"] = store.put_bytes(bytes(data), "response")
                 rec = {**res.record, "job_id": job, "outcome": res.outcome, "usage": res.usage,
-                       "request_sha256": content_hash(request)}
+                       "request_sha256": content_hash(request), "artifacts": arts}
                 rec_sha = store.put_json(rec)
                 # The sidecar is the sanitized, content-addressed bytes, never the original (§M).
                 (calls_dir / f"{task.task_id}-{i:03d}.json").write_bytes(store.get_bytes(rec_sha))
@@ -250,7 +261,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 if ev.candidate is not None:
                     adm.record_evaluation(cfg.campaign_id, task.task_id, candidate=ev.candidate,
                                           proposal=p_sha, call_record=rec_sha,
-                                          source=f"designer:{provider.name}")
+                                          source=f"designer:{provider.name}", artifacts=arts)
                     evaluations += 1
                 if ev.satisfies == "verified":
                     stop_reason[task.task_id] = "target_met"

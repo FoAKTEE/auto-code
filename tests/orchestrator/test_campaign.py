@@ -191,3 +191,40 @@ def test_frozen_live_config_still_validates_and_its_labels_are_admissible(tmp_pa
                             tasks=[t.model_dump(mode="json") for t in live.tasks], caps=live.caps,
                             labels=list(live.labels), domain="0" * 64,
                             manifest=store.put_json({}))
+
+
+# --- Codex M1 review #15: every attempt retains its exact inputs and raw outputs --------------------
+class RecordingDouble(ReplayProviderDouble):
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.sent = []
+
+    def call(self, *, job_id, system_prompt, request, schema, reservation):
+        self.sent.append((system_prompt, request, schema))
+        out = super().call(job_id=job_id, system_prompt=system_prompt, request=request,
+                           schema=schema, reservation=reservation)
+        out.raw = {"stdout": f"raw stdout for {job_id}".encode(), "stderr": b"warn: x\n"}
+        return out
+
+
+def test_every_call_retains_exact_inputs_and_raw_outputs(tmp_path):
+    from zkqec.store import ArtifactStore
+    prov = RecordingDouble(["not json {", GOOD])
+    run_campaign(cfg(), prov, tmp_path, require_clean=False, seal_bundle=False)
+    store = ArtifactStore(tmp_path / "t1" / "store")
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "t1" / "ledger.db")
+    results = [r for r, in conn.execute("SELECT result_sha FROM ops_jobs WHERE kind='propose' "
+                                        "ORDER BY created_at")]
+    events = [json.loads(p) for p, in conn.execute(
+        "SELECT payload FROM events WHERE kind='evaluation_recorded'")]
+    assert len(results) == len(prov.sent) == 2
+    for (system_prompt, request, schema), rec_sha, output in zip(prov.sent, results,
+                                                                 ["not json {", GOOD]):
+        arts = store.get_json(rec_sha)["artifacts"]
+        assert store.get_bytes(arts["request"]) == request.encode()
+        assert store.get_bytes(arts["system_prompt"]) == system_prompt.encode()
+        assert json.loads(store.get_bytes(arts["schema"])) == schema
+        assert store.get_bytes(arts["output_text"]) == output.encode()   # malformed kept too
+        assert store.get_bytes(arts["raw_stdout"]).startswith(b"raw stdout for ")
+    assert events and events[0]["artifacts"] == store.get_json(results[1])["artifacts"]

@@ -79,8 +79,7 @@ class ClaudeCallProvider:
                                             "duration_api_ms", "is_error", "stop_reason", "subtype")}
             if isinstance(cli, dict) else {},
             "stdout_sha256": content_hash(res.stdout.decode("utf-8", "replace")),
-            # Raw CLI JSON (result, usage, cost); the artifact store sanitizes before hashing (§M).
-            "cli_stdout": res.stdout.decode("utf-8", "replace")[:1_000_000],
+            # The raw CLI stdout/stderr are retained in full as sanitized artifacts (CallResult.raw).
             "sandbox_job_id": sandbox_job,
             "cli_stderr_tail": res.stderr.decode("utf-8", "replace")[-2000:],
             "telemetry_complete": bool(usage_known),
@@ -118,4 +117,5 @@ class ClaudeCallProvider:
             # The proposal is still evaluable (evidence comes from verifiers), only the charge is
             # uncertain; the orchestrator settles it at the full reservation.
             pass
-        return CallResult(outcome, text, usage, record)
+        return CallResult(outcome, text, usage, record,
+                          raw={"stdout": bytes(res.stdout), "stderr": bytes(res.stderr)})

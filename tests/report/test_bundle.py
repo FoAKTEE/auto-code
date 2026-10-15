@@ -42,12 +42,20 @@ def test_seal_and_offline_audit_roundtrip(tmp_path):
     adm.record_evaluation("bundle-test", "sa-fix", candidate=ev.candidate, source="fixture")
     md = render(adm, "bundle-test")
     adm.close()
-    entry = seal(run, "bundle-test", run / "ledger.db", run / "store", md)
+    out = tmp_path / "bundles"                      # bundles embed ~130 MB of closures
+    entry = seal(run, "bundle-test", run / "ledger.db", run / "store", md, out_dir=out)
     result = audit_bundle(Path(entry["path"]), workdir=tmp_path / "audit")
     assert result["ok"], result
     assert result["replayed_executions"] >= 2 and result["offline"]
+    # Codex M1 #15: the bundle file alone reconstructs offline (no archive, no repo)
+    alone = tmp_path / "clean-machine"
+    alone.mkdir()
+    copy = alone / Path(entry["path"]).name
+    copy.write_bytes(Path(entry["path"]).read_bytes())
+    result = audit_bundle(copy, archive=tmp_path / "no-archive", workdir=alone / "audit")
+    assert result["ok"], result
     # tamper: a modified report must fail the offline audit
     tampered = tmp_path / "tampered"
     entry2 = seal(run, "bundle-test", run / "ledger.db", run / "store",
-                  md.replace("**verified**", "**verified (novel)**"))
+                  md.replace("**verified**", "**verified (novel)**"), out_dir=out)
     assert not audit_bundle(Path(entry2["path"]), workdir=tampered)["ok"]

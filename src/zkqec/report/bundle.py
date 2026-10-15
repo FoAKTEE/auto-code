@@ -2,8 +2,15 @@
 
 Archive layout (``ARCHIVE``, outside the repo, durable):
   cas/<sha256>.tar.zst          content-addressed closures: runtime, wheelhouse, evaluator snapshot
+                                (a build cache; every bundle embeds its own copies)
   cas/<sha256>.json             sidecar metadata for each closure
   bundles/<campaign>/<sha256>.tar.zst   sealed campaign bundles
+
+Bundle format ``zkqec-bundle-v2`` is self-contained (§M): ``closures/{runtime,wheelhouse,
+evaluator}.tar.zst`` are embedded with their sha256 and sidecar metadata (glibc baseline, wheel
+hashes, git commit) in the manifest, so ``audit_bundle`` needs the bundle file alone: no repo, no
+venv, no archive and no network. v1 bundles (closures only in the archive CAS) are still audited
+through the archive.
 
 A bundle holds the campaign's complete transitive evidence: manifest (with CAS refs and the ledger
 head), a consistent ledger snapshot (which carries the frozen campaign, evaluation membership and
@@ -49,29 +56,30 @@ def _sha_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _tar_zst(src_dir: Path, out: Path, arcname: str) -> None:
-    """Deterministic tar (sorted, zeroed owners/mtimes) + zstd, published durably at ``out``
-    (temp in the destination directory → fsync → rename → fsync directory; §L)."""
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        for p in sorted(src_dir.rglob("*")):
-            info = tar.gettarinfo(str(p), arcname=f"{arcname}/{p.relative_to(src_dir)}")
-            info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
-            if p.is_file() and not p.is_symlink():
-                with open(p, "rb") as f:
-                    tar.addfile(info, f)
-            else:
-                tar.addfile(info)
+def _tar_zst(src_dir: Path, out: Path, arcname: str, *, level: int = 10) -> None:
+    """Deterministic tar (sorted, zeroed owners/mtimes) streamed through zstd, published durably at
+    ``out`` (temp in the destination directory → fsync → rename → fsync directory; §L)."""
     with atomic_writer(out) as f:
-        f.write(zstandard.ZstdCompressor(level=10).compress(raw.getvalue()))
+        with zstandard.ZstdCompressor(level=level).stream_writer(f, closefd=False) as zf:
+            with tarfile.open(fileobj=zf, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+                for p in sorted(src_dir.rglob("*")):
+                    info = tar.gettarinfo(str(p), arcname=f"{arcname}/{p.relative_to(src_dir)}")
+                    info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
+                    if p.is_file() and not p.is_symlink():
+                        with open(p, "rb") as fin:
+                            tar.addfile(info, fin)
+                    else:
+                        tar.addfile(info)
 
 
 def _untar_zst(path: Path, dest: Path) -> None:
-    """Extract with the PEP 706 ``data`` filter: no absolute paths, no escaping links, no special
-    files, no setuid bits (relative in-tree symlinks such as python3 -> python3.10 are kept)."""
-    data = zstandard.ZstdDecompressor().decompress(path.read_bytes(), max_output_size=8 << 30)
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
-        tar.extractall(dest, filter="data")
+    """Stream-extract with the PEP 706 ``data`` filter: no absolute paths, no escaping links, no
+    special files, no setuid bits (relative in-tree symlinks such as python3 -> python3.10 are
+    kept)."""
+    with open(path, "rb") as f:
+        reader = zstandard.ZstdDecompressor().stream_reader(f)
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
+            tar.extractall(dest, filter="data")
 
 
 def _cas_put(tmp_file: Path, meta: dict, archive: Path) -> str:
@@ -136,7 +144,11 @@ def ensure_closures(archive: Path = ARCHIVE, *, commit: str | None = None) -> di
     return {**out, "git_commit": commit, "lock_sha256": lock_sha}
 
 
-def scan_bundle_inputs(root: Path, sanitizer=None) -> list[str]:
+CLOSURE_KINDS = ("runtime", "wheelhouse", "evaluator")
+
+
+def scan_bundle_inputs(root: Path, sanitizer=None, *, skip: tuple[str, ...] = ("closures",)
+                       ) -> list[str]:
     """Secret scan of every campaign-derived bundle input (§M: secrets never enter a bundle).
 
     Text files are scanned with the sanitizer's text and JSON rules, any other file byte-wise
@@ -146,6 +158,8 @@ def scan_bundle_inputs(root: Path, sanitizer=None) -> list[str]:
     sanitizer = sanitizer or DEFAULT_SANITIZER
     hits = []
     for p in sorted(root.rglob("*")):
+        if p.relative_to(root).parts[:1] and p.relative_to(root).parts[0] in skip:
+            continue                                  # content-addressed software, hash-verified
         if p.is_symlink():
             hits.append(f"{p.relative_to(root)}: symlink in bundle input")
             continue
@@ -168,8 +182,10 @@ def scan_bundle_inputs(root: Path, sanitizer=None) -> list[str]:
 
 def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, report_md: str,
          extra_dirs: dict[str, Path] | None = None,
-         archive: Path = ARCHIVE, commit: str | None = None) -> dict[str, Any]:
-    """Write a sealed bundle; return its index entry (bundle sha256, path, ledger head, closures)."""
+         archive: Path = ARCHIVE, commit: str | None = None,
+         out_dir: Path | None = None) -> dict[str, Any]:
+    """Write a sealed, self-contained bundle (closures embedded) to ``out_dir`` (default
+    ``archive/bundles/<campaign>``); return its index entry."""
     closures = ensure_closures(archive, commit=commit)
     with tempfile.TemporaryDirectory() as td:
         b = Path(td) / "bundle"; b.mkdir()
@@ -182,26 +198,44 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
         for name, d in (extra_dirs or {}).items():
             if d.exists():
                 shutil.copytree(d, b / name, symlinks=False)
-        manifest = {"campaign_id": campaign_id, "ledger_head": {"seq": head[0], "hash": head[1]},
-                    "closures": closures, "format": "zkqec-bundle-v1"}
-        (b / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
-        hits = scan_bundle_inputs(b)
+        hits = scan_bundle_inputs(b)              # campaign evidence, before anything is added
         if hits:
             from zkqec.store import SecretDetected
             raise SecretDetected(f"refusing to seal: secret-like content in {hits[:10]}")
-        out_dir = archive / "bundles" / campaign_id
-        tmp = Path(td) / "bundle.tar.zst"; _tar_zst(b, tmp, "bundle")
+        (b / "closures").mkdir()
+        closure_files, closure_meta = {}, {}
+        for kind in CLOSURE_KINDS:
+            sha = closures[kind]
+            src = archive / "cas" / f"{sha}.tar.zst"
+            if _sha_file(src) != sha:
+                raise ValueError(f"CAS closure {kind} does not match its content address")
+            shutil.copyfile(src, b / "closures" / f"{kind}.tar.zst")
+            closure_files[kind] = f"closures/{kind}.tar.zst"
+            side = archive / "cas" / f"{sha}.json"
+            closure_meta[kind] = json.loads(side.read_text()) if side.exists() else {}
+        manifest = {"campaign_id": campaign_id, "ledger_head": {"seq": head[0], "hash": head[1]},
+                    "closures": closures, "closure_files": closure_files,
+                    "closure_meta": closure_meta, "format": "zkqec-bundle-v2"}
+        (b / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        if scan_bundle_inputs(b):                 # the manifest (closures are hash-verified)
+            from zkqec.store import SecretDetected
+            raise SecretDetected("refusing to seal: secret-like content in the manifest")
+        out_dir = Path(out_dir) if out_dir is not None else archive / "bundles" / campaign_id
+        tmp = Path(td) / "bundle.tar.zst"; _tar_zst(b, tmp, "bundle", level=3)
         sha = _sha_file(tmp)
         final = out_dir / f"{sha}.tar.zst"
         atomic_copy(tmp, final)          # destination temp + fsync + rename + dir fsync (§L)
     entry = {"campaign_id": campaign_id, "bundle_sha256": sha, "path": str(final),
-             "ledger_head": manifest["ledger_head"], "closures": closures}
+             "ledger_head": manifest["ledger_head"], "closures": closures,
+             "format": manifest["format"]}
     return entry
 
 
-def audit_bundle(bundle: Path, archive: Path = ARCHIVE, workdir: Path | None = None,
+def audit_bundle(bundle: Path, archive: Path | None = None, workdir: Path | None = None,
                  offline: bool = True) -> dict[str, Any]:
-    """Reconstruct in an empty directory from archived closures only and run the inner audit."""
+    """Reconstruct in an empty directory from the bundle file alone and run the inner audit.
+
+    v2 bundles embed their closures; ``archive`` is consulted only for v1 bundles."""
     workdir = Path(workdir or tempfile.mkdtemp(prefix="zkqec-audit-")).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     if any(workdir.iterdir()):
@@ -211,10 +245,15 @@ def audit_bundle(bundle: Path, archive: Path = ARCHIVE, workdir: Path | None = N
     _untar_zst(bundle, workdir)
     manifest = json.loads((workdir / "bundle" / "manifest.json").read_text())
     cl = manifest["closures"]
-    for kind in ("runtime", "wheelhouse", "evaluator"):
-        f = archive / "cas" / f"{cl[kind]}.tar.zst"
-        if _sha_file(f) != cl[kind]:
-            raise ValueError(f"CAS closure {kind} does not match its content address")
+    for kind in CLOSURE_KINDS:
+        if "closure_files" in manifest:
+            if manifest["closure_files"].get(kind) != f"closures/{kind}.tar.zst":
+                raise ValueError(f"bundle closure path for {kind} is not closures/{kind}.tar.zst")
+            f = workdir / "bundle" / "closures" / f"{kind}.tar.zst"
+        else:                                                     # v1: closures in the CAS
+            f = Path(archive or ARCHIVE) / "cas" / f"{cl[kind]}.tar.zst"
+        if not f.is_file() or f.is_symlink() or _sha_file(f) != cl[kind]:
+            raise ValueError(f"closure {kind} does not match its content address")
         _untar_zst(f, workdir)
     py = workdir / "runtime" / "bin" / "python3.10"
     subprocess.run([str(py), "-m", "venv", str(workdir / "venv")], check=True)

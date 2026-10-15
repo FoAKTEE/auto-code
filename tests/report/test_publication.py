@@ -83,3 +83,42 @@ def test_seal_scans_every_bundle_input_for_secrets(tmp_path, monkeypatch):
         bundle_mod.seal(run, "c", run / "ledger.db", run / "store", "# r\n", archive=archive,
                         extra_dirs={"calls": calls}, commit="0" * 40)
     assert not (archive / "bundles").exists() or not any((archive / "bundles").rglob("*.tar.zst"))
+
+
+def test_sealed_bundle_embeds_its_executable_closures(tmp_path, monkeypatch):
+    """Codex M1 review #15: the bundle alone must carry runtime, wheelhouse and evaluator."""
+    import io
+    import tarfile
+
+    import zstandard
+    from zkqec.admission import Admission, VerifierRegistry
+    from zkqec.store import ArtifactStore
+    archive = tmp_path / "archive"
+    closures = {}
+    for kind in ("runtime", "wheelhouse", "evaluator"):
+        src = tmp_path / f"src-{kind}"
+        src.mkdir()
+        (src / "f.txt").write_text(kind)
+        tmp = tmp_path / f"{kind}.tar.zst"
+        bundle_mod._tar_zst(src, tmp, kind)
+        closures[kind] = bundle_mod._cas_put(tmp, {"kind": kind}, archive)
+    monkeypatch.setattr(bundle_mod, "ensure_closures",
+                        lambda *a, **k: {**closures, "git_commit": "0" * 40, "lock_sha256": "1" * 64})
+    run = tmp_path / "run"
+    store = ArtifactStore(run / "store")
+    Admission(run / "ledger.db", store, VerifierRegistry()).close()
+    entry = bundle_mod.seal(run, "c", run / "ledger.db", run / "store", "# r\n", archive=archive,
+                            commit="0" * 40, out_dir=tmp_path / "out")
+    data = zstandard.ZstdDecompressor().decompress(Path(entry["path"]).read_bytes(),
+                                                   max_output_size=1 << 30)
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        names = set(tar.getnames())
+        manifest = json.loads(tar.extractfile("bundle/manifest.json").read())
+        for kind, sha in closures.items():
+            member = f"bundle/closures/{kind}.tar.zst"
+            assert member in names
+            blob = tar.extractfile(member).read()
+            assert __import__("hashlib").sha256(blob).hexdigest() == sha
+            assert manifest["closures"][kind] == sha
+    assert manifest["closure_files"] == {k: f"closures/{k}.tar.zst" for k in closures}
+    assert Path(entry["path"]).parent == tmp_path / "out"
