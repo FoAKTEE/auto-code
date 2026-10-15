@@ -481,7 +481,7 @@
         "hash": "59aaec9948b08922f7ae3b5d322a7d6dfdd4deff21da45a924da69476e832174",
         "seq": 50
       },
-      "note": "B1 ownership fix, read-only snapshot (01d1f32); controls passed; M1 acceptance run",
+      "note": "B1 ownership fix (01d1f32); superseded by re-review 5 (async interrupts)",
       "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-8/6848dfb8b41407a522a962745407095877dcd424b63eef5a2fe61c5531ecd283.tar.zst",
       "spend": {
         "cpu_seconds": 14.597,
@@ -491,9 +491,75 @@
         "usd": 0.207736,
         "wall_seconds": 114.802
       }
+    },
+    {
+      "audit": {
+        "ok": true,
+        "problems": []
+      },
+      "bundle_sha256": "ec7b710820de7235edcabece0dec78562f5546b4c58f0912e865cbb1c10a5146",
+      "bytes": 131879179,
+      "campaign_id": "m1-live-9",
+      "closures": {
+        "evaluator": "b96e3a08e1e9f794f676ef3921fa737ddef5efabd4bd288ff1e5d7c4a0322220",
+        "git_commit": "ff75f682069b6a803ca439904e0107aba39a4821",
+        "lock_sha256": "4347389f85529a2da685f464f12a6746d6208da6ba1c7ec995afa535ac2563b4",
+        "runtime": "608529a930a6266bb3fd617dc5c281d3ef39b8abce833303d577aa0321677551",
+        "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
+      },
+      "confirmation": {
+        "basis": "declared",
+        "final_totals": {
+          "cpu_seconds": 44.237085811,
+          "input_tokens": 6503.0,
+          "output_tokens": 8759.0,
+          "requests": 2.0,
+          "usd": 0.17649579999999998,
+          "wall_seconds": 140.76243459247053
+        },
+        "required": true,
+        "sha256": "de39824b417432099833cbf1eb5600f324ee9cdffc55745bc7c6c84caf2c6eb1",
+        "status": "linked",
+        "supplement": "ec7b710820de7235edcabece0dec78562f5546b4c58f0912e865cbb1c10a5146.confirmation.json"
+      },
+      "evaluated": [
+        {
+          "candidate": "1016c96ed5f742fc",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sa-live-1"
+        },
+        {
+          "candidate": "55fc2f3dbac6be07",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sf-live-1"
+        }
+      ],
+      "evaluator_commit": "ff75f682069b6a803ca439904e0107aba39a4821",
+      "format": "zkqec-bundle-v2",
+      "labels": [
+        "single-implementation",
+        "non-evaluation",
+        "M1-live-slice"
+      ],
+      "ledger_head": {
+        "hash": "996e65e379aa04eb963a291e8e6cbeca858270c32e4bd00c7701ffac367cf458",
+        "seq": 50
+      },
+      "note": "interrupt deferral, read-only snapshot (ff75f68); controls passed; M1 acceptance run",
+      "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-9/ec7b710820de7235edcabece0dec78562f5546b4c58f0912e865cbb1c10a5146.tar.zst",
+      "spend": {
+        "cpu_seconds": 14.1503,
+        "input_tokens": 6503.0,
+        "output_tokens": 8759.0,
+        "requests": 2.0,
+        "usd": 0.176496,
+        "wall_seconds": 99.6339
+      }
     }
   ],
-  "indexed_utc": "2026-10-15T22:47:18Z",
-  "indexed_with_commit": "01d1f32fa35846ba097bf9fcc46b0b1bd93b1060",
+  "indexed_utc": "2026-10-15T23:35:00Z",
+  "indexed_with_commit": "ff75f682069b6a803ca439904e0107aba39a4821",
   "schema": "zkqec.bundle-index/1"
 }
