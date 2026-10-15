@@ -107,3 +107,40 @@ def test_sanitizer_is_idempotent_and_leaves_clean_payloads_alone(tmp_path):
     ing = store.ingest_json(clean)
     assert ing.sha == content_hash(clean) and ing.redaction is None
     assert store.redactions(ing.sha) == []
+
+
+# --- Codex M1 review #9: placeholder-prefix and escaped-key bypasses -------------------------------
+LEAK = "actual-secret-12345678"
+
+
+def test_placeholder_prefix_does_not_exempt_a_secret():
+    s = Sanitizer()
+    obj = {"api_key": f"[REDACTED:prefix] {LEAK}"}
+    clean, counts = s.sanitize_obj(obj)
+    assert LEAK not in canonical_json(clean).decode() and counts["secret_field"] == 1
+    assert s.detect_obj(obj)                                   # residual detection, same rule
+    for text in (f'{{"api_key":"[REDACTED:prefix] {LEAK}"}}',
+                 f"Authorization: [REDACTED:auth_header] {LEAK}\n",
+                 f"GET /cb?access_token=[REDACTED:secret_param]{LEAK}&x=1"):
+        out, counts = s.sanitize_text(text)
+        assert LEAK not in out and counts, text
+    # exact placeholders are still left alone (idempotence)
+    for done in ('{"api_key":"[REDACTED:secret_field]"}', "Cookie: [REDACTED:cookie_header]\n",
+                 "x?access_token=[REDACTED:secret_param]&y=1"):
+        assert s.sanitize_text(done) == (done, {})
+
+
+def test_escaped_json_keys_are_redacted(tmp_path):
+    raw = f'{{"\\u0061pi_key":"{LEAK}","n":1}}'.encode()
+    store = ArtifactStore(tmp_path)
+    ing = store.ingest_bytes(raw, "json")
+    assert LEAK.encode() not in all_disk_bytes(tmp_path) and ing.redactions
+    assert store.get_json(ing.sha)["n"] == 1
+    s = Sanitizer()
+    out, counts = s.sanitize_text(f'log line {{"Proxy\\u002dAuthorization": "{LEAK}"}}')
+    assert LEAK not in out and counts["secret_field"] == 1
+    # JSON nested inside a JSON string is decoded and sanitized structurally
+    nested = canonical_json({"cli_stdout": f'{{"\\u0061pi_key":"{LEAK}"}}'})
+    clean, counts = s.sanitize_bytes(nested, "json")
+    assert LEAK.encode() not in clean and counts
+    assert s.detect_obj({"x": f'{{"\\u0061pi_key":"{LEAK}"}}'})

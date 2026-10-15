@@ -9,37 +9,49 @@ Rules
 -----
 * ``auth_header`` / ``cookie_header``: ``Authorization:``, ``Proxy-Authorization:``, ``X-Api-Key:``,
   ``Cookie:`` and ``Set-Cookie:`` header lines (value replaced).
-* ``secret_field``: JSON fields ``"access_token"``, ``"refresh_token"``, ``"id_token"``,
-  ``"api_key"``, ``"authorization"`` (and close variants) in text; in structured objects any dict
-  key in :data:`SENSITIVE_KEYS`, and ``[header_name, value]`` pairs naming a sensitive header.
+* ``secret_field``: in text, every ``"key": "value"`` string pair whose key — after JSON-unescaping
+  (``"\u0061pi_key"`` is ``api_key``) and normalising case and ``-``/``_`` — is in
+  :data:`SENSITIVE_KEYS`; in structured objects any dict key in :data:`SENSITIVE_KEYS`, and
+  ``[header_name, value]`` pairs naming a sensitive header. JSON payloads (kinds ``json``/``jsonl``)
+  are additionally parsed and sanitized structurally, so JSON nested inside JSON strings is covered.
 * ``secret_param``: ``access_token=…`` style query/form parameters.
 * ``bearer``: ``Bearer <token>``.
 * ``anthropic_key`` (``sk-ant-…``) and ``sk_key`` (``sk-…``).
+
+Only an *exact* placeholder (``[REDACTED:<rule>]`` and nothing else in the value) is exempt from
+re-redaction; a value that merely starts with ``[REDACTED:`` is redacted again (idempotence without a
+bypass). Detection is the same code path as sanitizing, so it shares no weaker rule.
 
 Binary payloads cannot be redacted without corrupting them, so a binary payload that matches any rule
 is refused (:class:`SecretDetected`) rather than stored.
 """
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
-SANITIZER_VERSION = "zkqec-sanitizer-1"
+SANITIZER_VERSION = "zkqec-sanitizer-2"
 TEXT_KINDS = frozenset({"text", "json", "jsonl", "http_request", "http_response", "prompt",
                         "response", "log", "csv", "markdown"})
 SENSITIVE_KEYS = frozenset({"access_token", "refresh_token", "id_token", "api_key", "apikey",
                             "x_api_key", "authorization", "proxy_authorization", "cookie",
                             "set_cookie", "client_secret"})
-_FIELD_NAMES = (r"access_token|refresh_token|id_token|api_key|apikey|x[-_]api[-_]key|authorization|"
-                r"proxy[-_]authorization|cookie|set[-_]cookie|client_secret")
-_FRESH = r"(?!\[REDACTED:)"          # never re-redact a placeholder (idempotence)
-_VALUE = r"(?=[^ \t\r\n])" + _FRESH   # header value starts at its first non-blank (no backtracking)
+RULE_NAMES = ("auth_header", "cookie_header", "secret_field", "secret_param", "bearer",
+              "anthropic_key", "sk_key")
+_PH = r"\[REDACTED:(?:" + "|".join(RULE_NAMES) + r")\]"
+# A header value starts at its first non-blank (no backtracking) and is exempt only when it is
+# exactly one placeholder up to the end of the line.
+_VALUE = r"(?=[^ \t\r\n])(?!" + _PH + r"[ \t]*\r?$)"
 
 
 def placeholder(rule: str) -> str:
     return f"[REDACTED:{rule}]"
+
+
+PLACEHOLDERS = frozenset(placeholder(r) for r in RULE_NAMES)
 
 
 class SecretDetected(ValueError):
@@ -50,7 +62,30 @@ class SecretDetected(ValueError):
 class TextRule:
     name: str
     pattern: re.Pattern[str]
-    repl: str
+    repl: str | Callable[[re.Match[str]], str]
+
+
+def _json_key(raw: str) -> str:
+    """The key a JSON parser would see for the raw (still escaped) string body ``raw``."""
+    try:
+        key = json.loads(f'"{raw}"')
+    except ValueError:
+        key = raw
+    return key if isinstance(key, str) else raw
+
+
+def _norm_key(key: str) -> str:
+    return key.strip().lower().replace("-", "_")
+
+
+_PAIR = re.compile(r'"((?:[^"\\]|\\.)*)"(\s*:\s*)"((?:[^"\\]|\\.)*)"')
+
+
+def _redact_pair(m: re.Match[str]) -> str:
+    key, value = m.group(1), m.group(3)
+    if _norm_key(_json_key(key)) not in SENSITIVE_KEYS or value == "" or value in PLACEHOLDERS:
+        return m.group(0)
+    return f'"{key}"{m.group(2)}"{placeholder("secret_field")}"'
 
 
 TEXT_RULES: tuple[TextRule, ...] = (
@@ -61,23 +96,17 @@ TEXT_RULES: tuple[TextRule, ...] = (
     TextRule("cookie_header",
              re.compile(r"(?im)^([ \t]*(?:set-cookie|cookie)[ \t]*:[ \t]*)" + _VALUE + r"[^\r\n]+"),
              r"\1" + placeholder("cookie_header")),
-    TextRule("secret_field",
-             re.compile(r'(?i)("(?:' + _FIELD_NAMES + r')"\s*:\s*)"' + _FRESH + r'(?:[^"\\]|\\.)*"'),
-             r'\1"' + placeholder("secret_field") + '"'),
+    TextRule("secret_field", _PAIR, _redact_pair),
     TextRule("secret_param",
              re.compile(r"(?i)\b(access_token|refresh_token|id_token|api_key|client_secret)="
-                        + _FRESH + r"[^&\s\"']+"),
+                        r"(?!" + _PH + r"""(?:[&\s"']|$))[^&\s"']+"""),
              r"\1=" + placeholder("secret_param")),
     TextRule("bearer",
-             re.compile(r"(?i)\b(bearer)\s+" + _FRESH + r"[A-Za-z0-9\-._~+/]{8,}=*"),
+             re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9\-._~+/]{8,}=*"),
              r"\1 " + placeholder("bearer")),
     TextRule("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"), placeholder("anthropic_key")),
     TextRule("sk_key", re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"), placeholder("sk_key")),
 )
-
-
-def _norm_key(key: str) -> str:
-    return key.strip().lower().replace("-", "_")
 
 
 class Sanitizer:
@@ -92,7 +121,18 @@ class Sanitizer:
     def sanitize_text(self, text: str, counts: Counter | None = None) -> tuple[str, Counter]:
         counts = Counter() if counts is None else counts
         for rule in self.rules:
-            text, n = rule.pattern.subn(rule.repl, text)
+            if callable(rule.repl):
+                hits = 0
+
+                def repl(m, _f=rule.repl):
+                    nonlocal hits
+                    out = _f(m)
+                    hits += out != m.group(0)
+                    return out
+                text = rule.pattern.sub(repl, text)
+                n = hits
+            else:
+                text, n = rule.pattern.subn(rule.repl, text)
             if n:
                 counts[rule.name] += n
         return text, counts
@@ -134,7 +174,7 @@ class Sanitizer:
     def _redactable(value: Any) -> bool:
         if value is None or value == "":
             return False
-        return not (isinstance(value, str) and value.startswith("[REDACTED:"))
+        return not (isinstance(value, str) and value in PLACEHOLDERS)     # exact placeholder only
 
     # -- bytes -----------------------------------------------------------------------------------
     def sanitize_bytes(self, data: bytes, kind: str) -> tuple[bytes, Counter]:
@@ -146,12 +186,29 @@ class Sanitizer:
                 text = None
             if text is not None:
                 clean, counts = self.sanitize_text(text)
+                if kind == "json":
+                    clean = self._structural_json(clean, counts)
+                elif kind == "jsonl":
+                    clean = "\n".join(self._structural_json(line, counts) if line.strip() else line
+                                      for line in clean.split("\n"))
                 return clean.encode("utf-8"), counts
         _, counts = self.sanitize_text(data.decode("latin-1"))
         if counts:
             raise SecretDetected(f"binary payload of kind {kind!r} matches secret rules "
                                  f"{sorted(counts)}; refusing to store it")
         return data, counts
+
+    def _structural_json(self, text: str, counts: Counter) -> str:
+        """Parse JSON text and sanitize the decoded object; re-encode only if that finds more."""
+        try:
+            obj = json.loads(text)
+        except (ValueError, RecursionError):
+            return text
+        clean, more = self.sanitize_obj(obj)
+        if not more:
+            return text
+        counts.update(more)
+        return json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     # -- detection -------------------------------------------------------------------------------
     def detect_obj(self, obj: Any) -> Counter:
