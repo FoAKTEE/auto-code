@@ -1,6 +1,6 @@
 # Technical contracts (binding appendix to `00-master-prompt.md`)
 
-> **Status:** DRAFT v0.4. Every rule here is normative.
+> **Status:** DRAFT v0.5. Every rule here is normative.
 >
 > **Phase tags** say when each contract must exist:
 > - **P1a**: first approved build (M0–M1);
@@ -82,8 +82,16 @@ supports supersession and **revocation**.
 **Revocation.** When a receipt is revoked, its descendants become `unknown`. A historical `verified`
 never survives revocation as current authority.
 
-**Contradictions.** If verified X and refuted X coexist, both are **quarantined** and an integrity
-incident is opened.
+**Contradictions.** Two kinds of contradiction quarantine their premises:
+- a direct one: verified X and refuted X coexist;
+- a **semantic** one: currently authorized records are jointly unsatisfiable across bounds,
+  equalities and sectors. Example: `distance_lower_bound(c, Z, 5)` together with
+  `distance_upper_bound(c, Z, 3)`. Another: a `both` bound inconsistent with the sector bounds.
+
+The resolver checks the interval consistency of every (subject, quantity) pair at each admission.
+On a conflict, every conflicting premise is **quarantined**, their descendants are invalidated, an
+integrity incident is opened, and neither `satisfies_task` nor `target_refuted` can be derived from
+them.
 
 **Guarantee propagation.**
 - A derivation inherits the weakest guarantee among its premises, in the order
@@ -458,7 +466,9 @@ Report `k/N` false authorizations and `j/M` false rejections.
 - spoofed issuer;
 - tampered or stale artifact;
 - source text requesting evaluator changes;
-- revoked premise still used.
+- revoked premise still used;
+- semantically conflicting bounds (lower 5 with upper 3 on the same sector) must quarantine, and
+  neither `satisfies_task` nor `target_refuted` may be authorized (P1a control).
 
 **Sandbox, broker and accounting tests** (§J, §K):
 - vault read;
@@ -536,6 +546,23 @@ For every request, the broker:
 
 Any policy violation blocks the request and fails the job closed.
 
+**Probe facts** (2026-10-15, mitmproxy 11.0.2; still to be qualified as tests in M0):
+- *Claude CLI 2.1.300 with `--tools ""`, under the user's normal HOME:* it called
+  `/v1/mcp_servers`, `mcp-proxy.anthropic.com` and `api.githubcopilot.com`, and its `/v1/messages`
+  request declared about 20 claude.ai connector tools, including Google Drive search.
+- *Claude with a fresh HOME holding only `.credentials.json`, plus
+  `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`:* only three requests, all to
+  `api.anthropic.com`: `GET /api/oauth/profile`, `GET /v1/mcp_servers`, and `POST /v1/messages`
+  declaring only `StructuredOutput` and `DeferredToolPlaceholder` (`max_tokens` 128000).
+- *Codex 0.160.1 (ChatGPT auth):*
+  - It uses `chatgpt.com/backend-api/codex/responses` over a **WebSocket**, so the broker must
+    inspect client frames.
+  - With the feature-disable set, the `response.create` frames carry **no `tools` key**.
+  - It also sends analytics (`/backend-api/codex/analytics-events/events`) and OTLP metrics
+    (`ab.chatgpt.com`). M0 tests whether blocking these breaks calls.
+- *Broker policy follows from these facts.* Allowlist exact (host, method, path) triples; the tool
+  set must be ⊆ {`StructuredOutput`, `DeferredToolPlaceholder`} for Claude, and absent for Codex.
+
 If TLS interception cannot be qualified (for example, because of pinning), a campaign **cannot claim
 K0** (D16). In that case only CLI configuration plus telemetry is available, and it is labelled
 `K0-unenforced`.
@@ -587,8 +614,13 @@ Generated programs run in a separate profile: J0 isolation, no network, no crede
 runtime, and a size-limited tmpfs scratch directory.
 
 Resource and output limits:
-- Each job gets a cgroup scope **inside a campaign parent slice** that enforces the D14 aggregate
-  limits: MemoryMax, TasksMax, CPUQuota, RuntimeMaxSec.
+- Each job, whether a program or an agent call (P1a), gets a cgroup scope **inside a campaign parent
+  slice**. The slice enforces the D14 aggregate limits MemoryMax, TasksMax and CPUQuota.
+- The **campaign deadline** is not a slice property: systemd 249 does not support `RuntimeMaxSec` on
+  slices. A supervisor timer enforces it. On expiry the timer stops every child scope and disables
+  further broker dispatch.
+- Per-job wall time is `RuntimeMaxSec` on the job's scope.
+- M0 qualifies all of this with concurrent jobs and with abandoned jobs.
 - Disk is bounded by tmpfs `size=`.
 - Output is accounted in aggregate, including logs and abandoned jobs.
 - Outputs are capped before parsing. Only regular files are accepted; they are copied into trusted
@@ -625,13 +657,17 @@ deferred until this profile is qualified.
 Subscription billing is recorded separately.
 
 **Enforceable ceilings, per call:**
+- an **input bound**: before forwarding, the broker computes a conservative input-token bound from
+  the request body (UTF-8 bytes ≥ tokens) and rejects requests above the per-call input ceiling;
 - maximum requests per CLI invocation, enforced at the broker (call mode expects 1, plus CLI retries
   up to a cap);
 - maximum output tokens, enforced via CLI or provider settings qualified in M0 and checked at the
   broker;
 - maximum wall time, enforced by killing the scope.
 
-The reservation is these ceilings multiplied by declared prices.
+The reservation is the **maximum total charge** under these ceilings: input bound × the highest
+applicable input price (including cache-write premiums), plus the output ceiling × the output
+price, plus the request-count ceiling. Prices are taken from a declared price table.
 
 **Settlement.**
 - Each retry is reserved separately.
@@ -647,6 +683,10 @@ The reservation is these ceilings multiplied by declared prices.
 reserved → dispatched → {completed | uncertain | failed} → settled
 ```
 
+- Dispatch intent is persisted durably **before** the CLI is launched.
+- The broker logs every upstream request, against the job's reservation, **before** forwarding it.
+- Killing a CLI never releases an unresolved charge: the job becomes `uncertain` and keeps its full
+  reservation.
 - Each job carries an idempotency key and a **monotone lease generation**.
 - On lease expiry the old execution's scope is killed. If killing cannot be confirmed, its reservation
   is retained.
@@ -693,8 +733,10 @@ Crash tests sit between each step.
 - call records;
 - broker logs;
 - report;
-- the **executable closure**: verifier snapshot source, the locked dependency wheels (downloaded with
-  hashes), the recorded Python interpreter version and its hash, and reconstruction scripts.
+- the **executable closure**: a runnable relocatable CPython (uv-managed standalone build:
+  interpreter, stdlib and bundled shared libraries; the glibc baseline is recorded), the locked
+  dependency wheels with hashes (native extensions included), the verifier snapshot source, and
+  the reconstruction scripts.
 
 The bundle is stored as tar + zstd with a sha256, and is chunked if large. A chunk size is never
 permission to omit evidence.
@@ -706,7 +748,8 @@ and **no network**:
 3. re-verify every hash;
 4. re-run every exact receipt.
 
-The interpreter must be available locally; that requirement is declared.
+The archived runtime is used for this, not any host installation. The only host requirement is a
+glibc at least as new as the recorded baseline.
 
 ## N. Namespacing and isolation across campaigns (P1a)
 

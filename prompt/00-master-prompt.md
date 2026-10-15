@@ -1,6 +1,10 @@
 # Master self-prompt — zkqec: a modular multi-agent zero-knowledge QEC code-discovery workflow
 
-> **Status:** DRAFT v0.4, awaiting owner approval. Nothing in §5–§11 has been built.
+> **Status:** v0.5 — FINAL for Phase 1a.
+> - The owner approved starting the build with the default decisions: "upon finish prompt editing,
+>   proceed to begin the project".
+> - Codex's v0.4 verdict was "yes-with-listed-edits — Phase 1a", and those edits are applied here
+>   (`reviews/TRIAGE.md`, round 3).
 >
 > **Companion files:**
 > - `01-technical-contracts.md` holds the **binding** semantics (§A–§O).
@@ -158,9 +162,31 @@ by us. Fixtures are trusted test data and are exempt from the D10 caps.
   `--search` flag is therefore not proof that web search is off.
 - The prompt must be passed as an argument with `< /dev/null`.
 
-**Unknown until M0:**
-- whether each CLI can be made tool-free;
-- whether TLS interception works for each CLI.
+**Probe results** (mitmproxy 11.0.2, 2026-10-15; details in appendix §J1; M0 turns them into tests):
+- **Claude.**
+  - Under the normal HOME, even with `--tools ""`, it fetched MCP servers and declared about 20
+    claude.ai connector tools (Google Drive search among them).
+  - With a fresh HOME holding only credentials, plus `--strict-mcp-config` and an empty
+    `--mcp-config`, it made only three `api.anthropic.com` requests. The tools were
+    {`StructuredOutput`, `DeferredToolPlaceholder`}, and `--json-schema` worked.
+  - It also offers `--max-budget-usd`, and `--system-prompt` replaces the default system prompt,
+    which otherwise carries environment details.
+- **Codex.**
+  - Via WebSocket to `chatgpt.com/backend-api/codex/responses`. With the feature-disable set, its
+    `response.create` frames have no `tools` key, and `--output-schema` worked.
+  - Analytics and OTLP endpoints still need blocking tests.
+- **TLS interception works for both CLIs**, via `NODE_EXTRA_CA_CERTS` and via
+  `SSL_CERT_FILE`/`CODEX_CA_CERTIFICATE`.
+- **`~/.local/bin/codex` is a wrapper.** It *silently re-runs jobs on Claude Opus 5.5 when Codex hits a
+  usage limit*.
+  - zkqec and the Codex reviews must call the real binary, `~/.local/node/bin/codex`, with
+    `~/.local/node/bin` on PATH.
+  - The four reviews so far ran on gpt-6-astra: their logs show the native header and no shim
+    lines, and there is no quota-block file.
+- **Runtime.**
+  - systemd 249: `RuntimeMaxSec` applies to scopes, not slices.
+  - `python3 -m venv` fails here (no ensurepip). uv 0.13.1 works and offers standalone CPython
+    3.10.22, which becomes the archived runtime (§M).
 
 ## 3. Binding definitions
 
@@ -485,10 +511,14 @@ Build `zkqec qualify-host`, which tests each property in §J0–J5, §K and §O:
 - Claude tool-free mode;
 - Codex feature-disable and web-search-disable, verified from intercepted request bodies;
 - structured output for each CLI;
-- enforceable token and request ceilings;
-- campaign cgroup slice: aggregate memory, tasks, CPU, wall time, tmpfs disk;
+- enforceable input-bound, output-token and request ceilings, with full-charge reservations (§K);
+- blocking tests for the telemetry and analytics endpoints;
+- campaign cgroup slice: aggregate memory, tasks, CPU and tmpfs disk;
+- a campaign-deadline supervisor that stops every child scope and disables the broker, tested with
+  concurrent and abandoned jobs (§J4);
 - output caps;
-- pinning and archiving of wheels.
+- pinning and archiving of wheels;
+- the venv moved onto uv-managed standalone CPython 3.10.22 (archived runtime, §M).
 
 *Accept:*
 - Every property has a passing positive test and a passing negative test.
@@ -496,7 +526,16 @@ Build `zkqec qualify-host`, which tests each property in §J0–J5, §K and §O:
 - Unqualified properties are listed. A provider that is not tool-free is disqualified for K0. If the
   broker is unqualified, live runs are dev-only and labelled `K0-unenforced` (D16).
 
-**M1 — Minimal live vertical slice.** Build:
+**M1 — Minimal live vertical slice.**
+
+*Prerequisites, before any live call:*
+- the durable dispatch state machine with retry reservations, fencing, duplicate rejection and atomic
+  settlement (§L);
+- dispatch intent persisted before launch;
+- crash tests around forwarding and settlement;
+- killing a CLI never releases an unresolved charge.
+
+Build:
 - the vendored kernel, with test-first fixes for the five §2 defects;
 - contracts subset;
 - store, admission and events;
@@ -519,6 +558,7 @@ Build `zkqec qualify-host`, which tests each property in §J0–J5, §K and §O:
   verified).
 - Paired negatives are rejected.
 - A test proves that nothing is admitted except through admission.
+- The semantic-conflict control (lower 5 with upper 3) quarantines and authorizes neither verdict.
 - **One live S-A task and one live S-F task**, within the D5 cap, produce sealed bundles that
   reconstruct offline. Their results are labelled `single-implementation, non-evaluation`.
 - Cost telemetry is recorded.
@@ -547,7 +587,7 @@ Build `zkqec qualify-host`, which tests each property in §J0–J5, §K and §O:
 - CodexCall, if qualified;
 - Designer-B, skeptic, route agent and commentator contracts;
 - digests;
-- the full job state machine (§K, §L);
+- concurrency extensions of the M1 job state machine: multiple providers, parallel leases, generations under contention (§K, §L);
 - the `program` family (J4);
 - namespacing;
 - B1e;
@@ -602,7 +642,8 @@ every assertion entailed.
 - Branch `zkqec-dev` (D7). Procedure: `.claude/skills/commit-gated/SKILL.md`.
 
 **Codex in parallel.**
-- Run it in the background at every milestone and every prompt revision:
+- Run it in the background at every milestone and every prompt revision, always via the **real
+  binary** (`PATH=~/.local/node/bin:$PATH ~/.local/node/bin/codex`):
   `codex exec -m gpt-6-astra -c model_reasoning_effort='"max"' -s read-only -C <repo> -o <out.md> "<prompt>" < /dev/null`.
 - Codex also blind-authors the twins in M2, inside a sandbox without the first implementation.
 

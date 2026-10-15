@@ -126,3 +126,21 @@ verified, not assumed).
 | R2-N10 | major | B6 conflicts with no-tools runtime | A — B6 and librarian deferred to a separately qualified profile (§J6) | 01 §J6, 00 §10 |
 | R2-N11 | major | Phase 1 oversized; weak smoke gate | A — Phase 1a (M0–M1) approved first with narrowed scope and deterministic positive S-A/S-F cases; M3 smoke must admit a verified S-F capability; D4 conditional continuation | 00 §0, §11, D4 |
 | R2-N12 | minor | D11/D13/D16 conflicts | A — algebra-level agent-performance comparisons allowed; single stop policy; unenforced runs cannot satisfy DoD | 00 §14, §15 |
+
+---
+
+# Round 3 — verification review of v0.4 (`codex-prompt-review-v0.4.md`) → v0.5 (final for Phase 1a)
+
+Verdict received: "yes-with-listed-edits — Phase 1a only"; five MAJOR items, all accepted.
+
+| ID | Finding | Disp. | Where in v0.5 |
+|---|---|---|---|
+| R3-1 | Reservations omit input/cache charges | A — broker-enforced input bound (UTF-8 bytes ≥ tokens) and maximum-total-charge reservation incl. cache-write premiums | 01 §K |
+| R3-2 | Dispatch/crash recovery scheduled after M1 | A — durable dispatch state machine, intent-before-launch, broker log-before-forward, crash tests and no-release-on-kill are M1 prerequisites before any live call; M3 keeps only concurrency extensions | 00 M1, M3; 01 §L |
+| R3-3 | Semantic conflicts across bounds undetected | A — interval-consistency check per (subject, quantity) at admission; quarantine + descendant invalidation; P1a control (lower 5 with upper 3) | 01 §A3, §I; 00 M1 |
+| R3-4 | `RuntimeMaxSec` unsupported on slices (systemd 249, confirmed on host) | A — slice keeps aggregate limits; campaign deadline via supervisor timer stopping child scopes and disabling broker; per-job `RuntimeMaxSec` on scopes | 01 §J4; 00 M0 |
+| R3-5 | Bundle lacks runtime bytes | A — archive a relocatable uv-managed standalone CPython 3.10.22 (available here) + wheels; reconstruction uses only the archived runtime (glibc baseline recorded) | 01 §M; 00 M0 |
+
+Also recorded in v0.5 from the M0 probe (not review findings): Claude MCP-connector tool leakage under the normal
+HOME and its fix; Codex WebSocket transport and tool-free frames; TLS interception working for both CLIs; the
+`~/.local/bin/codex` wrapper's silent fallback to Claude (all four Codex reviews verified as genuine gpt-6-astra runs).
