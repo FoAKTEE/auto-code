@@ -5,6 +5,10 @@ repository it extracts the committed evaluator closure into a read-only snapshot
 itself there in an isolated interpreter (:mod:`zkqec.exec.snapshot`); only the process that entered
 the snapshot (:func:`zkqec.orchestrator.freeze.enter_snapshot`) loads the configuration and runs the
 campaign. ``--dry-run`` stops after entering the snapshot and prints its facts.
+
+``audit`` is the final acceptance audit (Codex M1 re-review N4): it discovers the confirmation
+supplement ``<sha256>.confirmation.json`` next to the bundle (or takes ``--supplement``) and fails
+without it when the bundle requires one (:func:`zkqec.report.bundle.confirmation_requirement`).
 """
 from __future__ import annotations
 
@@ -32,9 +36,13 @@ def main(argv: list[str] | None = None) -> int:
                         "$ZKQEC_ARCHIVE or the configured archive)")
     r.add_argument("--dry-run", action="store_true",
                    help="enter the snapshot, validate the config, print the facts; launch nothing")
-    a = sub.add_parser("audit", help="offline audit of a sealed bundle")
+    a = sub.add_parser("audit", help="offline final-acceptance audit of a sealed bundle (with "
+                                      "its confirmation supplement when the bundle requires one)")
     a.add_argument("bundle", type=Path)
     a.add_argument("--workdir", type=Path, default=None)
+    a.add_argument("--supplement", type=Path, default=None,
+                   help="confirmation supplement (default: <sha256>.confirmation.json next to "
+                        "the bundle)")
     args = ap.parse_args(argv)
     if args.cmd == "qualify-host":
         from .qualify import main as qmain
@@ -65,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if out.get("audit", {}).get("ok", True) else 1
     if args.cmd == "audit":
         from .report.bundle import audit_bundle
-        res = audit_bundle(args.bundle, workdir=args.workdir)
+        res = audit_bundle(args.bundle, workdir=args.workdir, supplement=args.supplement)
         print(json.dumps(res, indent=2, sort_keys=True))
         return 0 if res["ok"] else 1
     return 2

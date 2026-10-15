@@ -31,6 +31,17 @@ The confirmation runs after sealing. Its settlement and the campaign's final tot
 next to the bundle as ``<bundle sha256>.confirmation.json`` (:func:`confirmation_supplement`): the
 ledger events appended after the sealed head, hash-chained from it, so :func:`check_confirmation`
 verifies them against the bundle alone (Codex M1 milestone review B6).
+
+Final acceptance requires that supplement (Codex M1 re-review N4). A bundle sealed with broker
+evidence (a live campaign) declares ``"confirmation": "required"`` in its manifest, any other
+``"not_required"``; the format string stays ``zkqec-bundle-v2`` because the field is additive (old
+readers ignore it) and the requirement is decided by the auditing code, not by the embedded
+evaluator. Bundles sealed before the field existed are classified by their contents
+(:func:`confirmation_requirement`): sealed broker evidence ⇒ required (inferred; m1-live-4/5), none
+⇒ genuinely pre-B6 (m1-live-1..3). :func:`audit_bundle` is the final acceptance audit by default: it
+discovers the supplement next to the bundle and fails without it when one is required; only the
+confirmation itself (the internal pre-confirmation replay, before its supplement exists) passes
+``final=False``.
 """
 from __future__ import annotations
 
@@ -222,9 +233,13 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
             closure_files[kind] = f"closures/{kind}.tar.zst"
             side = archive / "cas" / f"{sha}.json"
             closure_meta[kind] = json.loads(side.read_text()) if side.exists() else {}
+        # N4: a bundle with broker evidence (a live campaign) is final only with its supplement
+        confirmation = REQUIRED if (b / "broker" / "broker-manifest.json").is_file() \
+            else NOT_REQUIRED
         manifest = {"campaign_id": campaign_id, "ledger_head": {"seq": head[0], "hash": head[1]},
                     "closures": closures, "closure_files": closure_files,
-                    "closure_meta": closure_meta, "format": "zkqec-bundle-v2"}
+                    "closure_meta": closure_meta, "format": "zkqec-bundle-v2",
+                    "confirmation": confirmation}
         (b / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
         if scan_bundle_inputs(b):                 # the manifest (closures are hash-verified)
             from zkqec.store import SecretDetected
@@ -236,22 +251,48 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
         atomic_copy(tmp, final)          # destination temp + fsync + rename + dir fsync (§L)
     entry = {"campaign_id": campaign_id, "bundle_sha256": sha, "path": str(final),
              "ledger_head": manifest["ledger_head"], "closures": closures,
-             "format": manifest["format"]}
+             "format": manifest["format"], "confirmation": confirmation}
     return entry
 
 
 def audit_bundle(bundle: Path, archive: Path | None = None, workdir: Path | None = None,
-                 offline: bool = True, supplement: Path | None = None) -> dict[str, Any]:
+                 offline: bool = True, supplement: Path | None = None, *,
+                 final: bool = True) -> dict[str, Any]:
     """Reconstruct in an empty directory from the bundle file alone and run the inner audit.
 
-    v2 bundles embed their closures; ``archive`` is consulted only for v1 bundles. A confirmation
-    ``supplement`` is checked against the bundle as well."""
+    v2 bundles embed their closures; ``archive`` is consulted only for v1 bundles. The default is
+    the final acceptance audit (Codex M1 re-review N4): the confirmation supplement (``supplement``,
+    else ``<sha256>.confirmation.json`` next to the bundle) is checked against the bundle, and a
+    bundle that requires one (:func:`confirmation_requirement`) fails without it; the result's
+    ``confirmation`` says which. ``final=False`` is the confirmation's own pre-confirmation replay,
+    run before its supplement exists; a given ``supplement`` is still checked."""
+    bundle = Path(bundle)
     workdir = Path(workdir or tempfile.mkdtemp(prefix="zkqec-audit-")).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     if any(workdir.iterdir()):
         raise ValueError("audit workdir must be empty")
     if bundle.name != f"{_sha_file(bundle)}.tar.zst":
         raise ValueError("bundle file does not match its content address")
+    result = _reconstruct_and_audit(bundle, archive, workdir, offline)
+    extra: list[str] = []
+    if final:
+        conf = final_confirmation(bundle, supplement)
+        result["confirmation"] = {k: v for k, v in conf.items() if k != "problems"}
+        extra = conf["problems"]
+    elif supplement is not None:
+        extra = check_confirmation(bundle, supplement)
+    if extra:
+        result["problems"] = list(result.get("problems", [])) + [f"confirmation: {p}"
+                                                                  for p in extra]
+        result["ok"] = False
+    return result
+
+
+def _reconstruct_and_audit(bundle: Path, archive: Path | None, workdir: Path,
+                           offline: bool) -> dict[str, Any]:
+    """Extract the bundle and its closures into the empty ``workdir``, build the venv from the
+    archived wheels and run :func:`audit_inner` there (inside bwrap without network if
+    ``offline``)."""
     _untar_zst(bundle, workdir)
     manifest = json.loads((workdir / "bundle" / "manifest.json").read_text())
     cl = manifest["closures"]
@@ -288,15 +329,72 @@ def audit_bundle(bundle: Path, archive: Path | None = None, workdir: Path | None
         result = {"ok": False, "problems": [f"inner audit failed: {proc.stderr[-2000:]}"]}
     result["workdir"] = str(workdir)
     result["offline"] = offline
-    if supplement is not None:
-        extra = [f"confirmation: {p}" for p in check_confirmation(bundle, supplement)]
-        result["problems"] = list(result.get("problems", [])) + extra
-        result["ok"] = bool(result.get("ok")) and not extra
     return result
 
 
 # --- confirmation supplement (§K, §M) ---------------------------------------------------------------
 CONFIRMATION_FORMAT = "zkqec-confirmation-v1"
+REQUIRED, NOT_REQUIRED = "required", "not_required"       # the manifest's ``confirmation`` (N4)
+BROKER_EVIDENCE = "bundle/broker/broker-manifest.json"
+
+
+def load_supplement(path: Path) -> Any:
+    """The parsed confirmation supplement (``ValueError`` if it is not JSON)."""
+    return json.loads(Path(path).read_text())
+
+
+def supplement_path(bundle: Path) -> Path:
+    """Where a bundle's confirmation supplement is published: ``<sha256>.confirmation.json``."""
+    bundle = Path(bundle)
+    return bundle.with_name(f"{bundle.name.split('.')[0]}.confirmation.json")
+
+
+def confirmation_requirement(bundle: Path) -> dict[str, Any]:
+    """Whether final acceptance of ``bundle`` needs its confirmation supplement (Codex M1 re-review
+    N4): ``required``, ``basis`` (``declared``; ``inferred from sealed broker evidence`` for a
+    bundle sealed with broker evidence before the manifest field existed; ``pre-B6`` for one with
+    neither) and ``problems`` (an unknown declaration, or ``not_required`` beside sealed broker
+    evidence, both treated as required)."""
+    with tempfile.TemporaryDirectory() as td:
+        got, members = _bundle_scan(Path(bundle), {"bundle/manifest.json"}, Path(td))
+        if "bundle/manifest.json" not in got:
+            return {"required": True, "declared": None, "basis": "unreadable",
+                    "problems": ["bundle lacks its manifest"]}
+        manifest = json.loads(got["bundle/manifest.json"].read_text())
+    broker = BROKER_EVIDENCE in members
+    declared = manifest.get("confirmation") if isinstance(manifest, dict) else None
+    problems: list[str] = []
+    if declared is None:
+        required, basis = broker, "inferred from sealed broker evidence" if broker else "pre-B6"
+    else:
+        required, basis = declared != NOT_REQUIRED or broker, "declared"
+        if declared not in (REQUIRED, NOT_REQUIRED):
+            problems.append(f"the manifest declares an unknown confirmation {declared!r}")
+        elif declared == NOT_REQUIRED and broker:
+            problems.append("the manifest declares no confirmation but the bundle seals broker "
+                            "evidence")
+    return {"required": required, "declared": declared, "basis": basis, "problems": problems}
+
+
+def final_confirmation(bundle: Path, supplement: Path | None = None) -> dict[str, Any]:
+    """The final-acceptance confirmation check of ``bundle``: the supplement (given, else
+    discovered next to the bundle) checked by :func:`check_confirmation` when present; missing
+    while required is a problem. ``status``: ``linked``, ``missing``, ``pre-B6`` or
+    ``not required``."""
+    req = confirmation_requirement(bundle)
+    path = Path(supplement) if supplement is not None else supplement_path(bundle)
+    problems = list(req["problems"])
+    if path.is_file():
+        status = "linked"
+        problems += check_confirmation(Path(bundle), path)
+    elif req["required"]:
+        status = "missing"
+        problems.append(f"the bundle requires its confirmation supplement ({req['basis']}) but "
+                        f"{path.name} is missing")
+    else:
+        status = "pre-B6" if req["basis"] == "pre-B6" else "not required"
+    return {"status": status, "required": req["required"], "basis": req["basis"],
+            "supplement": str(path) if path.is_file() else None, "problems": problems}
 
 
 def confirmation_supplement(adm, campaign_id: str, entry: dict, job_id: str, totals: dict,
@@ -328,19 +426,28 @@ def publish_confirmation(entry: dict, doc: dict) -> tuple[Path, str]:
     return path, hashlib.sha256(data).hexdigest()
 
 
-def _bundle_members(bundle: Path, names: set[str], dest: Path) -> dict[str, Path]:
-    """Stream the bundle once and extract only ``names`` (regular files) into ``dest``."""
+def _bundle_scan(bundle: Path, names: set[str], dest: Path) -> tuple[dict[str, Path], set[str]]:
+    """Stream the bundle once: extract only ``names`` (regular files) into ``dest`` and list the
+    names of every regular member."""
     out: dict[str, Path] = {}
+    members: set[str] = set()
     with open(bundle, "rb") as f:
         reader = zstandard.ZstdDecompressor().stream_reader(f)
         with tarfile.open(fileobj=reader, mode="r|") as tar:
             for m in tar:
+                if m.isfile():
+                    members.add(m.name)
                 if m.name in names and m.isfile():
                     target = dest / Path(m.name).name
                     with open(target, "wb") as fout:
                         shutil.copyfileobj(tar.extractfile(m), fout)
                     out[m.name] = target
-    return out
+    return out, members
+
+
+def _bundle_members(bundle: Path, names: set[str], dest: Path) -> dict[str, Path]:
+    """Stream the bundle once and extract only ``names`` (regular files) into ``dest``."""
+    return _bundle_scan(bundle, names, dest)[0]
 
 
 def check_confirmation(bundle: Path, supplement: Path) -> list[str]:
@@ -351,7 +458,7 @@ def check_confirmation(bundle: Path, supplement: Path) -> list[str]:
     from zkqec.contracts import UNITS, UsageError, check_usage
     from zkqec.contracts.jobs import charge_for
     try:
-        doc = json.loads(Path(supplement).read_text())
+        doc = load_supplement(supplement)
     except (OSError, ValueError) as exc:
         return [f"supplement unreadable: {type(exc).__name__}"]
     if not isinstance(doc, dict) or doc.get("format") != CONFIRMATION_FORMAT:

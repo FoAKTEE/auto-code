@@ -456,8 +456,9 @@ def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, jo
             # N1: the re-executed evaluator's own bounded workers stay in the child's process
             # group; unmeasured CPU (killed workers) is absent from usage(), so charged at the
             # reservation; an escaped group settles uncertain at the full reservation.
+            # N4: the pre-confirmation replay; its supplement is published (and checked) below
             res = run_bounded(audit_bundle, Path(entry["path"]), workdir=run / "audit",
-                              limits=_limits(cfg, cfg.confirmation), **kw)
+                              final=False, limits=_limits(cfg, cfg.confirmation), **kw)
             usage = res.usage()
             if res.outcome == "escaped":
                 state = "uncertain"

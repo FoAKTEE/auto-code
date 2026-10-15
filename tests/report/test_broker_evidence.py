@@ -332,3 +332,149 @@ def test_a_tampered_supplement_is_refused(sealed, tmp_path, name):
     bad.write_text(json.dumps(doc))
     problems = check_confirmation(bundle, bad)
     assert any(expected in p for p in problems), problems
+
+
+# --- Codex M1 re-review N4: the final audit requires the supplement a bundle declares ------------
+def _offline_stub(monkeypatch):
+    """Replace only the reconstruction + inner audit (covered by the slow round trips) with an
+    extraction that passes, so the final-acceptance rules can be checked quickly."""
+    def stub(bundle, archive, workdir, offline):
+        bundle_mod._untar_zst(bundle, workdir)
+        return {"ok": True, "problems": [], "workdir": str(workdir), "offline": offline}
+    monkeypatch.setattr(bundle_mod, "_reconstruct_and_audit", stub)
+
+
+def _manifest(bundle: Path) -> dict:
+    data = zstandard.ZstdDecompressor().decompress(bundle.read_bytes(), max_output_size=1 << 30)
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        return json.loads(tar.extractfile("bundle/manifest.json").read())
+
+
+def _alone(bundle: Path, where: Path, supplement: Path | None = None) -> Path:
+    where.mkdir(parents=True)
+    copy = where / bundle.name
+    shutil.copyfile(bundle, copy)
+    if supplement is not None:
+        shutil.copyfile(supplement, where / supplement.name)
+    return copy
+
+
+def _reseal(bundle: Path, where: Path, edit) -> Path:
+    """The bundle re-packed after ``edit(bundle_dir)`` (a bundle as an older sealer wrote it)."""
+    x = where / "x"
+    bundle_mod._untar_zst(bundle, x)
+    edit(x / "bundle")
+    tmp = where / "b.tar.zst"
+    bundle_mod._tar_zst(x / "bundle", tmp, "bundle", level=3)
+    out = where / "out" / f"{bundle_mod._sha_file(tmp)}.tar.zst"
+    out.parent.mkdir()
+    shutil.copyfile(tmp, out)
+    return out
+
+
+def _drop_declaration(b: Path) -> None:
+    m = json.loads((b / "manifest.json").read_text())
+    del m["confirmation"]
+    (b / "manifest.json").write_text(json.dumps(m, indent=2, sort_keys=True))
+
+
+def test_a_bundle_sealed_with_broker_evidence_declares_its_confirmation_required(sealed, tmp_path,
+                                                                                 monkeypatch):
+    out, run, bundle, _ = sealed
+    assert _manifest(bundle)["confirmation"] == "required" and out["bundle"]["confirmation"] == \
+        "required"
+    assert _manifest(bundle)["format"] == "zkqec-bundle-v2"          # an additive field
+    req = bundle_mod.confirmation_requirement(bundle)
+    assert (req["required"], req["basis"], req["problems"]) == (True, "declared", [])
+    monkeypatch.setattr(bundle_mod, "ensure_closures", lambda *a, **k: out["bundle"]["closures"])
+    plain = bundle_mod.seal(run, "sealed", run / "ledger.db", run / "store", "# r\n",
+                            archive=bundle.parents[2], commit="0" * 40, out_dir=tmp_path / "o")
+    assert _manifest(Path(plain["path"]))["confirmation"] == "not_required"
+
+
+def test_the_final_audit_discovers_the_supplement_and_fails_without_it(sealed, tmp_path,
+                                                                       monkeypatch):
+    from zkqec import cli
+    out, run, bundle, supp = sealed
+    _offline_stub(monkeypatch)
+    linked = bundle_mod.audit_bundle(_alone(bundle, tmp_path / "linked", supp),
+                                     workdir=tmp_path / "w1")
+    assert linked["ok"] and linked["confirmation"]["status"] == "linked", linked
+    alone = _alone(bundle, tmp_path / "alone")
+    missing = bundle_mod.audit_bundle(alone, workdir=tmp_path / "w2")
+    assert not missing["ok"] and missing["confirmation"]["status"] == "missing"
+    assert any("requires its confirmation supplement" in p for p in missing["problems"]), missing
+    assert cli.main(["audit", str(alone), "--workdir", str(tmp_path / "w3")]) == 1
+    assert cli.main(["audit", str(tmp_path / "linked" / bundle.name),
+                     "--workdir", str(tmp_path / "w4")]) == 0
+    assert cli.main(["audit", str(alone), "--supplement", str(supp),
+                     "--workdir", str(tmp_path / "w5")]) == 0
+    # the internal pre-confirmation replay (the confirmation itself) has no supplement yet
+    assert bundle_mod.audit_bundle(alone, workdir=tmp_path / "w6", final=False)["ok"]
+
+
+def test_bundles_sealed_before_the_declaration_are_classified_by_their_broker_evidence(
+        sealed, tmp_path, monkeypatch):
+    """m1-live-4/5 sealed broker evidence before the field existed: the supplement is inferred to
+    be required. m1-live-1..3 hold no broker evidence: genuinely pre-B6, nothing required."""
+    out, run, bundle, _ = sealed
+    _offline_stub(monkeypatch)
+    legacy = _reseal(bundle, tmp_path / "legacy", _drop_declaration)
+    req = bundle_mod.confirmation_requirement(legacy)
+    assert req["required"] is True and req["basis"] == "inferred from sealed broker evidence"
+    res = bundle_mod.audit_bundle(legacy, workdir=tmp_path / "w1")
+    assert not res["ok"] and res["confirmation"]["status"] == "missing"
+    old = _reseal(bundle, tmp_path / "old", lambda b: (_drop_declaration(b),
+                                                       shutil.rmtree(b / "broker")))
+    req = bundle_mod.confirmation_requirement(old)
+    assert req["required"] is False and req["basis"] == "pre-B6"
+    res = bundle_mod.audit_bundle(old, workdir=tmp_path / "w2")
+    assert res["ok"] and res["confirmation"]["status"] == "pre-B6"
+    lying = _reseal(bundle, tmp_path / "lying", lambda b: (b / "manifest.json").write_text(
+        (b / "manifest.json").read_text().replace('"required"', '"not_required"')))
+    req = bundle_mod.confirmation_requirement(lying)
+    assert req["required"] is True and any("broker evidence" in p for p in req["problems"])
+
+
+def test_the_bundle_index_fails_on_a_missing_required_supplement(sealed, tmp_path, monkeypatch):
+    import importlib.util
+    out, run, bundle, supp = sealed
+    _offline_stub(monkeypatch)
+    spec = importlib.util.spec_from_file_location(
+        "bundle_index", Path(__file__).resolve().parents[2] / "scripts" / "bundle_index.py")
+    index = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(index)
+    monkeypatch.setattr(index, "OUT", tmp_path / "index")
+    alone = _alone(bundle, tmp_path / "alone")
+    assert index.main([str(alone)]) == 2 and not (tmp_path / "index").exists()
+    old = _reseal(bundle, tmp_path / "old", lambda b: (_drop_declaration(b),
+                                                       shutil.rmtree(b / "broker")))
+    linked = _alone(bundle, tmp_path / "linked", supp)
+    assert index.main([str(linked), str(old)]) == 0
+    md = (tmp_path / "index" / "index.md").read_text()
+    rows = {line.split("`")[1]: line for line in md.splitlines() if line.startswith("| sealed")}
+    assert "| linked |" in rows[bundle.name[:-8]] and "| none (pre-B6) |" in rows[old.name[:-8]]
+    doc = json.loads((tmp_path / "index" / "index.json").read_text())
+    conf = {e["bundle_sha256"]: e["confirmation"] for e in doc["bundles"]}
+    assert conf[bundle.name[:-8]]["required"] is True and conf[old.name[:-8]]["basis"] == "pre-B6"
+
+
+ARCHIVED = {"m1-live-1": (False, "pre-B6", "pre-B6"), "m1-live-2": (False, "pre-B6", "pre-B6"),
+            "m1-live-3": (False, "pre-B6", "pre-B6"),
+            "m1-live-4": (True, "inferred from sealed broker evidence", "linked"),
+            "m1-live-5": (True, "inferred from sealed broker evidence", "linked")}
+
+
+@pytest.mark.skipif(not (bundle_mod.ARCHIVE / "bundles" / "m1-live-5").is_dir(),
+                    reason="needs the archived m1-live bundles")
+def test_the_archived_live_bundles_are_classified_by_their_contents():
+    """m1-live-1..3 hold no broker evidence (pre-B6); m1-live-4/5 sealed broker evidence before the
+    declaration existed, so their supplement is required, and both have one linked (read only)."""
+    found = {p.parent.name: p for p in (bundle_mod.ARCHIVE / "bundles").glob("m1-live-[1-5]/*.tar.zst")}
+    assert set(found) == set(ARCHIVED)
+    for name, path in sorted(found.items()):
+        req, conf = bundle_mod.confirmation_requirement(path), bundle_mod.final_confirmation(path)
+        assert (req["required"], req["basis"], conf["status"]) == ARCHIVED[name], name
+    assert bundle_mod.final_confirmation(found["m1-live-5"])["problems"] == []
+    assert bundle_mod.final_confirmation(found["m1-live-4"])["problems"] == \
+        ["the confirmation audit did not pass"]                # m1-live-4 stays failed evidence
