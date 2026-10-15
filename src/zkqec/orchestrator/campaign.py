@@ -169,7 +169,8 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 rec = {**res.record, "job_id": job, "outcome": res.outcome, "usage": res.usage,
                        "request_sha256": content_hash(request)}
                 rec_sha = store.put_json(rec)
-                (calls_dir / f"{task.task_id}-{i:03d}.json").write_text(json.dumps(rec, indent=2, sort_keys=True))
+                # The sidecar is the sanitized, content-addressed bytes, never the original (§M).
+                (calls_dir / f"{task.task_id}-{i:03d}.json").write_bytes(store.get_bytes(rec_sha))
                 if res.outcome == "launch_failure" and res.text is None:
                     launch_failures += 1
                 else:

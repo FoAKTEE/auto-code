@@ -111,3 +111,29 @@ def test_interrupted_call_with_partial_usage_keeps_its_full_reservation(tmp_path
                        require_clean=False, seal_bundle=False)
     assert out["totals"]["usd"]["spent"] == pytest.approx(0.2)
     assert out["totals"]["requests"]["spent"] == pytest.approx(2)
+
+
+class SecretRecordDouble(ReplayProviderDouble):
+    """A provider whose call record carries a secret under a sensitive key (Codex M1 review #8)."""
+
+    def call(self, *, job_id, system_prompt, request, schema, reservation):
+        self.requests.append(json.loads(request))
+        return CallResult("completed", GOOD, {"usd": 0.01, "requests": 1},
+                          {"provider": "replay", "api_key": "opaque-secret-123"})
+
+
+def _disk(root):
+    import os
+    out = b""
+    for d, _, files in os.walk(root):
+        for f in files:
+            with open(os.path.join(d, f), "rb") as fh:
+                out += fh.read()
+    return out
+
+
+def test_call_record_sidecars_hold_only_sanitized_bytes(tmp_path):
+    out = run_campaign(cfg(max_proposals_per_task=1), SecretRecordDouble([]), tmp_path,
+                       require_clean=False, seal_bundle=False)
+    disk = _disk(out["run_dir"])
+    assert b"opaque-secret-123" not in disk and b"[REDACTED:secret_field]" in disk

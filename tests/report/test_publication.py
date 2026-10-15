@@ -65,3 +65,21 @@ def test_tar_zst_publishes_durably(tmp_path, trace):
     bundle_mod._tar_zst(src, out, "x")
     assert out.is_file() and _published(trace, out)
     assert not any(p.name.endswith(".tmp") for p in out.parent.iterdir())
+
+
+def test_seal_scans_every_bundle_input_for_secrets(tmp_path, monkeypatch):
+    """Codex M1 review #8: sealing refuses secret-bearing inputs instead of copying them."""
+    from zkqec.admission import Admission, VerifierRegistry
+    from zkqec.store import ArtifactStore, SecretDetected
+    run = tmp_path / "run"
+    store = ArtifactStore(run / "store")
+    Admission(run / "ledger.db", store, VerifierRegistry()).close()
+    calls = run / "calls"
+    calls.mkdir()
+    (calls / "x.json").write_text('{"api_key": "opaque-secret-123"}')
+    monkeypatch.setattr(bundle_mod, "ensure_closures", lambda *a, **k: {})
+    archive = tmp_path / "archive"
+    with pytest.raises(SecretDetected, match="calls/x.json"):
+        bundle_mod.seal(run, "c", run / "ledger.db", run / "store", "# r\n", {}, archive=archive,
+                        extra_dirs={"calls": calls}, commit="0" * 40)
+    assert not (archive / "bundles").exists() or not any((archive / "bundles").rglob("*.tar.zst"))

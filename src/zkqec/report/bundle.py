@@ -132,6 +132,36 @@ def ensure_closures(archive: Path = ARCHIVE, *, commit: str | None = None) -> di
     return {**out, "git_commit": commit, "lock_sha256": lock_sha}
 
 
+def scan_bundle_inputs(root: Path, sanitizer=None) -> list[str]:
+    """Secret scan of every campaign-derived bundle input (§M: secrets never enter a bundle).
+
+    Text files are scanned with the sanitizer's text and JSON rules, any other file byte-wise
+    (latin-1); a hit is reported by relative path and rule names, never by content. Content-addressed
+    software closures are verified by hash instead and are not passed here."""
+    from zkqec.store.sanitize import DEFAULT_SANITIZER
+    sanitizer = sanitizer or DEFAULT_SANITIZER
+    hits = []
+    for p in sorted(root.rglob("*")):
+        if p.is_symlink():
+            hits.append(f"{p.relative_to(root)}: symlink in bundle input")
+            continue
+        if not p.is_file():
+            continue
+        data = p.read_bytes()
+        kind = "json" if p.suffix == ".json" else "text"
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            kind = "binary"
+        try:
+            _, counts = sanitizer.sanitize_bytes(data, kind)
+        except Exception as exc:                                  # SecretDetected for binary
+            counts = {type(exc).__name__: 1}
+        if counts:
+            hits.append(f"{p.relative_to(root)}: {sorted(counts)}")
+    return hits
+
+
 def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, report_md: str,
          campaign_record: dict, extra_dirs: dict[str, Path] | None = None,
          archive: Path = ARCHIVE, commit: str | None = None) -> dict[str, Any]:
@@ -152,6 +182,10 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
         manifest = {"campaign_id": campaign_id, "ledger_head": {"seq": head[0], "hash": head[1]},
                     "closures": closures, "format": "zkqec-bundle-v1"}
         (b / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        hits = scan_bundle_inputs(b)
+        if hits:
+            from zkqec.store import SecretDetected
+            raise SecretDetected(f"refusing to seal: secret-like content in {hits[:10]}")
         out_dir = archive / "bundles" / campaign_id
         tmp = Path(td) / "bundle.tar.zst"; _tar_zst(b, tmp, "bundle")
         sha = _sha_file(tmp)
