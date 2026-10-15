@@ -81,11 +81,31 @@ class JobResult:
     job_dir: str
 
 
+class LiveCallForbidden(RuntimeError):
+    """A job would receive a real credential file while live calls are forbidden (test runs)."""
+
+
+_LIVE_CREDENTIALS = ("~/.claude/.credentials.json", "~/.codex/auth.json")
+
+
+def _forbid_live(spec: JobSpec) -> None:
+    """While ``ZKQEC_FORBID_LIVE=1`` (set for every test run), no real credential file enters a job
+    home, so no code path can make a billed model call (an unintended test-run campaign spent $0.2047)."""
+    if os.environ.get("ZKQEC_FORBID_LIVE") != "1":
+        return
+    real = {os.path.realpath(os.path.expanduser(p)) for p in _LIVE_CREDENTIALS}
+    for h in spec.home_files:
+        if os.path.realpath(h.src) in real:
+            raise LiveCallForbidden(f"job {spec.job_id}: live credentials are forbidden here "
+                                    "(ZKQEC_FORBID_LIVE=1)")
+
+
 def run_job(spec: JobSpec, jobs_root: str | os.PathLike[str], slice_: CampaignSlice, *,
             blocked_probe: Callable[[str], str | None] | None = None, keep_job_dir: bool = True,
             poll: float = 0.2, host_env_extra: dict[str, str] | None = None) -> JobResult:
     """Run one job to completion. ``host_env_extra`` adds variables to the *launcher-side* environment
     (qualification uses it to prove that nothing inherited crosses into the sandbox)."""
+    _forbid_live(spec)
     if spec.profile.credentials is False and spec.home_files:
         raise ValueError(f"profile {spec.profile.name} carries no credentials")
     if spec.profile.network == "bridge" and (spec.broker_port is None or spec.token is None):
