@@ -320,3 +320,10 @@ def test_an_out_of_order_operational_history_is_flagged(ran):
     conn.close()
     problems = audit_campaign(adm, store, "t1")
     assert any(job[0] in p and "settled -> dispatched" in p for p in problems), problems
+
+
+def test_a_campaign_frozen_without_campaign_ceilings_audits_clean(camp):
+    """A ledger frozen outside run_campaign (no verifier ceilings, per-call reservation or
+    confirmation in its config) has no frozen ceilings to compare its verifier jobs with."""
+    adm, store, _, _ = camp
+    assert audit_campaign(adm, store, "c3") == []

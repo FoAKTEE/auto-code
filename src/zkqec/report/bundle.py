@@ -590,8 +590,10 @@ def audit_operations(adm, store, campaign_id: str) -> list[str]:
 
     if camp.get("confirmation") is not None:
         required("confirmation", lambda r: r["kind"] == "confirm", camp["confirmation"])
-    verifier = {"wall_seconds": cfg.get("verifier_wall_seconds", 0),
-                "cpu_seconds": cfg.get("verifier_cpu_seconds", 0)}
+    verifier = None                          # frozen ceilings exist only in a CampaignConfig
+    if "verifier_wall_seconds" in cfg and "verifier_cpu_seconds" in cfg:
+        verifier = {"wall_seconds": cfg["verifier_wall_seconds"],
+                    "cpu_seconds": cfg["verifier_cpu_seconds"]}
     if cfg.get("controls"):
         key = f"controls:{cfg['controls']}"
         required(key, lambda r: r["idem_key"] == key and r["kind"] == "verify", verifier)
@@ -606,7 +608,7 @@ def audit_operations(adm, store, campaign_id: str) -> list[str]:
         if r["kind"] == "confirm" or idem == f"controls:{cfg.get('controls')}":
             continue
         if r["kind"] == "verify":
-            if r["reservation"] != _unit_dict(verifier):
+            if verifier is not None and r["reservation"] != _unit_dict(verifier):
                 problems.append(f"job {job}: verifier reservation differs from the frozen ceilings")
             if (idem.split(":", 1)[0], r["input_sha"]) not in executions:
                 problems.append(f"job {job}: verifier job {idem!r} names no execution with its inputs")
