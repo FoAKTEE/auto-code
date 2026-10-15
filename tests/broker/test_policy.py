@@ -232,7 +232,8 @@ def test_usage_parsing():
     sse = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,'
            b'"cache_creation_input_tokens":899,"output_tokens":1}}}\n\n'
            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},'
-           b'"usage":{"output_tokens":52}}\n\n')
+           b'"usage":{"output_tokens":52}}\n\n'
+           b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
     u = P.anthropic_usage(sse, "text/event-stream")
     assert u == {"usage": {"input_tokens": 2, "cache_creation_input_tokens": 899, "output_tokens": 52},
                  "stop_reason": "tool_use"}
@@ -242,6 +243,43 @@ def test_usage_parsing():
     assert P.ws_server_usage(frame) == {"frame_type": "response.completed",
                                         "usage": {"input_tokens": 10, "cached_tokens": 3, "output_tokens": 4}}
     assert P.ws_server_usage(b'{"type":"response.output_text.delta"}') is None
+
+
+# Codex M1 milestone review B2: usage is reported only for a complete message
+_START = {"type": "message_start", "message": {"usage": {"input_tokens": 7, "output_tokens": 1}}}
+_DELTA = {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 40}}
+_TEXT = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "{"}}
+
+
+def _sse(*events) -> bytes:
+    return b"".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events)
+
+
+def test_usage_requires_a_complete_message():
+    stop = {"type": "message_stop"}
+    complete = P.anthropic_usage(_sse(_START, _TEXT, _DELTA, stop), "text/event-stream")
+    assert complete == {"usage": {"input_tokens": 7, "output_tokens": 40}, "stop_reason": "end_turn"}
+    incomplete = [
+        _sse(_START, _TEXT),                                     # clean EOF mid-message (the repro)
+        _sse(_START, _TEXT, _DELTA),                             # no message_stop
+        _sse(_START, _TEXT, stop),                               # no final message_delta
+        _sse(_TEXT, _DELTA, stop),                               # no message_start
+        _sse(_START, dict(_DELTA, usage=None), stop),            # final delta without usage
+        _sse(_START, _DELTA, dict(_DELTA, usage={}), stop),      # the last delta has no output count
+        _sse(_START, _DELTA, stop, _DELTA),                      # a delta after message_stop
+        _sse(_START, _DELTA, {"type": "error", "error": {"type": "overloaded_error"}}, stop),
+        _sse(_START, _DELTA, stop, _START, _DELTA, stop),        # two messages in one response
+    ]
+    for body in incomplete:
+        assert P.anthropic_usage(body, "text/event-stream") is None, body
+    # diagnostic parse of a partial stream (never a usage record)
+    assert P.anthropic_usage(_sse(_START, _TEXT), "text/event-stream", complete=False)["usage"] == \
+        {"input_tokens": 7, "output_tokens": 1}
+    msg = {"type": "message", "usage": {"input_tokens": 3, "output_tokens": 9}, "stop_reason": "end_turn"}
+    assert P.anthropic_usage(json.dumps(msg).encode(), "application/json")["usage"] == \
+        {"input_tokens": 3, "output_tokens": 9}
+    assert P.anthropic_usage(json.dumps(dict(msg, stop_reason=None)).encode(), "application/json") is None
+    assert P.anthropic_usage(json.dumps({"usage": msg["usage"]}).encode(), "application/json") is None
 
 
 def test_reservation_bound():

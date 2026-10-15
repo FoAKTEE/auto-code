@@ -125,6 +125,64 @@ def test_client_abort_mid_stream_leaves_usage_unreported(env):
     assert s["model_requests"] == 1 and s["usage_records"] == 0 and s["usage_missing"] == 1
 
 
+class _Job:
+    """What ``run_job`` returns for a CLI that exited 0 with a structured result."""
+    outcome, exit_code, wall_seconds, blocked_reason, profile_sha256 = "completed", 0, 1.0, None, "0" * 64
+    stdout = json.dumps({"structured_output": {"family": "explicit_sparse"}, "total_cost_usd": 0.01,
+                         "is_error": False}).encode()
+    stderr = b""
+
+
+@pytest.mark.parametrize("gz", [False, True])
+def test_truncated_stream_then_retry_stays_usage_missing(env, gz, monkeypatch, tmp_path):
+    # Codex M1 milestone review B2: a cleanly ended response holding an unfinished SSE message (no
+    # final message_delta, no message_stop) is not complete usage, even when the CLI's retry then
+    # completes: the call keeps a usage-missing request, so it settles uncertain at its reservation.
+    from zkqec.agents import providers
+    from zkqec.contracts import Reservation
+    from zkqec.contracts.jobs import charge_for
+    from zkqec.orchestrator.campaign import outcome_state
+    _, b, up, _ = env
+    jid = f"h_trunc_{int(gz)}"
+    up.sse_truncate, up.sse_gzip = 1, gz
+    try:
+        br, c = _client(env, jid, "claude", "m1", Ceilings(2, 6, 4096, 100, 60))
+        first = c.request("POST", "/v1/messages", json.dumps(MSG).encode())
+        retry = c.request("POST", "/v1/messages", json.dumps(MSG).encode())
+        c.close(); br.stop()
+    finally:
+        up.sse_truncate, up.sse_gzip = 0, False
+    assert first[0] == retry[0] == 200
+    if not gz:
+        assert b"message_stop" not in first[1] and b"message_stop" in retry[1]
+    deadline = time.time() + 10
+    while len([r for r in b.records(jid) if r.get("event") == "response"]) < 2:
+        assert time.time() < deadline
+        time.sleep(0.05)
+    recs = b.records(jid)
+    assert [r["usage_status"] for r in recs if r.get("event") == "response"] == ["unknown", "reported"]
+    s = summarize_job(recs)
+    assert s["model_requests"] == 2 and s["usage_records"] == 1 and s["usage_missing"] == 1
+
+    class Recorded:                         # the provider reads this job's real broker records
+        ca_cert, port = b.ca_cert, b.port
+        grant = staticmethod(lambda *a, **k: "token")
+        revoke = staticmethod(lambda token: None)
+        blocked_reason = staticmethod(lambda job: None)
+        records = staticmethod(lambda job: recs)
+
+    monkeypatch.setattr(providers, "run_job", lambda *a, **k: _Job())
+    prov = providers.ClaudeCallProvider("m1", broker=Recorded(), slice_=None, jobs_root=tmp_path)
+    res = prov.call(job_id=jid, system_prompt="s", request="r", schema={},
+                    reservation=Reservation(usd=1.0, requests=2, input_tokens=8192, output_tokens=200,
+                                            wall_seconds=60, cpu_seconds=0))
+    assert res.outcome == "uncertain" and res.record["telemetry_complete"] is False
+    reservation = {"usd": 1.0, "requests": 2, "input_tokens": 8192, "output_tokens": 200,
+                   "wall_seconds": 60, "cpu_seconds": 0}
+    assert charge_for(outcome_state(res.outcome), reservation, res.usage) == \
+        {u: float(v) for u, v in reservation.items()}
+
+
 def test_websocket_frames(env):
     _, b, up, _ = env
     br, c = _client(env, "w1", "codex", "g1", Ceilings(3, 6, 100000, 100, 60))

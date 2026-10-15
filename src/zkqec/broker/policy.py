@@ -593,16 +593,24 @@ def _flat_usage(u: Any) -> dict[str, int]:
 MAX_USAGE_BODY_BYTES = 64 << 20               # larger model responses are not parsed: usage unknown
 
 
-def anthropic_usage(body: bytes, content_type: str | None,
-                    max_bytes: int = MAX_USAGE_BODY_BYTES) -> dict[str, Any] | None:
-    """Usage from an Anthropic Messages response: SSE (``message_start``/``message_delta``) or JSON."""
+def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = MAX_USAGE_BODY_BYTES, *,
+                    complete: bool = True) -> dict[str, Any] | None:
+    """Usage of one **complete** Anthropic Messages response, else None (unknown, §J5, §K).
+
+    SSE: exactly one ``message_start`` (initial usage), a final ``message_delta`` carrying usage with
+    an output count, then ``message_stop``, and no ``error`` event. JSON: a message with ``usage`` and
+    a non-null ``stop_reason``. A cleanly ended HTTP body without these (a stream cut short upstream)
+    is not complete accounting, whatever partial counters it held (Codex M1 milestone review B2).
+    ``complete=False`` returns whatever partial usage was seen (diagnostics only, never a usage
+    record)."""
     if len(body) > max_bytes:
         return None
     text = body.decode("utf-8", "replace")
     if content_type and "event-stream" in content_type:
         usage: dict[str, int] = {}
         stop = None
-        found = False
+        starts = 0
+        final_usage = stopped = failed = after_stop = False
         for line in text.splitlines():
             if not line.startswith("data:"):
                 continue
@@ -613,19 +621,35 @@ def anthropic_usage(body: bytes, content_type: str | None,
                 ev = json.loads(payload)
             except ValueError:
                 continue
-            if ev.get("type") == "message_start":
-                found = True
-                usage.update(_flat_usage((ev.get("message") or {}).get("usage")))
-            elif ev.get("type") == "message_delta":
-                found = True
-                usage.update(_flat_usage(ev.get("usage")))
-                stop = (ev.get("delta") or {}).get("stop_reason") or stop
-        return {"usage": usage, "stop_reason": sanitize_label(stop)} if found else None
+            if not isinstance(ev, dict):
+                continue
+            t = ev.get("type")
+            if stopped and t != "ping":
+                after_stop = True
+            if t == "message_start":
+                starts += 1
+                msg = ev.get("message")
+                usage.update(_flat_usage(msg.get("usage") if isinstance(msg, dict) else None))
+            elif t == "message_delta":
+                u = ev.get("usage")
+                final_usage = isinstance(u, dict) and type(u.get("output_tokens")) is int
+                usage.update(_flat_usage(u))
+                delta = ev.get("delta")
+                stop = (delta.get("stop_reason") if isinstance(delta, dict) else None) or stop
+            elif t == "message_stop":
+                stopped = True
+            elif t == "error":
+                failed = True
+        ok = starts == 1 and final_usage and stopped and not failed and not after_stop
+        if ok or (not complete and (starts or usage)):
+            return {"usage": usage, "stop_reason": sanitize_label(stop)}
+        return None
     try:
         doc = json.loads(text)
     except ValueError:
         return None
-    if isinstance(doc, dict) and isinstance(doc.get("usage"), dict):
+    if isinstance(doc, dict) and isinstance(doc.get("usage"), dict) \
+            and (doc.get("stop_reason") is not None or not complete):
         return {"usage": _flat_usage(doc["usage"]), "stop_reason": sanitize_label(doc.get("stop_reason"))}
     return None
 

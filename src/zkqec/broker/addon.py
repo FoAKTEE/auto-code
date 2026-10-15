@@ -411,8 +411,9 @@ class ZkqecBroker:
             _kill(flow)
             self._hook_failed("responseheaders", flow.metadata.get("zkqec_job"), exc)
 
-    def _model_usage(self, flow: http.HTTPFlow) -> tuple[int, dict[str, Any] | None]:
-        """(body bytes seen, parsed usage) of a model response, from the streamed copy."""
+    def _model_usage(self, flow: http.HTTPFlow, complete: bool = True) -> tuple[int, dict[str, Any] | None]:
+        """(body bytes seen, parsed usage) of a model response, from the streamed copy; usage only for
+        a complete message unless ``complete`` is False (diagnostics)."""
         assert flow.response is not None
         tee = flow.metadata.get("zkqec_tee")
         if tee is None:                         # not streamed (no body): parse what was buffered
@@ -423,7 +424,7 @@ class ZkqecBroker:
             return len(raw), None
         ctype = flow.response.headers.get("content-type")
         if flow.metadata.get("zkqec_body") == "anthropic_messages":
-            return len(raw), P.anthropic_usage(content, ctype)
+            return len(raw), P.anthropic_usage(content, ctype, complete=complete)
         u = None
         for line in content.decode("utf-8", "replace").splitlines():
             if line.startswith("data:") and "response.completed" in line:
@@ -462,7 +463,7 @@ class ZkqecBroker:
                             "error": P.sanitize_label(msg, 160)})
             if flow.metadata.get("zkqec_tee") is not None and flow.response is not None:
                 # Diagnostic only: an interrupted stream never yields a usage record (§K).
-                n, u = self._model_usage(flow)
+                n, u = self._model_usage(flow, complete=False)
                 self.log.write({"event": "response_incomplete", "job_id": flow.metadata.get("zkqec_job"),
                                 "path": P.sanitize_label(P.strip_query(flow.request.path), 160),
                                 "status": flow.response.status_code, "body_bytes": n,

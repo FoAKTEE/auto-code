@@ -48,18 +48,32 @@ class Seen:
     size: int = 0
 
 
+SSE_MESSAGE = (
+    {"type": "message_start", "message": {"usage": {"input_tokens": 11, "output_tokens": 1,
+                                                    "cache_creation_input_tokens": 0}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "{}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}},
+    {"type": "message_stop"},
+)
+
+
 @dataclass
 class FakeUpstream:
-    """TLS server on 127.0.0.1 answering like a model API: SSE with usage for ``POST /v1/messages``,
-    a ``response.completed`` frame (with usage) for every WebSocket text frame, JSON 200 otherwise.
-    ``sse_delay`` holds the SSE body back after its first part (a slow, thinking model);
-    ``sse_gzip`` sends it with ``Content-Encoding: gzip``."""
+    """TLS server on 127.0.0.1 answering like a model API: a complete SSE message with usage for
+    ``POST /v1/messages``, a ``response.completed`` frame (with usage) for every WebSocket text frame,
+    JSON 200 otherwise. ``sse_delay`` holds the SSE body back after its first part (a slow, thinking
+    model); ``sse_gzip`` sends it with ``Content-Encoding: gzip``; ``sse_truncate`` makes that many
+    next model responses end cleanly (correct Content-Length) in the middle of the message, after
+    ``message_start`` and one text delta."""
     cert: str
     key: str
     seen: list[Seen] = field(default_factory=list)
     port: int = 0
     sse_delay: float = 0.0
     sse_gzip: bool = False
+    sse_truncate: int = 0
 
     def start(self) -> "FakeUpstream":
         ready = threading.Event()
@@ -103,11 +117,10 @@ class FakeUpstream:
                     return
                 self.seen.append(Seen("http", method, path, len(body)))
                 if method == "POST" and path.split("?")[0] == "/v1/messages":
-                    events = [
-                        {"type": "message_start", "message": {"usage": {"input_tokens": 11, "output_tokens": 1,
-                                                                        "cache_creation_input_tokens": 0}}},
-                        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}},
-                    ]
+                    events = list(SSE_MESSAGE)
+                    if self.sse_truncate > 0:
+                        self.sse_truncate -= 1
+                        events = events[:3]
                     parts = [f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events]
                     payload, ctype = b"".join(parts), b"text/event-stream"
                     if self.sse_delay or self.sse_gzip:
