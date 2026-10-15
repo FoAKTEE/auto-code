@@ -77,11 +77,20 @@ def _read_only(root: Path) -> None:
     os.chmod(root, 0o555)
 
 
+def _stamp(root: Path, when: int) -> None:
+    """Set every entry's mtime to the commit time. The closure tar stores mtime 0, and mitmproxy
+    loads a script only once its mtime exceeds 0: a zero-mtime broker addon never loads (m1-live-4)."""
+    for p in [root, *root.rglob("*")]:
+        os.utime(p, (when, when), follow_symlinks=False)
+
+
 def _verify(root: Path, commit: str, expected: dict) -> Path:
     """The snapshot's marker names ``commit`` and its files carry the commit's fingerprint."""
     info = freeze.snapshot_info(root)
     if info is None or info.get("commit") != commit:
         raise SnapshotError(f"{root} is not the snapshot of {commit}")
+    if any(p.lstat().st_mtime <= 0 for p in [root, *root.rglob("*")]):
+        raise SnapshotError(f"snapshot {root} has zero mtimes (built before the commit-time stamp)")
     fp = freeze.worktree_fingerprint(root)["sha256"]
     if not fp == info.get("fingerprint") == expected["sha256"]:
         raise SnapshotError(f"snapshot {root} differs from its recorded fingerprint")
@@ -124,7 +133,8 @@ def prepare(*, archive: str | os.PathLike | None = None, repo: str | os.PathLike
             {"kind": freeze.SNAPSHOT_KIND, "commit": commit, "evaluator_closure": closure,
              "fingerprint": fp["sha256"], "repository": str(repo)}, indent=2, sort_keys=True))
         if (repo / BROKER_VENV).is_dir():
-            os.symlink(repo / BROKER_VENV, root / BROKER_VENV)   # runtime, not evaluator code
+            os.symlink((repo / BROKER_VENV).resolve(), root / BROKER_VENV)   # runtime, not evaluator code
+        _stamp(root, int(_git(repo, "show", "-s", "--format=%ct", commit)))
         _read_only(root)
         try:
             os.rename(tmp, final)

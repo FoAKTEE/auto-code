@@ -191,3 +191,32 @@ def test_a_tampered_snapshot_is_refused(env):
     res = run_inner(root, "print('ran')")
     assert res.returncode != 0 and "ran" not in res.stdout
     assert "EvaluatorChanged" in res.stderr
+
+
+def test_snapshot_files_carry_the_commit_time(env):
+    # m1-live-4: the closure tar stores mtime 0; mitmproxy loads a script only once its mtime
+    # exceeds 0, so the broker addon in a snapshot never loaded and the broker never became ready.
+    root = snapshot.prepare(archive=env["archive"])
+    ct = int(git(env["repo"], "show", "-s", "--format=%ct", env["commit"]))
+    assert ct > 0
+    for p in [root, *root.rglob("*")]:
+        if not p.is_symlink():
+            assert int(p.stat().st_mtime) == ct, p
+
+
+@pytest.mark.skipif(not (REPO / ".venv-broker" / "bin" / "mitmdump").exists(),
+                    reason="needs .venv-broker (mitmproxy)")
+def test_the_broker_starts_from_the_snapshot(env, tmp_path):
+    link = env["repo"] / ".venv-broker"
+    link.symlink_to(REPO / ".venv-broker")
+    try:
+        root = snapshot.prepare(archive=env["archive"])
+        entry = ("from pathlib import Path\nfrom zkqec.broker import launcher\n"
+                 f"b = launcher.Broker('snapstart', Path({str(tmp_path / 'ops')!r}))\n"
+                 "assert str(launcher.ADDON).startswith(str(Path(launcher.__file__).parents[1]))\n"
+                 "b.start(timeout=30)\nprint('ready', launcher.ADDON)\nb.stop()\n")
+        out = run_inner(root, entry)
+    finally:
+        link.unlink()
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.split()[0] == "ready" and out.stdout.split()[1].startswith(str(root))
