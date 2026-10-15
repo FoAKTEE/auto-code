@@ -78,3 +78,51 @@ None. CR-1 is modified rather than rejected: closing the application objective i
 require faithful TMR/RUS instruments from a source paper that is not bundled, plus calibrated resource
 closure. Doing it badly would produce exactly the vacuous completion the reviewer warns against, so
 the first run's claims are scoped to the algebra level instead.
+
+---
+
+# Round 2 — review of v0.3 (`codex-prompt-review-v0.3.md`) → v0.4
+
+Verdict received: "with changes — not ready for owner approval". All items accepted; none rejected.
+Host check added for this round: `codex features list` shows `shell_tool`, `multi_agent`, `apps`, `browser_use`,
+`computer_use`, `in_app_browser`, `plugins`, `remote_plugin` enabled by default (so "no tools" must be enforced and
+verified, not assumed).
+
+## Triage-verification gaps (R2-T)
+
+| ID | Gap | Disp. | Where in v0.4 |
+|---|---|---|---|
+| R2-T1 (CR-2/33) | No operation field; sparse shape ambiguous | A — `OperationRef` in `G`; explicit `shape` per matrix; code/operation edit invalidation | 01 §B1–B3 |
+| R2-T2 (CR-3) | Prose sections can smuggle claims | A — authoritative report fully templated; LLM text only in a quarantined "Unverified commentary" appendix | 01 §A5, 00 §4.10 |
+| R2-T3 (CR-4/5) | Codex web search may be on by default; schemas ≠ tool disable | A — explicit feature/web-search disable, effective tool manifest verified from intercepted request bodies; non-tool-free provider disqualified for K0 | 01 §J1–J2, 00 §2 |
+| R2-T4 (CR-8) | Presentation features used as filters | A — true invariants vs presentation features; features only prioritize; nonmatch must cover every relevant DB entry | 01 §D2a–D2b, D4 |
+| R2-T5 (CR-11) | Lower-bound rule omits "no nontrivial logical through 2t" | A — `w*` recorded; `w* ≤ 2t` ⇒ exact; Steane t=2 control | 01 §C2, §I |
+| R2-T6 (CR-14) | Singleton stated as iff | A — "excluded if"; passing proves nothing | 01 §E |
+| R2-T7 (CR-17) | Circuit witness lacks `Df=0, Lf≠0`; graphlike overstatement | A | 01 §G |
+| R2-T8 (CR-21) | Twins vs M1 campaign contradiction; small-n twins vs "every proposition" | A — twins in M2 before evaluation; M1 labelled non-evaluation; confirmation-method/range matrix | 01 §F, 00 §11 |
+| R2-T9 (CR-22) | Missing directory fsync | A — temp → fsync → rename → fsync dir → DB commit; crash tests between steps | 01 §L |
+| R2-T10 (CR-24) | Per-job scopes don't enforce campaign limits; no disk quota | A — campaign parent slice; tmpfs `size=`; aggregate output accounting | 01 §J4, D14 |
+| R2-T11 (CR-25) | Reservations lack enforceable maxima | A — broker-enforced request/token ceilings; uncertain charges retained | 01 §K |
+| R2-T12 (CR-26) | Bundles lack executable closure | A — archived wheels, verifier snapshot, interpreter hash; offline reconstruction | 01 §M |
+| R2-T13 (CR-29) | Arm capabilities unspecified; proposals-and-cost conflict | A — arm capability matrix; separate fixed-proposal / fixed-budget analyses; cost units never summed | 00 §10, §4.12 |
+| R2-T14 (CR-30) | Annotation semantics missing | A — necessary / sufficient / preference, multiple routes, uncertainty, scoring rules (Phase 3) | 00 §11 Phase 3 |
+| R2-T15 (IA-1) | S-F prescribed routes | A — S-F = target action + hardware operation class; agent picks route; route-constrained tasks moved to S-A; rotations excluded | 00 §3 |
+| R2-T16 (IA-12) | 15-mode coverage untraceable | A — mapping table | 01 §I |
+| R2-T17 (CR-12/35) | 288-qubit fixture vs cap; D17 index | A — fixtures exempt; D17 = Phase-2 memory estimand | 00 §2, §14 |
+
+## New findings (R2-N)
+
+| ID | Sev. | Finding | Disp. | Where |
+|---|---|---|---|---|
+| R2-N1 | blocker | CONNECT tunnel cannot establish API-level policy | A — TLS-terminating request-inspecting broker with per-campaign CA; request-level enforcement and accounting; unqualified ⇒ `K0-unenforced`, dev-only | 01 §J1, D15–D16 |
+| R2-N2 | major | Disjoint-representative bound uses wrong sector | A — `k·d_P` for P-type representatives | 01 §E |
+| R2-N3 | major | Proposition registry incomplete; no revocation/guarantee semantics | A — subject-typed signatures, `block_length_eq`, `target_refuted`, `nogo`, `arm_contrast`; revocation, quarantine, guarantee propagation, field consistency | 01 §A1–A3 |
+| R2-N4 | major | Verification sharing by code identity transfers presentation claims | A — predicate-keyed subjects and transport bridges | 01 §A3, §D3 |
+| R2-N5 | blocker | No process isolation | A — J0 launch profile (PID/IPC/UTS/net/session, clearenv, fd hygiene, no host sockets) with signalling and secret tests | 01 §J0 |
+| R2-N6 | major | Lease fencing doesn't stop execution/spend | A — dispatch state machine, kill-or-retain reservation, per-retry reservations, atomic settlement, same-generation duplicate rejection | 01 §L |
+| R2-N7 | major | Scrubbing after hashing breaks evidence | A — sanitize before content addressing; secret-bearing ingest test | 01 §M |
+| R2-N8 | major | Phase-1 statistical claims mis-described | A — "no physical-noise sampling"; frozen estimands, clustering, censoring, Holm, separate analyses | 01 §H, D13 |
+| R2-N9 | major | H3 ablation lacks oracle/estimand | A — separate experimental ledger scored by intact resolver; estimand = useful counterexamples / cost / time-to-rejection | 00 §10 |
+| R2-N10 | major | B6 conflicts with no-tools runtime | A — B6 and librarian deferred to a separately qualified profile (§J6) | 01 §J6, 00 §10 |
+| R2-N11 | major | Phase 1 oversized; weak smoke gate | A — Phase 1a (M0–M1) approved first with narrowed scope and deterministic positive S-A/S-F cases; M3 smoke must admit a verified S-F capability; D4 conditional continuation | 00 §0, §11, D4 |
+| R2-N12 | minor | D11/D13/D16 conflicts | A — algebra-level agent-performance comparisons allowed; single stop policy; unenforced runs cannot satisfy DoD | 00 §14, §15 |
