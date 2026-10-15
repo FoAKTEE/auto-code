@@ -1,5 +1,5 @@
 {
-  "campaign_id": "m1-live-8",
+  "campaign_id": "m1-live-9",
   "profile": {"knowledge": "K0", "prompt": "P-min", "grammar": ["G-open"]},
   "tasks": [
     {"kind": "S-A", "task_id": "sa-live-1",
