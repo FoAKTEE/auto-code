@@ -1,0 +1,25 @@
+{
+  "campaign_id": "m1-live-1",
+  "profile": {"knowledge": "K0", "prompt": "P-min", "grammar": ["G-open"]},
+  "tasks": [
+    {"kind": "S-A", "task_id": "sa-live-1",
+     "targets": {"n_max": 60, "k_min": 8, "d_min": 6, "w_max": 6, "deg_max": 6}},
+    {"kind": "S-F", "task_id": "sf-live-1",
+     "targets": {"n_max": 40, "k_min": 2, "d_min": 3, "w_max": 6, "deg_max": 6},
+     "k_req": 2,
+     "target_action": {"x_images": ["IX", "XI"], "z_images": ["IZ", "ZI"]},
+     "hardware": {"name": "permutation-only", "allowed_operations": ["qubit_permutation"],
+                  "operation_costs": {"qubit_permutation": 1.0}}}
+  ],
+  "provider": "claude",
+  "model": "claude-opus-5-5",
+  "effort": "high",
+  "max_proposals_per_task": 4,
+  "caps": {"usd": 5.0, "requests": 40, "input_tokens": 4000000, "output_tokens": 400000,
+           "wall_seconds": 10800, "cpu_seconds": 7200},
+  "per_call": {"usd": 0.6, "requests": 3, "input_tokens": 400000, "output_tokens": 32000,
+               "wall_seconds": 900, "cpu_seconds": 0},
+  "distance_budget": {"max_patterns": 3000000, "max_pairs": 200000000},
+  "max_n": 200,
+  "labels": ["single-implementation", "non-evaluation", "M1-live-slice"]
+}

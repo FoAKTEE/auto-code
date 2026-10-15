@@ -70,3 +70,9 @@ def test_campaign_refuses_dirty_evaluator(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "git_state", lambda: {"commit": "x", "dirty": True, "dirty_paths": ["src/x"]})
     with pytest.raises(c.EvaluatorDirty):
         run_campaign(cfg(), ReplayProviderDouble([GOOD]), tmp_path)
+
+
+def test_large_pmin_requests_are_screened_for_family_terms_not_size(tmp_path):
+    from zkqec.firewall.lint import family_terms
+    assert family_terms("x" * 20000) == []
+    assert family_terms("use a bicycle construction") == ["bicycle"]

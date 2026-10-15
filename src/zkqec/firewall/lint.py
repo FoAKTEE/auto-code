@@ -23,6 +23,11 @@ FAMILY_TERMS = (
 _FAMILY_RE = [re.compile(t, re.IGNORECASE) for t in FAMILY_TERMS]
 
 
+def family_terms(text: str) -> list[str]:
+    """Named families/constructions found in a text (P-min screening for contracts and requests)."""
+    return [m.group(0) for pat in _FAMILY_RE for m in [pat.search(text)] if m]
+
+
 def lint_contract(text: str, profile: str) -> list[str]:
     """Return violations for a role contract under a prompt profile (empty list = pass)."""
     out = []

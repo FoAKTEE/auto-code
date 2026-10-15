@@ -18,7 +18,7 @@ from pydantic import Field
 
 from ..admission import Admission
 from ..contracts import (Frozen, Profile, Proposal, Reservation, TaskSA, TaskSF, content_hash)
-from ..firewall.lint import check_fingerprints, lint_contract, lint_request
+from ..firewall.lint import check_fingerprints, family_terms, lint_contract, lint_request
 from ..grammar import MANIFESTS, GrammarCaps
 from ..grammar.rawjson import check_raw_json
 from ..pipeline import Evaluation, Pipeline, build_registry, evaluator_domain
@@ -132,6 +132,8 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                                       "grammar": grammar_for(cfg.profile)}, sort_keys=True)
                 if lint_request(request, [task.task_id]):
                     raise RuntimeError("rendered request leaked a task identifier")
+                if cfg.profile.prompt == "P-min" and family_terms(request):
+                    raise RuntimeError("rendered P-min request names a code family/construction")
                 try:
                     job = book.reserve("propose", f"{task.task_id}:{i}", cfg.per_call,
                                        input_sha=content_hash(request))
@@ -149,14 +151,16 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 book.complete(job, gen, state, actual=res.usage or None)
                 book.settle(job)
                 proposal = None
-                if res.outcome == "completed" and res.text is not None:
+                # An "uncertain" call keeps its full reservation, but if it produced output the
+                # proposal is still evaluated: scientific authority comes from verifiers, not the call.
+                if res.outcome in ("completed", "uncertain") and res.text is not None:
                     try:
                         check_raw_json(res.text, max_bytes=2_000_000, max_depth=12, max_list_len=200_000)
                         proposal = Proposal.model_validate_json(res.text)
                     except Exception as e:                       # noqa: BLE001
                         history.append(Evaluation("malformed_proposal", {"reason": str(e)[:200]}))
                 if proposal is None:
-                    if res.outcome != "completed":
+                    if res.outcome not in ("completed",) and res.text is None:
                         history.append(Evaluation(res.outcome, {"reason": res.outcome}))
                     continue
                 p_sha = store.put_json(proposal.model_dump(mode="json"))
