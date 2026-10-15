@@ -298,14 +298,17 @@ class Admission:
                                                "action": action, "detail": detail})
 
     def record_controls(self, campaign_id: str, control_set: str, results: list[dict], *,
-                        evidence: str) -> None:
+                        evidence: str, on_close: Callable[[], None] | None = None) -> None:
         """Record a §I control summary (per control: N injections with k false authorizations,
-        M paired positives with j false rejections) backed by an evidence artifact."""
+        M paired positives with j false rejections) backed by an evidence artifact.
+        ``on_close()`` runs inside the same transaction (the control job's settlement, §L)."""
         with self.ledger.transaction():
             self._durable([evidence])
             self._append("controls_recorded", {"campaign_id": campaign_id,
                                                "control_set": control_set,
                                                "results": list(results), "evidence": evidence})
+            if on_close is not None:
+                on_close()
 
     def job_book(self, campaign_id: str, **namespace):
         """The campaign's operational job book, bound to this ledger: every settlement appends a

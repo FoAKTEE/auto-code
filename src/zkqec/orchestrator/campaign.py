@@ -5,8 +5,10 @@ freeze (clean evaluator tree, manifest, ``campaign_frozen`` ledger event) → pe
 and frozen-task checks, reserve → dispatch → provider call (call mode, no tools) → settle with
 actual usage (a ``job_settled`` event in the same transaction) → strict intake → frozen-task check →
 pipeline.evaluate → ``evaluation_recorded`` → stop when the task is satisfied or the proposal budget
-is spent → templated report (from the ledger only) → sealed bundle → offline audit (the Phase-1a
-confirmation: re-execution from the sealed bundle).
+is spent → [``controls``: the §I control suite in a scratch directory, as a verifier-class job reserved
+at freeze; its evidence stored and recorded with ``controls_recorded``] → templated report (from the
+ledger only) → sealed bundle → offline audit (the Phase-1a confirmation: re-execution from the
+sealed bundle, the control suite included).
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import Field
 
+from .. import controls
 from ..admission import Admission
 from ..contracts import (CampaignLabel, Frozen, Profile, Proposal, Reservation, TaskSA, TaskSF,
                          content_hash)
@@ -58,6 +61,7 @@ class CampaignConfig(Frozen):
                                             wall_seconds=1800, cpu_seconds=1800)
     deadline_seconds: int | None = Field(default=None, ge=0)   # campaign wall-clock deadline
     labels: tuple[CampaignLabel, ...] = ("single-implementation", "non-evaluation")
+    controls: Literal["p1a"] | None = None    # §I control set run after dispatch, before sealing
 
 
 @dataclass
@@ -149,6 +153,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     run = run_root / cfg.campaign_id
     run.mkdir(parents=True, exist_ok=False)
     store = ArtifactStore(run / "store")
+    schema_sha = store.put_bytes(schema_bytes, "json")       # frozen with the manifest (§I inputs)
     reg = build_registry(store)
     adm = Admission(run / "ledger.db", store, reg)
     dom = evaluator_domain(reg)
@@ -156,7 +161,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     manifest = {"campaign_id": cfg.campaign_id, "config_sha256": content_hash(config),
                 "config": config, "domain": dom, "registry": reg.manifest(),
                 "git": gs, "contract_sha256": content_hash(contract),
-                "evaluator_fingerprint": guard.manifest(),
+                "evaluator_fingerprint": guard.manifest(), "output_schema": schema_sha,
                 "provider": provider.name, "model": provider.model}
     manifest_sha = store.put_json(manifest)
     (run / "manifest.json").write_bytes(store.get_bytes(manifest_sha))
@@ -169,8 +174,12 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     book = adm.job_book(cfg.campaign_id, profile=prof)
     book.set_caps(cfg.caps)
     try:
-        # §K: confirmation capacity is reserved before any proposal is dispatched.
+        # §K: confirmation (and control) capacity is reserved before any proposal is dispatched.
         confirm_job = book.reserve("confirm", "confirmation", cfg.confirmation)
+        controls_job = None
+        if cfg.controls is not None:
+            controls_job = book.reserve("verify", f"controls:{cfg.controls}",
+                                        _verifier_reservation(cfg), input_sha=manifest_sha)
     except BaseException:
         adm.close()
         raise
@@ -262,6 +271,9 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 if ev.satisfies == "verified":
                     stop_reason[task.task_id] = "target_met"
                     break
+        control_summary = None
+        if controls_job is not None:
+            control_summary = _run_controls(cfg, adm, store, book, controls_job, run / "controls")
         report_md = render(adm, cfg.campaign_id)          # from the ledger only (§A5)
         (run / "report.md").write_text(report_md)
         totals = book.totals()
@@ -270,6 +282,8 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     out: dict[str, Any] = {"run_dir": str(run), "stop": stop_reason, "evaluations": evaluations,
                            "satisfied": sorted(k for k, v in stop_reason.items() if v == "target_met"),
                            "totals": totals}
+    if control_summary is not None:
+        out["controls"] = control_summary
     if seal_bundle:
         kw = {"archive": archive} if archive else {}
         entry = seal(run, cfg.campaign_id, run / "ledger.db", run / "store", report_md,
@@ -278,6 +292,43 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
         out.update(bundle=entry, audit={k: audit[k] for k in ("ok", "problems") if k in audit},
                    confirmation=confirmation_charge)
     return out
+
+
+def _verifier_reservation(cfg: CampaignConfig) -> Reservation:
+    return Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0,
+                       wall_seconds=cfg.verifier_wall_seconds, cpu_seconds=cfg.verifier_cpu_seconds)
+
+
+def _run_controls(cfg: CampaignConfig, adm: Admission, store: ArtifactStore, book, job: str,
+                  scratch: Path) -> dict[str, Any]:
+    """§I controls after dispatch and before sealing, as the verifier-class job reserved at freeze
+    (#13 pattern: measured CPU and wall charged). Inputs come from the frozen campaign; the evidence
+    goes through the sanitizing store and ``controls_recorded`` commits with the job's settlement.
+    A failing suite is charged, recorded as a ``controls_failed`` incident and records no summary."""
+    gen = book.dispatch(job)
+    t0, w0 = time.process_time(), time.monotonic()
+
+    def settle(state: str) -> None:
+        usage = {"cpu_seconds": max(0.0, time.process_time() - t0),
+                 "wall_seconds": max(0.0, time.monotonic() - w0)}
+        book.complete(job, gen, state, actual=usage)
+        book.settle(job)
+    try:
+        inputs = controls.campaign_inputs(adm, store, cfg.campaign_id)
+        evidence = controls.run_suite(cfg.controls, scratch, inputs)
+        sha = store.put_json(evidence)
+    except Exception as exc:                                       # noqa: BLE001
+        settle("failed")
+        adm.open_incident("controls_failed", {"control_set": cfg.controls,
+                                              "error": type(exc).__name__})
+        return {"control_set": cfg.controls, "ok": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    rows = evidence["results"]
+    adm.record_controls(cfg.campaign_id, cfg.controls, rows, evidence=sha,
+                        on_close=lambda: settle("completed"))
+    return {"control_set": cfg.controls, "ok": True, "evidence": sha,
+            **{k: sum(r[k] for r in rows) for k in ("injections", "false_authorizations",
+                                                    "paired_positives", "false_rejections")}}
 
 
 def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, job: str,

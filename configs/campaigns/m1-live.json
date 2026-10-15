@@ -1,5 +1,5 @@
 {
-  "campaign_id": "m1-live-2",
+  "campaign_id": "m1-live-3",
   "profile": {"knowledge": "K0", "prompt": "P-min", "grammar": ["G-open"]},
   "tasks": [
     {"kind": "S-A", "task_id": "sa-live-1",
@@ -21,5 +21,6 @@
                "wall_seconds": 900, "cpu_seconds": 0},
   "distance_budget": {"max_patterns": 3000000, "max_pairs": 200000000},
   "max_n": 200,
-  "labels": ["single-implementation", "non-evaluation", "M1-live-slice"]
+  "labels": ["single-implementation", "non-evaluation", "M1-live-slice"],
+  "controls": "p1a"
 }
