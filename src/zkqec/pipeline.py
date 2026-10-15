@@ -6,7 +6,10 @@ Flow for one proposal (prompt §7 step 3, appendix §B, §C, §F):
   so t = ⌈(d_min−1)/2⌉) → [S-F] L3 (logical_action) → DesignCandidate → resolver verdicts.
 
 Every verifier run is a job in the :class:`JobBook`; its settlement commits inside the admission's
-closing transaction. Agents never call this module; the orchestrator does.
+closing transaction (fenced by the lease generation). Recovery (§L): a settled job is only ever
+*read* (its execution's recorded closure); a settled job whose execution never closed gets its old
+execution closed as abandoned and a **new** reserved retry job (``retry_of``, its own execution key
+and reservation, fenced settlement). Agents never call this module; the orchestrator does.
 """
 from __future__ import annotations
 
@@ -25,13 +28,18 @@ from .contracts.registry import REGISTRY_VERSION
 from .grammar import GrammarCaps, MalformedProposal, build
 from .grammar.errors import UnsupportedFamily
 from .identity import code_sha
-from .orchestrator.jobs import JobBook
+from .orchestrator.jobs import JobBook, JobError
 from .store import ArtifactStore
 from .verify import DistanceBudget, analyze, certify_distance, implements
 from .verify.logical_action import MalformedInput, UnsupportedInput
 
 KERNEL_VERSION = "kernel-0.1.0+1"
 PIPELINE_VERSION = "1.0.0"
+MAX_ATTEMPTS = 3
+
+
+class RetriesExhausted(JobError):
+    """A verifier run could not be completed within MAX_ATTEMPTS reserved attempts."""
 
 
 def _dense(p: Presentation) -> tuple[np.ndarray, np.ndarray]:
@@ -111,9 +119,33 @@ class Pipeline:
     def _run(self, name: str, inputs: dict[str, str], key: str):
         res = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0, wall_seconds=0,
                           cpu_seconds=self.cpu_reservation)
-        job = self.book.reserve("verify", f"{name}:{key}", res, input_sha=content_hash(inputs))
-        if self.book.state(job) == "settled":            # idempotent replay of a finished job
-            return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=key)
+        prev = None
+        for attempt in range(MAX_ATTEMPTS):
+            ekey = key if attempt == 0 else f"{key}#retry{attempt}"
+            job = self.book.find(f"{name}:{ekey}") or self.book.reserve(
+                "verify", f"{name}:{ekey}", res, input_sha=content_hash(inputs), retry_of=prev)
+            state = self.book.state(job)
+            if state == "dispatched":
+                raise JobError(f"{job} holds a live lease; run recover() before resuming")
+            if state == "reserved":
+                done = self.adm.closed_report(name, inputs, self.domain, ekey)
+                if done is not None:                     # closed under another namespace's job
+                    self.book.cancel(job)
+                    return done
+                return self._execute(job, name, inputs, ekey)
+            if state != "settled":                       # completed/failed/uncertain: charge it
+                self.book.settle(job)
+            done = self.adm.closed_report(name, inputs, self.domain, ekey)
+            if done is not None and done.detail.get("error_type") != "abandoned":
+                return done                              # settled work is only ever read
+            if done is None:
+                eid = self.adm.execution_id_for(name, inputs, self.domain, ekey)
+                if self.adm.ledger.execution(eid) is not None:
+                    self.adm.abandon(eid, f"job {job} settled without a closure; retried")
+            prev = job
+        raise RetriesExhausted(f"{name}:{key}: no completed closure after {MAX_ATTEMPTS} attempts")
+
+    def _execute(self, job: str, name: str, inputs: dict[str, str], ekey: str):
         gen = self.book.dispatch(job)
         t0 = time.process_time()
 
@@ -122,7 +154,8 @@ class Pipeline:
             self.book.complete(job, gen, "completed" if outcome == "admitted" else "failed",
                                actual={"cpu_seconds": cpu})
             self.book.settle(job)
-        return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=key, on_close=settle)
+        return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=ekey,
+                                     on_close=settle)
 
     # -- evaluation --------------------------------------------------------------------------------
     def evaluate(self, proposal: Proposal, task: TaskSA | TaskSF) -> Evaluation:

@@ -323,6 +323,12 @@ class JobBook:
     def state(self, job_id: str) -> str:
         return self._row(job_id)[1]
 
+    def find(self, idem_key: str) -> str | None:
+        """The job of this namespace with this idempotency key, if any."""
+        row = self.conn.execute("SELECT job_id FROM ops_jobs WHERE campaign=? AND idem_key=?",
+                                (self.campaign, idem_key)).fetchone()
+        return None if row is None else row[0]
+
     def audit(self) -> list[str]:
         """Replay ops_log and compare with ops_jobs (final state and generation per job)."""
         last: dict[str, tuple[str, int]] = {}

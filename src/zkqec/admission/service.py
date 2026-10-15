@@ -244,6 +244,41 @@ class Admission:
                 raise AdmissionRefused(f"input {name}={sha} failed verification: {exc}") from None
         return loaded
 
+    @staticmethod
+    def _execution_id(spec: Registered, inputs: dict[str, str], domain: str, key: str) -> str:
+        return content_hash({"issuer": spec.name, "version": spec.version,
+                             "inputs": dict(sorted(inputs.items())), "domain": domain,
+                             "key": str(key)})
+
+    def execution_id_for(self, name: str, inputs: dict[str, str], domain: str, key: str) -> str:
+        """The deterministic execution id of an idempotency-keyed run."""
+        entry = self.registry._entries.get(name)
+        if entry is None:
+            raise KeyError(f"unregistered issuer {name!r}")
+        return self._execution_id(entry, inputs, domain, key)
+
+    def closed_report(self, name: str, inputs: dict[str, str], domain: str,
+                      key: str) -> ExecutionReport | None:
+        """Read-only: the recorded closure of a keyed execution, or ``None`` if it is not closed.
+        Never runs anything (recovery reads settled work only through this; §L)."""
+        ex = self.ledger.execution(self.execution_id_for(name, inputs, domain, key))
+        return None if ex is None else self._replay(ex)
+
+    def abandon(self, execution_id: str, reason: str) -> bool:
+        """Close an OPEN execution as ``crashed`` (abandoned after recovery): a late completion of
+        the old run is then a duplicate completion. Returns False if it was already closed."""
+        detail = {"error_type": "abandoned",
+                  "message": self.store.sanitizer.sanitize_text(str(reason)[:MAX_MESSAGE])[0]}
+        with self.ledger.transaction():
+            if self.ledger.execution(execution_id) is None:
+                raise KeyError(f"no execution {execution_id}")
+            if self.ledger.closure(execution_id) is not None:
+                return False
+            self._append("execution_closed", {
+                "execution_id": execution_id, "outcome": "crashed", "completion": "crashed",
+                "records": [], "detail": detail})
+        return True
+
     def _open(self, spec: Registered, inputs: dict[str, str], domain: str,
               key: str | None) -> dict:
         check_sha(domain)
@@ -251,8 +286,7 @@ class Admission:
         if key is None:
             execution_id = uuid.uuid4().hex
         else:
-            execution_id = content_hash({"issuer": spec.name, "version": spec.version,
-                                         "inputs": inputs, "domain": domain, "key": str(key)})
+            execution_id = self._execution_id(spec, inputs, domain, key)
         with self.ledger.transaction():
             if self.ledger.execution(execution_id) is None:
                 for sha in inputs.values():
