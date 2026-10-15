@@ -89,9 +89,60 @@
         "usd": 0.652376,
         "wall_seconds": 919.446
       }
+    },
+    {
+      "audit": {
+        "ok": true,
+        "problems": []
+      },
+      "bundle_sha256": "3bdd699b0b2d6a41ce64205aeffa6b8d98635c2c4510723983a86db1793b107a",
+      "bytes": 131856482,
+      "campaign_id": "m1-live-3",
+      "closures": {
+        "evaluator": "a68decaf6fe7f90ef1fb3f018788061321538506d3ee05da8c31f7a4b7a8c41e",
+        "git_commit": "7d8c36d2e62829d83eefb31ad3032f04863539c7",
+        "lock_sha256": "4347389f85529a2da685f464f12a6746d6208da6ba1c7ec995afa535ac2563b4",
+        "runtime": "608529a930a6266bb3fd617dc5c281d3ef39b8abce833303d577aa0321677551",
+        "wheelhouse": "f9a14614c0d32c0b05de8a18fbde3fd7648b13dc447df33215330dba7a338cfb"
+      },
+      "evaluated": [
+        {
+          "candidate": "1016c96ed5f742fc",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sa-live-1"
+        },
+        {
+          "candidate": "e1eafd3211801198",
+          "satisfies_task": "verified",
+          "source": "designer:claude",
+          "task": "sf-live-1"
+        }
+      ],
+      "evaluator_commit": "7d8c36d2e62829d83eefb31ad3032f04863539c7",
+      "format": "zkqec-bundle-v2",
+      "labels": [
+        "single-implementation",
+        "non-evaluation",
+        "M1-live-slice"
+      ],
+      "ledger_head": {
+        "hash": "9fdaf0e7753b4363cc262cf8d491d65a4af4f784f1472ee100f9de043c2f9ae3",
+        "seq": 50
+      },
+      "note": "hardened code (7d8c36d); P1a controls 0/37, 0/24; M1 acceptance run",
+      "path": "/data/haiyangw/claude/zkqec-archive/bundles/m1-live-3/3bdd699b0b2d6a41ce64205aeffa6b8d98635c2c4510723983a86db1793b107a.tar.zst",
+      "spend": {
+        "cpu_seconds": 9.91395,
+        "input_tokens": 6503.0,
+        "output_tokens": 16149.0,
+        "requests": 2.0,
+        "usd": 0.359528,
+        "wall_seconds": 167.864
+      }
     }
   ],
-  "indexed_utc": "2026-10-15T12:39:45Z",
-  "indexed_with_commit": "3f046ed2fa5a4de83712ec3e7ea6e95495c0bd00",
+  "indexed_utc": "2026-10-15T13:13:43Z",
+  "indexed_with_commit": "7d8c36d2e62829d83eefb31ad3032f04863539c7",
   "schema": "zkqec.bundle-index/1"
 }

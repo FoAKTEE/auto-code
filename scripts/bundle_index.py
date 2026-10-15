@@ -28,7 +28,18 @@ OUT = REPO / "results" / "bundles"
 def _report_facts(report: str) -> dict:
     labels = re.search(r"^- Labels: (.*)$", report, re.M)
     evaluated = re.findall(r"^\| `([^`]+)` \| ([^|]+) \| `([0-9a-f]+)` \| \**([a-z_]+)\** \|", report, re.M)
-    spend = dict(re.findall(r"^\| ([a-z_]+) \| ([0-9.e+-]+) \| [0-9.e+-]+ \|$", report, re.M))
+    spend: dict[str, str] = {}
+    lines = report.splitlines()
+    for i, line in enumerate(lines):                # the budget/accounting table: "| unit | ... spent ..."
+        cols = [c.strip() for c in line.strip("|").split("|")]
+        if cols[:1] == ["unit"] and "spent" in cols:
+            j = cols.index("spent")
+            for row in lines[i + 2:]:
+                cells = [c.strip() for c in row.strip("|").split("|")]
+                if not row.startswith("|") or len(cells) != len(cols):
+                    break
+                spend[cells[0]] = cells[j]
+            break
     return {"labels": [x.strip() for x in labels.group(1).split(",")] if labels else [],
             "evaluated": [{"task": t, "source": s.strip(), "candidate": c, "satisfies_task": v}
                           for t, s, c, v in evaluated],
