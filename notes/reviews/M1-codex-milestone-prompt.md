@@ -1,0 +1,21 @@
+You are the independent reviewer for milestone M1 of the zero-knowledge QEC discovery workflow in this repository (branch zkqec-dev). You previously reviewed the committed M1 code (range 5b375f7..3753ffa) and blocked M1 acceptance with 3 blockers and 14 majors: notes/reviews/M1-codex-partial.md. The triage is notes/reviews/M1-triage-partial.md; the per-finding hardening response is notes/reviews/M1-hardening.md.
+
+Your task: decide whether M1 can be ACCEPTED. Read-only review; do not modify files.
+
+Binding plan: prompt/00-master-prompt.md (v0.5.1; §M1 build + accept lists, §14 decisions D4/D5/D9/D10/D11/D16, §15 definition of done Phase 1a) and prompt/01-technical-contracts.md (v0.5; especially §A, §C, §I, §J, §K, §L, §M, §N, §O).
+
+Review range: 3753ffa..HEAD (git log --oneline 3753ffa..HEAD). It contains:
+1. the 19 hardening commits for your 17 findings (82ccb1e..f57d9cb);
+2. lead fixes: daf36b4 (broker streams model responses; m1-live-2 duplicate-request root cause), eed11b3 (declared list-price table), 9da3430 (qualification of the production designer schema), 3f046ed (per-call USD reservation must cover the §K maximum charge of its ceilings; run_live refuses otherwise), 69bb4c6 (BLAS threads pinned when zkqec is imported first; CPU charging);
+3. the P1a control suite: 2ec9572, a46b51e, c61dc7d, 5bc3182, 73c27cf (src/zkqec/controls/, notes/build/controls.md);
+4. measured certification feasibility tables and the D10 decision (scripts/feasibility_tables.py, results/feasibility/, notes/DECISIONS.md G8) if present at HEAD;
+5. live evidence: results/bundles/index.{json,md} (scripts/bundle_index.py), notes/postmortems/M1-slice.md, the m1-live-3 run (configs/campaigns/m1-live.json at 7d8c36d; its report and bundle are referenced in the postmortem and index).
+Host evidence: runs/ is gitignored but readable: runs/qualify/20261015T123410Z/report.md (latest M0 qualification), runs/campaigns/m1-live-3/report.md, runs/campaigns/m1-live-3.out.
+
+Questions, in priority order:
+A. For each of your 17 prior findings: is it actually fixed at HEAD (cite code), is the regression test meaningful (would it fail on the pre-fix code), and is the stated residual risk acceptable for Phase 1a? Mark each FIXED / PARTIAL / NOT FIXED.
+B. New defects introduced by the hardening or the later commits (correctness, evidence-integrity, accounting, containment, durability, reproducibility). Look especially at: the streaming tee in src/zkqec/broker/addon.py (can a model response now reach the client without being logged or counted; content-encoding handling; abort paths), the reservation floor (src/zkqec/agents/providers.py) vs §K, the task-hash gate and boundary checks (src/zkqec/orchestrator/freeze.py, campaign.py), the controls' definitions of "false authorization" (an injection counts as authorized only if resolver, ledger verify and the audit replay all accept it) and the fault-injection issuer used only in scratch ledgers, the audit's byte-identical re-run of the controls, and whether anything in controls/ can leak into a campaign ledger or registry.
+C. M1 acceptance: walk the §M1 Accept list and the Phase 1a definition of done item by item and state PASS / FAIL / NOT EVIDENCED with the evidence location. Include: qecforge reference table, Steane t=2, deterministic positive S-A/S-F through the production resolver, paired negatives, admission-only test, semantic-conflict control, one live S-A + one live S-F within D5 producing sealed bundles that reconstruct offline (labelled single-implementation, non-evaluation), cost telemetry, postmortem, feasibility tables setting D10, every Codex review triaged.
+D. Phase 1b gate (D4): are any blockers open; does the projected Phase-1b cost from M1 telemetry fit D5 (M3 smoke <= 10 USD, P1b dev pilot <= 150 USD)? State the projection you derive and its assumptions.
+
+Output format (markdown): a one-line verdict first ("ACCEPT M1", "ACCEPT M1 WITH CONDITIONS", or "BLOCK M1"), then sections A–D. Every finding: severity (blocker/major/minor), file:line, failure scenario, suggested fix. Be concrete and adversarial; do not pad. Severity guide: blocker = could produce a false scientific claim, a false acceptance, an unbounded spend or a containment break; major = evidence/accounting/reproducibility gap that must be fixed before Phase 1b; minor = everything else.
