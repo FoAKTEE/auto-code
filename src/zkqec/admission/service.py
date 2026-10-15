@@ -21,7 +21,7 @@ import re
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from zkqec.contracts import Receipt, VerifierResult, canonical_json, content_hash
 from zkqec.contracts.registry import REGISTRY_VERSION
@@ -102,7 +102,14 @@ class Admission:
 
     # -- verifiers -------------------------------------------------------------------------------
     def run_verifier(self, name: str, inputs: dict[str, str], domain: str, *,
-                     idempotency_key: str | None = None) -> ExecutionReport:
+                     idempotency_key: str | None = None,
+                     on_close: Callable[[str], None] | None = None) -> ExecutionReport:
+        """Run a registered verifier and admit its results.
+
+        ``on_close(outcome)`` runs INSIDE the closing write transaction (outcome ``admitted``,
+        ``refused`` or ``crashed``) so operational job settlement and accounting commit atomically
+        with the admission (appendix §L). It is not called for replayed executions.
+        """
         spec = self.registry.get(name, "verifier")
         loaded = self._load_inputs(inputs)
         ex = self._open(spec, inputs, domain, idempotency_key)
@@ -112,14 +119,15 @@ class Admission:
         try:
             raw = spec.fn(**loaded)
         except Exception as exc:                                    # noqa: BLE001
-            return self._close_crashed(ex, type(exc).__name__, str(exc))
+            return self._close_crashed(ex, type(exc).__name__, str(exc), on_close)
         try:
             results = _revalidate_results(raw)
         except Exception as exc:                                    # noqa: BLE001
-            return self._close_crashed(ex, "malformed_result", str(exc))
-        return self._complete(ex, results)
+            return self._close_crashed(ex, "malformed_result", str(exc), on_close)
+        return self._complete(ex, results, on_close)
 
-    def _complete(self, ex: dict, results: Iterable[VerifierResult]) -> ExecutionReport:
+    def _complete(self, ex: dict, results: Iterable[VerifierResult],
+                  on_close: Callable[[str], None] | None = None) -> ExecutionReport:
         items, refs, problems = [], set(ex["inputs"].values()), []
         inputs = set(ex["inputs"].values())
         for res in results:
@@ -134,7 +142,7 @@ class Admission:
             if self.store.sanitizer.detect_obj(payload):
                 problems.append(f"{prop.predicate}: secret-like content in the result")
             items.append(("receipt_admitted", rid, payload))
-        return self._commit(ex, items, refs, problems)
+        return self._commit(ex, items, refs, problems, on_close)
 
     # -- identity --------------------------------------------------------------------------------
     def run_identity(self, name: str, presentation: str, domain: str, *,
@@ -267,7 +275,8 @@ class Admission:
             raise AdmissionRefused("execution was refused earlier", report)
         return report
 
-    def _close_crashed(self, ex: dict, error_type: str, message: str) -> ExecutionReport:
+    def _close_crashed(self, ex: dict, error_type: str, message: str,
+                       on_close: Callable[[str], None] | None = None) -> ExecutionReport:
         sanitize = self.store.sanitizer.sanitize_text
         detail = {"error_type": sanitize(error_type[:100])[0],
                   "message": sanitize(message[:MAX_MESSAGE])[0]}
@@ -277,10 +286,13 @@ class Admission:
             self.ledger.append("execution_closed", {
                 "execution_id": ex["execution_id"], "outcome": "crashed", "completion": "crashed",
                 "records": [], "detail": detail})
+            if on_close is not None:
+                on_close("crashed")
         return self._report(ex, "crashed", detail=detail)
 
     def _commit(self, ex: dict, items: list[tuple[str, str, dict]], refs: set[str],
-                problems: list[str]) -> ExecutionReport:
+                problems: list[str],
+                on_close: Callable[[str], None] | None = None) -> ExecutionReport:
         ids = tuple(sorted({rid for _, rid, _ in items}))
         refused = None
         with self.ledger.transaction():
@@ -302,6 +314,8 @@ class Admission:
                     "execution_id": ex["execution_id"], "outcome": "refused", "completion": None,
                     "records": [], "detail": detail})
                 refused = self._report(ex, "refused", incidents=incidents, detail=detail)
+                if on_close is not None:
+                    on_close("refused")
             else:
                 written = set()
                 for kind, rid, payload in items:
@@ -317,6 +331,8 @@ class Admission:
                 quarantined, incidents = self._quarantine_conflicts(ex["domain"])
                 report = self._report(ex, "admitted", records=ids, quarantined=quarantined,
                                       incidents=incidents)
+                if on_close is not None:
+                    on_close("admitted")
         if refused is not None:
             raise AdmissionRefused("; ".join(refused.detail["problems"]), refused)
         return report
