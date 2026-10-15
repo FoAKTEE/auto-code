@@ -298,9 +298,10 @@ def test_run_live_hands_its_broker_to_the_campaign(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "run_campaign", fake_run)
     from pathlib import Path
     path = Path(__file__).resolve().parents[2] / "configs" / "campaigns" / "m1-live.json"
-    out = live.run_live(CampaignConfig.model_validate_json(path.read_text()), tmp_path)
+    cfg = CampaignConfig.model_validate_json(path.read_text())
+    out = live.run_live(cfg, tmp_path)
     assert isinstance(seen.get("broker"), Stub)
-    assert sorted(p.name for p in (tmp_path / "m1-live-4").iterdir()) == []
+    assert sorted(p.name for p in (tmp_path / cfg.campaign_id).iterdir()) == []
     assert "broker_manifest" not in out
 
 

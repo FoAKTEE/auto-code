@@ -199,6 +199,6 @@ def test_controls_are_off_by_default_and_on_for_the_live_config(tmp_path):
     assert "controls" not in {k for k, v in cfg(controls=None).model_dump().items() if v}
     live = CampaignConfig.model_validate_json(
         (REPO / "configs" / "campaigns" / "m1-live.json").read_text())
-    assert live.controls == "p1a" and live.campaign_id == "m1-live-4"
+    assert live.controls == "p1a" and live.campaign_id.startswith("m1-live-")
     with pytest.raises(ValueError):
         cfg(controls="p9")

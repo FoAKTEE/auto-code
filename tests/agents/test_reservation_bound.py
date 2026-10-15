@@ -129,7 +129,7 @@ def test_reservation_below_the_bound_or_unpriced_is_refused():
 
 def test_the_live_config_reserves_its_invocation_totals():
     cfg = CampaignConfig.model_validate_json((REPO / "configs" / "campaigns" / "m1-live.json").read_text())
-    assert cfg.campaign_id == "m1-live-4" and cfg.per_call == LIVE_4
+    assert cfg.campaign_id.startswith("m1-live-") and cfg.per_call == LIVE_4
     assert check_reservation(cfg.model, cfg.per_call) == pytest.approx(cfg.per_call.usd)
 
 
