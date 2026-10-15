@@ -64,6 +64,11 @@ class Provider(Protocol):
              reservation: Reservation) -> CallResult: ...
 
 
+def profile_key(profile: Profile) -> str:
+    """Namespace component for a profile (§N), e.g. ``K0.P-min.G-open``."""
+    return ".".join((profile.knowledge, profile.prompt, "+".join(profile.grammar)))
+
+
 def contract_path(profile: Profile) -> Path:
     return REPO / "roles" / "designer" / f"{profile.prompt}.md"
 
@@ -125,7 +130,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     reg = build_registry(store)
     adm = Admission(run / "ledger.db", store, reg)
     dom = evaluator_domain(reg)
-    book = JobBook(adm.ledger.conn, cfg.campaign_id)
+    book = JobBook(adm.ledger.conn, cfg.campaign_id, profile=profile_key(cfg.profile))
     book.set_caps(cfg.caps)
     pipe = Pipeline(adm, store, book, dom, caps=GrammarCaps(max_n=cfg.max_n),
                     distance_budget=cfg.distance_budget)

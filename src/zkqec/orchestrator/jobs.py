@@ -6,8 +6,13 @@ appended to the immutable ``ops_log``.
 
 Lifecycle: ``reserved → dispatched → {completed | uncertain | failed} → settled``.
 
+* Every job belongs to one **namespace** (campaign / arm / split / profile, §N). Idempotency keys are
+  unique per namespace, and every lookup and update is restricted to the book's namespace: a book
+  never sees, dispatches, completes or settles another namespace's job.
 * ``reserve`` checks every budget unit atomically (open reservations + spent ≤ cap) before anything
-  external happens. Each retry is a new job with its own reservation (``retry_of``).
+  external happens. A repeated idempotency key returns the existing job only for the identical
+  request (kind, input hash, reservation, retry_of); anything else is refused. Each retry is a new
+  job with its own reservation (``retry_of``: a finished job of the same namespace and kind).
 * ``dispatch`` persists the dispatch intent and bumps the lease generation BEFORE the caller launches
   the external action (CLI, verifier). A crash after this point leaves the job ``dispatched``;
   ``recover`` turns it into ``uncertain``, which keeps its full reservation.
@@ -38,10 +43,10 @@ UNITS = ("usd", "requests", "input_tokens", "output_tokens", "wall_seconds", "cp
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ops_jobs (
   job_id TEXT PRIMARY KEY, campaign TEXT NOT NULL, kind TEXT NOT NULL,
-  idem_key TEXT NOT NULL UNIQUE, input_sha TEXT, retry_of TEXT,
+  idem_key TEXT NOT NULL, input_sha TEXT, retry_of TEXT,
   state TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
   reservation TEXT NOT NULL, actual TEXT, outcome TEXT, result_sha TEXT, overrun INTEGER DEFAULT 0,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (campaign, idem_key));
 CREATE TABLE IF NOT EXISTS ops_caps (campaign TEXT NOT NULL, unit TEXT NOT NULL, cap REAL NOT NULL,
   PRIMARY KEY (campaign, unit));
 CREATE TABLE IF NOT EXISTS ops_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
@@ -116,10 +121,24 @@ def _res_dict(r: Reservation) -> dict:
             "cpu_seconds": r.cpu_seconds}
 
 
+def namespace(campaign: str, arm: str | None = None, split: str | None = None,
+              profile: str | None = None) -> str:
+    """The §N namespace key: ``campaign`` alone, or ``campaign/arm/split/profile``."""
+    parts = (campaign, arm, split, profile)
+    for x in parts:
+        if x is not None and (not isinstance(x, str) or not x or "/" in x):
+            raise JobError(f"bad namespace component {x!r}")
+    if not campaign:
+        raise JobError("a namespace needs a campaign")
+    return campaign if parts[1:] == (None, None, None) else "/".join(x or "-" for x in parts)
+
+
 class JobBook:
-    def __init__(self, conn: sqlite3.Connection, campaign: str):
+    def __init__(self, conn: sqlite3.Connection, campaign: str, *, arm: str | None = None,
+                 split: str | None = None, profile: str | None = None):
         self.conn = conn
-        self.campaign = campaign
+        self.namespace = namespace(campaign, arm, split, profile)
+        self.campaign = self.namespace          # column value: the full namespace key
         # sqlite3.executescript would COMMIT an open transaction; run statements one by one.
         for stmt in _SCHEMA.strip().split(";\n"):
             if stmt.strip():
@@ -146,10 +165,11 @@ class JobBook:
 
     def _row(self, job_id: str) -> sqlite3.Row:
         cur = self.conn.execute("SELECT job_id, state, generation, reservation, actual, outcome, kind "
-                                "FROM ops_jobs WHERE job_id=?", (job_id,))
+                                "FROM ops_jobs WHERE job_id=? AND campaign=?",
+                                (job_id, self.campaign))
         row = cur.fetchone()
         if row is None:
-            raise JobError(f"unknown job {job_id}")
+            raise JobError(f"unknown job {job_id} in namespace {self.campaign}")
         return row
 
     def _move(self, job_id: str, to: str, **fields) -> None:
@@ -157,8 +177,10 @@ class JobBook:
         if to not in TRANSITIONS[state]:
             raise IllegalTransition(f"{job_id}: {state} -> {to} is not allowed")
         sets = ", ".join(f"{k}=?" for k in ("state", "updated_at", *fields))
-        self.conn.execute(f"UPDATE ops_jobs SET {sets} WHERE job_id=?",
-                          (to, _now(), *fields.values(), job_id))
+        cur = self.conn.execute(f"UPDATE ops_jobs SET {sets} WHERE job_id=? AND campaign=?",
+                                (to, _now(), *fields.values(), job_id, self.campaign))
+        if cur.rowcount != 1:
+            raise JobError(f"{job_id}: update outside namespace {self.campaign}")
 
     # -- caps and totals ------------------------------------------------------------------------
     def set_caps(self, caps: dict[str, float]) -> None:
@@ -195,12 +217,25 @@ class JobBook:
     def reserve(self, kind: str, idem_key: str, reservation: Reservation, *,
                 input_sha: str | None = None, retry_of: str | None = None) -> str:
         """Reserve a job's worst-case budget atomically; idempotent on ``idem_key``."""
+        want = _res_dict(reservation)
         with self._tx():
-            row = self.conn.execute("SELECT job_id FROM ops_jobs WHERE idem_key=?",
-                                    (idem_key,)).fetchone()
+            row = self.conn.execute(
+                "SELECT job_id, kind, input_sha, reservation, retry_of FROM ops_jobs "
+                "WHERE campaign=? AND idem_key=?", (self.campaign, idem_key)).fetchone()
             if row is not None:
+                if (row[1], row[2], json.loads(row[3]), row[4]) != (kind, input_sha, want, retry_of):
+                    raise JobError(f"idempotency key {idem_key!r} reused for a different request")
                 return row[0]
-            caps, totals, want = self.caps(), self.totals(), _res_dict(reservation)
+            if retry_of is not None:
+                prev = self.conn.execute("SELECT kind, state FROM ops_jobs WHERE job_id=? AND "
+                                         "campaign=?", (retry_of, self.campaign)).fetchone()
+                if prev is None:
+                    raise JobError(f"retry_of {retry_of} is not a job of {self.campaign}")
+                if prev[0] != kind:
+                    raise JobError(f"retry_of {retry_of} is a {prev[0]} job, not {kind}")
+                if prev[1] in ("reserved", "dispatched"):
+                    raise JobError(f"retry_of {retry_of} is still {prev[1]}")
+            caps, totals = self.caps(), self.totals()
             for unit, cap in caps.items():
                 used = totals[unit]["spent"] + totals[unit]["open"]
                 if used + want[unit] > cap + 1e-12:
@@ -292,13 +327,15 @@ class JobBook:
         """Replay ops_log and compare with ops_jobs (final state and generation per job)."""
         last: dict[str, tuple[str, int]] = {}
         for job_id, event, gen in self.conn.execute(
-                "SELECT job_id, event, generation FROM ops_log ORDER BY seq"):
+                "SELECT job_id, event, generation FROM ops_log WHERE job_id IN "
+                "(SELECT job_id FROM ops_jobs WHERE campaign=?) ORDER BY seq", (self.campaign,)):
             state = {"recovered_uncertain": "uncertain", "expired": "uncertain",
                      "cancelled": "settled"}.get(event, event)
             last[job_id] = (state, gen)
         problems = []
         for job_id, state, gen, res, actual in self.conn.execute(
-                "SELECT job_id, state, generation, reservation, actual FROM ops_jobs"):
+                "SELECT job_id, state, generation, reservation, actual FROM ops_jobs WHERE campaign=?",
+                (self.campaign,)):
             if last.get(job_id) != (state, gen):
                 problems.append(f"{job_id}: table {(state, gen)} != log {last.get(job_id)}")
             for name, text in (("reservation", res), ("charge", actual)):

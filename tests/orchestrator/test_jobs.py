@@ -196,3 +196,65 @@ def test_audit_flags_non_finite_charges(book):
     book.conn.execute("UPDATE ops_jobs SET actual = ? WHERE job_id = ?",
                       ('{"usd": NaN}', j))
     assert any("finite" in p for p in book.audit())
+
+
+# --- Codex M1 review #6: ownership and idempotency are namespace-scoped ----------------------------
+def test_a_job_is_invisible_to_other_campaigns(tmp_path):
+    from zkqec.orchestrator.jobs import JobError
+    led = Ledger(tmp_path / "l.db")
+    a = JobBook(led.conn, "camp-a"); a.set_caps(CAPS)
+    b = JobBook(led.conn, "camp-b"); b.set_caps({"usd": 0.0})
+    ja = a.reserve("propose", "same-key", R)
+    with pytest.raises(BudgetExceeded):             # B cannot ride on A's reservation
+        b.reserve("propose", "same-key", R)
+    for call in (lambda: b.dispatch(ja), lambda: b.state(ja), lambda: b.cancel(ja)):
+        with pytest.raises(JobError):
+            call()
+    ga = a.dispatch(ja)
+    for call in (lambda: b.complete(ja, ga, "completed", actual={"usd": 0.0}),
+                 lambda: b.expire(ja, ga, killed=True), lambda: b.settle(ja)):
+        with pytest.raises(JobError):
+            call()
+    assert a.state(ja) == "dispatched" and b.recover() == []
+    c = JobBook(led.conn, "camp-c"); c.set_caps(CAPS)
+    assert c.reserve("propose", "same-key", R) != ja      # same key, independent namespace
+    led.close()
+
+
+def test_namespace_includes_arm_split_and_profile(tmp_path):
+    led = Ledger(tmp_path / "l.db")
+    x = JobBook(led.conn, "camp", arm="zero", split="dev", profile="K0.P-min.G-open")
+    y = JobBook(led.conn, "camp", arm="b1", split="dev", profile="K0.P-min.G-open")
+    x.set_caps(CAPS); y.set_caps(CAPS)
+    assert x.reserve("propose", "k", R) != y.reserve("propose", "k", R)
+    assert x.namespace != y.namespace and x.totals()["usd"]["open"] == 1.0
+    led.close()
+
+
+def test_idempotent_reserve_rejects_a_different_request(book):
+    from zkqec.orchestrator.jobs import JobError
+    j = book.reserve("propose", "k", R, input_sha="a" * 64)
+    assert book.reserve("propose", "k", R, input_sha="a" * 64) == j
+    other = Reservation(usd=0.5, requests=1, input_tokens=1, output_tokens=1, wall_seconds=1,
+                        cpu_seconds=0)
+    for kw in ({"kind": "verify"}, {"input_sha": "b" * 64}, {"reservation": other}):
+        args = {"kind": "propose", "reservation": R, "input_sha": "a" * 64, **kw}
+        with pytest.raises(JobError, match="idempotency"):
+            book.reserve(args["kind"], "k", args["reservation"], input_sha=args["input_sha"])
+
+
+def test_retry_ownership_is_checked(tmp_path):
+    from zkqec.orchestrator.jobs import JobError
+    led = Ledger(tmp_path / "l.db")
+    a = JobBook(led.conn, "camp-a"); a.set_caps(CAPS)
+    b = JobBook(led.conn, "camp-b"); b.set_caps(CAPS)
+    ja = a.reserve("propose", "k", R)
+    with pytest.raises(JobError):
+        b.reserve("propose", "k-retry", R, retry_of=ja)       # another campaign's job
+    with pytest.raises(JobError):
+        a.reserve("verify", "k-retry", R, retry_of=ja)        # a different kind
+    with pytest.raises(JobError):
+        a.reserve("propose", "k-retry", R, retry_of=ja)       # still reserved: nothing to retry
+    a.cancel(ja)
+    assert a.reserve("propose", "k-retry", R, retry_of=ja)
+    led.close()
