@@ -73,11 +73,11 @@ def test_controls_are_recorded_in_the_ledger_and_returned(ran):
     assert content_hash(evidence) == rec["evidence"]
     assert len(rec["results"]) == 20
     assert out["controls"] == {
-        "control_set": "p1a", "ok": True, "evidence": rec["evidence"],
+        "control_set": "p1a", "ok": True, "passed": True, "evidence": rec["evidence"],
         "injections": sum(r["injections"] for r in rec["results"]),
         "false_authorizations": 0,
         "paired_positives": sum(r["paired_positives"] for r in rec["results"]),
-        "false_rejections": 0}
+        "false_rejections": 0, "outcome_mismatches": 0}
     # the inputs come from the frozen campaign: its manifest's output schema, its profile families
     manifest = store.get_json(adm.ledger.campaign("ctl")["manifest"])
     schema = json.loads((REPO / "roles" / "designer" / "output.schema.json").read_text())
@@ -91,6 +91,7 @@ def test_report_renders_the_recorded_controls(ran):
     out, run, adm, store = ran
     md = (run / "report.md").read_text()
     assert "Control set `p1a`" in md and "none recorded" not in md
+    assert "- Result: **PASSED**" in md and "FAILED" not in md
     assert "| task_mutated | 0/3 | 0/1 |" in md and "| semantic_conflict | 0/2 | 0/2 |" in md
     c = out["controls"]
     assert f"False authorizations: 0/{c['injections']}; false rejections: 0/" \
@@ -113,23 +114,84 @@ def test_the_control_run_is_a_charged_verifier_job_reserved_before_dispatch(ran)
     assert adm.verify().ok and audit_campaign(adm, store, "ctl") == []
 
 
-def test_a_failing_control_suite_is_charged_and_recorded_as_an_incident(tmp_path, monkeypatch):
-    import zkqec.controls as controls
+def test_a_failing_control_suite_keeps_its_evidence_and_fails_the_campaign(tmp_path, monkeypatch):
+    """Codex M1 milestone review B3: a suite exception preserves the evidence produced so far, writes
+    a failed-controls record, and the audit and the report show the required set as FAILED (it used
+    to report "controls not supplied" with a clean audit)."""
+    from zkqec.controls import p1a
+    from zkqec.controls.record import audit_controls
+    names = [c.name for c in p1a.CONTROL_SETS["p1a"]]
+    orig = p1a._run_control
 
-    def broken(*a, **k):
-        raise RuntimeError("injected suite failure")
-    monkeypatch.setattr(controls, "run_suite", broken)
+    def third_fails(c, root, inputs):
+        if c.name == names[2]:
+            raise RuntimeError("injected suite failure")
+        return orig(c, root, inputs)
+    monkeypatch.setattr(p1a, "_run_control", third_fails)
     out = run_campaign(cfg(), ReplayDouble([GOOD]), tmp_path, require_clean=False,
                        seal_bundle=False)
-    assert out["controls"]["ok"] is False and "RuntimeError" in out["controls"]["error"]
+    c = out["controls"]
+    assert c["ok"] is False and c["passed"] is False and "RuntimeError" in c["error"]
     store = ArtifactStore(tmp_path / "ctl" / "store")
+    evidence = store.get_json(c["evidence"])
+    assert evidence["kind"] == p1a.FAILED_KIND and evidence["control_set"] == "p1a"
+    assert evidence["failed"]["control"] == names[2] and "RuntimeError" in evidence["failed"]["error"]
+    assert [x["control"] for x in evidence["partial"]["controls"]] == names[:2]
     with Admission(tmp_path / "ctl" / "ledger.db", store, build_registry(store)) as adm:
         assert adm.ledger.controls("ctl") == []
-        cats = [e.payload["category"] for e in adm.ledger.events() if e.kind == "incident_opened"]
-        assert cats == ["controls_failed"]
+        (inc,) = [e.payload for e in adm.ledger.events() if e.kind == "incident_opened"]
+        assert inc["category"] == "controls_failed" and inc["detail"]["evidence"] == c["evidence"]
         (s,) = [s for s in adm.ledger.settlements("ctl") if s["idem_key"] == "controls:p1a"]
-        assert s["from_state"] == "failed" and audit_campaign(adm, store, "ctl") == []
-    assert "none recorded" in (tmp_path / "ctl" / "report.md").read_text()
+        assert s["from_state"] == "failed" and s["result"] == c["evidence"]
+        assert audit_campaign(adm, store, "ctl") == []          # the accounting itself is sound
+        problems, _ = audit_controls(adm, store, "ctl", tmp_path / "rerun-scratch")
+        assert any("required control set p1a" in p and "not recorded" in p for p in problems)
+        md = (tmp_path / "ctl" / "report.md").read_text()
+        assert lint(md, adm, "ctl") == []
+    assert "not supplied" not in md and "**FAILED**" in md and c["evidence"] in md
+
+
+def test_a_reproducible_false_authorization_fails_the_controls(tmp_path, monkeypatch):
+    """Byte-identical reproduction is not a pass: k > 0 fails the result, the report and the audit."""
+    from zkqec.controls import p1a
+    from zkqec.controls.record import audit_controls
+    first = p1a.CONTROL_SETS["p1a"][0].name
+    orig = p1a._run_control
+
+    def leaky(c, root, inputs):
+        row = orig(c, root, inputs)
+        if c.name == first:
+            row["injections"][0]["observed"]["authorized"] = True
+            row["counts"]["false_authorizations"] = 1
+        return row
+    monkeypatch.setattr(p1a, "_run_control", leaky)
+    out = run_campaign(cfg(), ReplayDouble([GOOD]), tmp_path, require_clean=False,
+                       seal_bundle=False)
+    assert out["controls"]["ok"] is True and out["controls"]["passed"] is False
+    assert out["controls"]["false_authorizations"] == 1
+    md = (tmp_path / "ctl" / "report.md").read_text()
+    assert "- Result: **FAILED** (1 false authorizations, 0 false rejections, 0 outcome mismatches)" in md
+    store = ArtifactStore(tmp_path / "ctl" / "store")
+    with Admission(tmp_path / "ctl" / "ledger.db", store, build_registry(store)) as adm:
+        problems, reproduced = audit_controls(adm, store, "ctl", tmp_path / "rerun-scratch")
+    assert reproduced == 1                                  # it reproduces byte-identically ...
+    assert any("did not pass" in p and "1 false authorizations" in p for p in problems)   # ... and fails
+
+
+@pytest.mark.parametrize("edit, passed", [
+    (lambda e: None, True),
+    (lambda e: e["controls"][0]["counts"].update(false_rejections=1), False),
+    (lambda e: e["controls"][1]["counts"].update(outcome_mismatches=2), False),
+    (lambda e: e["controls"].pop(), False),                                   # incomplete set
+    (lambda e: e.update(kind="something-else"), False),
+])
+def test_the_control_pass_result(ran, edit, passed):
+    from zkqec.controls.p1a import verdict
+    out, run, adm, store = ran
+    (rec,) = adm.ledger.controls("ctl")
+    evidence = json.loads(json.dumps(store.get_json(rec["evidence"])))
+    edit(evidence)
+    assert verdict(evidence)["passed"] is passed
 
 
 def test_controls_are_off_by_default_and_on_for_the_live_config(tmp_path):

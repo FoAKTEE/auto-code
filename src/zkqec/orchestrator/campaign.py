@@ -339,31 +339,47 @@ def _run_controls(cfg: CampaignConfig, adm: Admission, store: ArtifactStore, boo
     """§I controls after dispatch and before sealing, as the verifier-class job reserved at freeze
     (#13 pattern: measured CPU and wall charged). Inputs come from the frozen campaign; the evidence
     goes through the sanitizing store and ``controls_recorded`` commits with the job's settlement.
-    A failing suite is charged, recorded as a ``controls_failed`` incident and records no summary."""
+    ``ok`` says the suite ran to completion; ``passed`` is its pass result (k = 0, j = 0, no outcome
+    mismatch). A failing suite keeps the evidence it produced: a failure record (``FAILED_KIND``,
+    with the completed controls) is the failed job's settled result and a ``controls_failed``
+    incident names it (Codex M1 milestone review B3)."""
     gen = book.dispatch(job)
     t0, w0 = time.process_time(), time.monotonic()
 
-    def settle(state: str) -> None:
+    def settle(state: str, result: str | None = None) -> None:
         usage = {"cpu_seconds": max(0.0, time.process_time() - t0),
                  "wall_seconds": max(0.0, time.monotonic() - w0)}
-        book.complete(job, gen, state, actual=usage)
+        book.complete(job, gen, state, actual=usage, result_sha=result)
         book.settle(job)
     try:
         inputs = controls.campaign_inputs(adm, store, cfg.campaign_id)
         evidence = controls.run_suite(cfg.controls, scratch, inputs)
         sha = store.put_json(evidence)
     except Exception as exc:                                       # noqa: BLE001
-        settle("failed")
-        adm.open_incident("controls_failed", {"control_set": cfg.controls,
-                                              "error": type(exc).__name__})
-        return {"control_set": cfg.controls, "ok": False,
-                "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        error = f"{type(exc).__name__}: {str(exc)[:300]}"
+        failure = getattr(exc, "evidence", None) or {
+            "kind": controls.FAILED_KIND, "control_set": cfg.controls,
+            "failed": {"control": None, "error": error}, "partial": {"controls": []}}
+        try:
+            sha = store.put_json(failure)
+        except Exception:                                          # noqa: BLE001
+            sha = store.put_json({"kind": controls.FAILED_KIND, "control_set": cfg.controls,
+                                  "failed": {"control": None, "error": type(exc).__name__},
+                                  "partial": {"controls": []}})
+        settle("failed", sha)
+        adm.open_incident("controls_failed", {"campaign_id": cfg.campaign_id,
+                                              "control_set": cfg.controls,
+                                              "error": type(exc).__name__, "evidence": sha})
+        return {"control_set": cfg.controls, "ok": False, "passed": False, "evidence": sha,
+                "error": error}
     rows = evidence["results"]
+    v = controls.verdict(evidence)
     adm.record_controls(cfg.campaign_id, cfg.controls, rows, evidence=sha,
                         on_close=lambda: settle("completed"))
-    return {"control_set": cfg.controls, "ok": True, "evidence": sha,
+    return {"control_set": cfg.controls, "ok": True, "passed": v["passed"], "evidence": sha,
             **{k: sum(r[k] for r in rows) for k in ("injections", "false_authorizations",
-                                                    "paired_positives", "false_rejections")}}
+                                                    "paired_positives", "false_rejections")},
+            "outcome_mismatches": v["outcome_mismatches"]}
 
 
 def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, job: str,

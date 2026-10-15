@@ -16,7 +16,11 @@ reservation; retry reserved separately) and ``settled`` (one settled completion,
 
 All outcomes are deterministic: a killed enumeration is a deterministic ``DistanceBudget`` exhaustion
 (preflight refusal or the kernel's pair cap), never a wall-clock race. A case that raises is a suite
-failure (:class:`ControlSuiteError`, no summary), never a pass.
+failure (:class:`ControlSuiteError`, no summary), never a pass; the error carries the evidence of the
+controls completed before it (``FAILED_KIND``), so it is preserved (Codex M1 milestone review B3).
+
+:func:`verdict` is the control-set pass result, separate from reproducibility: complete evidence of
+the declared set with zero false authorizations, zero false rejections and no outcome mismatch.
 """
 from __future__ import annotations
 
@@ -47,6 +51,7 @@ from .fixtures import (D1, D3_K6, D5, D6, D7, SF_S, SF_SDG, SF_SHIFT, SF_XBAR, S
 
 SUITE_VERSION = "p1a-1"
 EVIDENCE_KIND = "zkqec-control-evidence-v1"
+FAILED_KIND = "zkqec-control-failure-v1"
 EVALUATOR_SRC = Path(__file__).resolve().parents[1]         # the zkqec package being run
 K_REAL_FIELD = 0      # Steane + the redundant row r0 ⊕ r1: real rank 4 (GF(2) rank 3) gives 7 − 4 − 3
 SUPERSEDED = {"l2.distance": "1.0.0"}       # L2 before the M1 hardening (review #11)
@@ -56,7 +61,12 @@ USED = {"cpu_seconds": 1.0, "wall_seconds": 1.0}
 
 
 class ControlSuiteError(RuntimeError):
-    """A control case raised: the suite produced no summary."""
+    """A control case raised: the suite produced no summary. ``evidence`` holds what the suite
+    produced before the failure (``FAILED_KIND``), or None."""
+
+    def __init__(self, message: str, evidence: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence
 
 
 @dataclass(frozen=True)
@@ -931,11 +941,40 @@ def run_suite(control_set: str, scratch: Path, inputs: SuiteInputs, *,
     scratch = Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
     domain = evaluator_domain(build_registry(ArtifactStore(scratch / "registry")))
-    out = [_run_control(c, scratch / c.name, inputs) for c in controls]
+    head = {"control_set": control_set, "suite_version": SUITE_VERSION, "domain": domain,
+            "inputs": {"schema_sha256": inputs.schema_sha, "families": list(inputs.families)}}
+    out: list[dict[str, Any]] = []
+    for c in controls:
+        try:
+            out.append(_run_control(c, scratch / c.name, inputs))
+        except Exception as exc:                                    # noqa: BLE001
+            partial = {"kind": FAILED_KIND, **head, "failed": {
+                "control": c.name, "error": f"{type(exc).__name__}: {str(exc)[:300]}"},
+                "partial": {"controls": out}}
+            raise ControlSuiteError(f"{control_set}/{c.name}: {type(exc).__name__}: "
+                                    f"{str(exc)[:300]}", evidence=partial) from exc
     assert {"control", *COUNTS} == CONTROL_FIELDS
-    return {"kind": EVIDENCE_KIND, "control_set": control_set, "suite_version": SUITE_VERSION,
-            "domain": domain,
-            "inputs": {"schema_sha256": inputs.schema_sha, "families": list(inputs.families)},
+    return {"kind": EVIDENCE_KIND, **head,
             "controls": out, "deferred": [dict(d) for d in DEFERRED],
             "results": [{"control": c["control"], **{k: c["counts"][k] for k in COUNTS}}
                         for c in out]}
+
+
+def verdict(evidence: Any) -> dict[str, Any]:
+    """Pass result of a control set's evidence (§I): ``passed`` only for complete evidence of a
+    declared set (every control, in order) with no false authorization, no false rejection and no
+    mismatch between expected and observed outcomes. Malformed evidence never passes."""
+    try:
+        assert isinstance(evidence, dict) and evidence.get("kind") == EVIDENCE_KIND
+        controls = evidence["controls"]
+        counts = [c["counts"] for c in controls]
+        k = sum(int(x["false_authorizations"]) for x in counts)
+        j = sum(int(x["false_rejections"]) for x in counts)
+        m = sum(int(x["outcome_mismatches"]) for x in counts)
+        declared = CONTROL_SETS.get(evidence.get("control_set"))
+        complete = declared is not None and [c["control"] for c in controls] == [c.name for c in declared]
+    except (AssertionError, KeyError, TypeError, ValueError):
+        return {"passed": False, "complete": False, "false_authorizations": None,
+                "false_rejections": None, "outcome_mismatches": None}
+    return {"passed": complete and k == j == m == 0, "complete": complete,
+            "false_authorizations": k, "false_rejections": j, "outcome_mismatches": m}

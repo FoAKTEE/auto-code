@@ -4,8 +4,10 @@ The authoritative section is a deterministic function of (ledger, campaign id). 
 derived from hash-chained events of that campaign: the frozen tasks, labels, configuration hash,
 domain and manifest (``campaign_frozen``), the evaluated candidates (``evaluation_recorded``), the
 current receipts (resolver), the accounting (``job_settled``; units never summed), the §I control
-summary (``controls_recorded``: k/N false authorizations, j/M false rejections) and the autonomy
-log (``autonomy_recorded``). No caller-supplied record is rendered, so a caller cannot substitute
+summary (``controls_recorded``: k/N false authorizations, j/M false rejections, and the pass result
+of its evidence artifact; a required set that failed or was never recorded shows as FAILED with the
+``controls_failed`` incident and its preserved evidence) and the autonomy log
+(``autonomy_recorded``). No caller-supplied record is rendered, so a caller cannot substitute
 tasks, membership, totals or prose. Strings come from closed vocabularies or validated patterns and
 are Markdown-escaped anyway. The linter re-renders and requires byte equality. LLM-written text may
 only follow ``COMMENTARY_MARKER`` and is never evidence.
@@ -85,9 +87,30 @@ def report_data(adm: Admission, campaign_id: str) -> dict[str, Any]:
             "overruns": sorted(s["job_id"] for s in settlements if s["overrun"]),
             "autonomy_log": [{k: a[k] for k in ("actor", "action", "detail")}
                              for a in adm.ledger.autonomy(campaign_id)],
-            "controls": [{k: c[k] for k in ("control_set", "results", "evidence")}
+            "controls": [{**{k: c[k] for k in ("control_set", "results", "evidence")},
+                          "verdict": _verdict(adm, c["evidence"])}
                          for c in adm.ledger.controls(campaign_id)],
+            "controls_required": (camp.get("config") or {}).get("controls"),
+            "controls_failed": _controls_failed(adm, campaign_id),
             "integrity": _integrity(adm)}
+
+
+def _verdict(adm: Admission, evidence: str) -> dict[str, Any]:
+    from ..controls.p1a import verdict
+    try:
+        return verdict(adm.store.get_json(evidence))
+    except Exception:                                            # noqa: BLE001
+        return verdict(None)
+
+
+def _controls_failed(adm: Admission, campaign_id: str) -> list[dict[str, Any]]:
+    out = []
+    for (detail,) in adm.ledger.conn.execute(
+            "SELECT detail FROM incidents WHERE category='controls_failed' ORDER BY event_seq"):
+        d = json.loads(detail)
+        if isinstance(d, dict) and d.get("campaign_id") == campaign_id:
+            out.append({k: d.get(k) for k in ("control_set", "error", "evidence")})
+    return out
 
 
 def _integrity(adm: Admission) -> dict[str, Any]:
@@ -151,7 +174,13 @@ def render_markdown(data: dict[str, Any]) -> str:
     L += ["", f"- Overrun jobs (charged beyond their reservation): "
               f"{', '.join(f'`{j}`' for j in data['overruns']) or 'none'}"]
     L += ["", "## Controls (§I: k/N false authorizations, j/M false rejections)", ""]
-    if not data["controls"]:
+    required = data.get("controls_required")
+    if required and not any(c["control_set"] == required for c in data["controls"]):
+        L.append(f"- Required control set `{esc(required)}`: **FAILED** (not recorded)")
+    for f in data.get("controls_failed", []):
+        L.append(f"- Control set `{esc(f['control_set'])}` suite failed ({esc(f['error'])}); "
+                 f"preserved evidence `{esc(f['evidence'])}`")
+    if not data["controls"] and not required and not data.get("controls_failed"):
         L.append("- none recorded (controls not supplied for this campaign)")
     for c in data["controls"]:
         rows = c["results"]
@@ -161,7 +190,17 @@ def render_markdown(data: dict[str, Any]) -> str:
               f"{r['false_rejections']}/{r['paired_positives']} |" for r in rows]
         k, n = sum(r["false_authorizations"] for r in rows), sum(r["injections"] for r in rows)
         j, m = sum(r["false_rejections"] for r in rows), sum(r["paired_positives"] for r in rows)
-        L += ["", f"- False authorizations: {k}/{n}; false rejections: {j}/{m}", ""]
+        L += ["", f"- False authorizations: {k}/{n}; false rejections: {j}/{m}"]
+        v = c["verdict"]
+        if v["passed"]:
+            L.append("- Result: **PASSED** (no false authorizations, no false rejections, no "
+                     "outcome mismatches)")
+        else:
+            L.append(f"- Result: **FAILED** ({_num(v['false_authorizations'])} false authorizations, "
+                     f"{_num(v['false_rejections'])} false rejections, "
+                     f"{_num(v['outcome_mismatches'])} outcome mismatches"
+                     + ("" if v["complete"] else "; evidence incomplete or not a known set") + ")")
+        L.append("")
     L += ["", "## Autonomy log (human actions)", ""]
     L += [f"- {esc(a['actor'])}: {esc(a['action'])} — {esc(a['detail'])}"
           for a in data["autonomy_log"]] or ["- none"]

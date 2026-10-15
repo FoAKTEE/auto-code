@@ -516,6 +516,12 @@ def audit_campaign(adm, store, campaign_id: str) -> list[str]:
     for s in settlements:
         if not s["result"]:
             continue
+        if s["kind"] != "propose":            # e.g. a failed control suite's evidence (§I)
+            try:
+                store.verify(s["result"])
+            except Exception as exc:                             # noqa: BLE001
+                problems.append(f"job {s['job_id'][:12]} result {s['result']}: {type(exc).__name__}")
+            continue
         found, rec = _call_record_problems(store, s["result"], f"job {s['job_id'][:12]}")
         problems += found
         if not isinstance(rec, dict):

@@ -8,7 +8,9 @@ campaign run and the offline audit derive them identically from the ledger and t
 is re-run with the evaluator being audited (the bundle's embedded closure) in a scratch directory;
 the canonical evidence must hash to the recorded evidence artifact (byte-identical) and the recorded
 rows must equal the re-run rows. Anything else — an unknown control set, missing inputs, a re-run
-that raises — is an audit problem, never a pass.
+that raises — is an audit problem, never a pass. Reproduction is not acceptance (Codex M1 milestone
+review B3): the control set the frozen config requires must be recorded, and the reproduced evidence
+must pass (:func:`~zkqec.controls.p1a.verdict`: k = 0, j = 0, no outcome mismatch, complete).
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from pathlib import Path
 
 from ..contracts import Profile, canonical_json
 from .env import SuiteInputs
-from .p1a import CONTROL_SETS, run_suite
+from .p1a import CONTROL_SETS, run_suite, verdict
 
 
 def campaign_inputs(adm, store, campaign_id: str) -> SuiteInputs:
@@ -39,6 +41,11 @@ def audit_controls(adm, store, campaign_id: str, scratch: Path) -> tuple[list[st
     records = adm.ledger.controls(campaign_id)
     problems: list[str] = []
     reproduced = 0
+    camp = adm.ledger.campaign(campaign_id) or {}
+    required = (camp.get("config") or {}).get("controls")
+    if required and not any(r["control_set"] == required for r in records):
+        problems.append(f"required control set {required} of the frozen config was not recorded "
+                        "(the suite failed or never ran)")
     if not records:
         return problems, reproduced
     Path(scratch).mkdir(parents=True, exist_ok=True)
@@ -66,4 +73,11 @@ def audit_controls(adm, store, campaign_id: str, scratch: Path) -> tuple[list[st
             found.append(f"{tag}: recorded counts differ from the offline re-run")
         problems += found
         reproduced += not found
+    for name, evidence in sorted(reruns.items()):
+        v = verdict(evidence)
+        if not v["passed"]:
+            problems.append(f"control set {name} did not pass: {v['false_authorizations']} false "
+                            f"authorizations, {v['false_rejections']} false rejections, "
+                            f"{v['outcome_mismatches']} outcome mismatches"
+                            + ("" if v["complete"] else ", incomplete"))
     return problems, reproduced
