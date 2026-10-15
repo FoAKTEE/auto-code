@@ -20,7 +20,7 @@ from ..admission import Admission
 from ..contracts import (Frozen, Profile, Proposal, Reservation, TaskSA, TaskSF, content_hash)
 from ..firewall.lint import check_fingerprints, family_terms, lint_contract, lint_request
 from ..grammar import MANIFESTS, GrammarCaps
-from ..grammar.rawjson import check_raw_json
+from ..grammar.intake import parse_proposal
 from ..pipeline import Evaluation, Pipeline, build_registry, evaluator_domain
 from ..report.bundle import audit_bundle, seal
 from ..report.render import CampaignRecord, EvaluationRef, render
@@ -132,8 +132,9 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     dom = evaluator_domain(reg)
     book = JobBook(adm.ledger.conn, cfg.campaign_id, profile=profile_key(cfg.profile))
     book.set_caps(cfg.caps)
+    families = tuple(grammar_for(cfg.profile))
     pipe = Pipeline(adm, store, book, dom, caps=GrammarCaps(max_n=cfg.max_n),
-                    distance_budget=cfg.distance_budget)
+                    distance_budget=cfg.distance_budget, families=families)
     manifest = {"campaign_id": cfg.campaign_id, "config_sha256": content_hash(cfg),
                 "config": cfg.model_dump(mode="json"), "domain": dom, "registry": reg.manifest(),
                 "git": gs, "contract_sha256": content_hash(contract),
@@ -180,11 +181,11 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 # An "uncertain" call keeps its full reservation, but if it produced output the
                 # proposal is still evaluated: scientific authority comes from verifiers, not the call.
                 if res.outcome in ("completed", "uncertain") and res.text is not None:
-                    try:
-                        check_raw_json(res.text, max_bytes=2_000_000, max_depth=12, max_list_len=200_000)
-                        proposal = Proposal.model_validate_json(res.text)
+                    try:      # strict parse + full schema + frozen profile, before construction
+                        proposal = parse_proposal(res.text, schema=schema, families=families)
                     except Exception as e:                       # noqa: BLE001
-                        history.append(Evaluation("malformed_proposal", {"reason": str(e)[:200]}))
+                        reason = getattr(e, "reason", None) or str(e)
+                        history.append(Evaluation("malformed_proposal", {"reason": reason[:200]}))
                 if proposal is None:
                     if res.outcome not in ("completed",) and res.text is None:
                         history.append(Evaluation(res.outcome, {"reason": res.outcome}))

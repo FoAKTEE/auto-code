@@ -27,6 +27,7 @@ from .contracts import (DesignCandidate, LogicalBasis, OperationRef, PhysicalOpe
 from .contracts.registry import REGISTRY_VERSION
 from .grammar import GrammarCaps, MalformedProposal, build
 from .grammar.errors import UnsupportedFamily
+from .grammar.intake import POLICY
 from .identity import code_sha
 from .orchestrator.jobs import JobBook, JobError
 from .store import ArtifactStore
@@ -108,12 +109,50 @@ class Evaluation:
     facts: dict[str, Any] = field(default_factory=dict)
 
 
+def _int_list(v: Any, field: str) -> tuple[int, ...]:
+    """A list of genuine ints (no bool, float or str coercion)."""
+    if not isinstance(v, (list, tuple)) or any(type(x) is not int for x in v):
+        raise ValueError(f"{field} must be a list of integers")
+    return tuple(v)
+
+
+def _strict_witnesses(w: Any) -> dict[str, Any]:
+    """S-F witnesses (§B3 class c), checked strictly: known keys only, integer entries only."""
+    if not isinstance(w, dict) or set(w) - {"basis", "operation", "logical_qubits"}:
+        raise ValueError(f"unknown witness fields {sorted(set(w) - {'basis', 'operation', 'logical_qubits'})}"
+                         if isinstance(w, dict) else "witnesses must be an object")
+    out: dict[str, Any] = {}
+    if "basis" in w:
+        b = w["basis"]
+        if not isinstance(b, dict) or set(b) != {"lx", "lz"}:
+            raise ValueError("basis needs exactly lx and lz")
+        out["basis"] = {k: tuple(_int_list(row, f"basis.{k}") for row in
+                                 (b[k] if isinstance(b[k], (list, tuple)) else [None]))
+                        for k in ("lx", "lz")}
+    if "operation" in w:
+        o = w["operation"]
+        if not isinstance(o, dict) or set(o) - {"permutation", "local_cliffords"}:
+            raise ValueError("operation allows only permutation and local_cliffords")
+        out["operation"] = dict(o)                       # None means absent
+        if o.get("permutation") is not None:
+            out["operation"]["permutation"] = _int_list(o["permutation"], "operation.permutation")
+        lc = o.get("local_cliffords")
+        if lc is not None and (not isinstance(lc, (list, tuple))
+                               or any(type(g) is not str for g in lc)):
+            raise ValueError("operation.local_cliffords must be a list of strings")
+    if "logical_qubits" in w:
+        out["logical_qubits"] = _int_list(w["logical_qubits"], "logical_qubits")
+    return out
+
+
 class Pipeline:
     def __init__(self, admission: Admission, store: ArtifactStore, book: JobBook, domain: str, *,
-                 caps: GrammarCaps, distance_budget: dict | None = None, cpu_reservation: int = 600):
+                 caps: GrammarCaps, distance_budget: dict | None = None, cpu_reservation: int = 600,
+                 families: tuple[str, ...] | None = None):
         self.adm, self.store, self.book, self.domain = admission, store, book, domain
         self.caps, self.distance_budget = caps, distance_budget or {}
         self.cpu_reservation = cpu_reservation
+        self.families = None if families is None else frozenset(families)   # frozen profile
 
     # -- one verifier run = one settled job -------------------------------------------------------
     def _run(self, name: str, inputs: dict[str, str], key: str):
@@ -159,6 +198,8 @@ class Pipeline:
 
     # -- evaluation --------------------------------------------------------------------------------
     def evaluate(self, proposal: Proposal, task: TaskSA | TaskSF) -> Evaluation:
+        if self.families is not None and proposal.family not in self.families:
+            return Evaluation("malformed_proposal", {"reason": POLICY})     # §N: policy only
         try:
             pres, _, _ = build(proposal, self.caps)
         except UnsupportedFamily as e:
@@ -193,11 +234,10 @@ class Pipeline:
         return self._verdicts(ev, task, candidate)
 
     def _evaluate_operation(self, proposal, task: TaskSF, p_sha, facts, candidate, ev):
-        w = proposal.witnesses or {}
         try:
+            w = _strict_witnesses(proposal.witnesses or {})
             if "basis" in w:
-                basis = LogicalBasis(presentation=p_sha, lx=tuple(map(tuple, w["basis"]["lx"])),
-                                     lz=tuple(map(tuple, w["basis"]["lz"])))
+                basis = LogicalBasis(presentation=p_sha, lx=w["basis"]["lx"], lz=w["basis"]["lz"])
                 b_sha = self.store.put_json(basis.model_dump(mode="json"))
             else:
                 b_sha = facts.get("canonical_basis")
@@ -205,7 +245,7 @@ class Pipeline:
                     ev.detail["operation"] = "no basis available"
                     return candidate
             op = PhysicalOperation(n=facts["n"], **(w.get("operation") or {}))
-            lq = tuple(int(q) for q in w.get("logical_qubits", range(task.k_req)))
+            lq = w.get("logical_qubits", tuple(range(task.k_req)))
         except (ValueError, TypeError, KeyError) as e:
             ev.detail["operation"] = f"malformed witness: {e}"
             return candidate
