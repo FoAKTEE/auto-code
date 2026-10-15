@@ -590,7 +590,11 @@ def _flat_usage(u: Any) -> dict[str, int]:
     return out
 
 
-def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = 64 << 20) -> dict[str, Any] | None:
+MAX_USAGE_BODY_BYTES = 64 << 20               # larger model responses are not parsed: usage unknown
+
+
+def anthropic_usage(body: bytes, content_type: str | None,
+                    max_bytes: int = MAX_USAGE_BODY_BYTES) -> dict[str, Any] | None:
     """Usage from an Anthropic Messages response: SSE (``message_start``/``message_delta``) or JSON."""
     if len(body) > max_bytes:
         return None

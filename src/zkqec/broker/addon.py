@@ -13,6 +13,11 @@ fsync'ed **before** the request is forwarded (§L). Logged fields are sanitized 
 header, no body, no query string. A violation answers 403 (HTTP) or drops the frame and injects an
 error frame (WebSocket), and fails the job closed: a marker is written to ``<state>/blocked/<job>.json``
 and every later request of that job is blocked.
+
+Model responses are streamed to the client unchanged as they arrive, never buffered: a client waiting
+for its first byte must not time out and re-send a billed request (m1-live-2). A bounded copy of the
+stream is kept and parsed for usage at end of stream; a stream that ends early is logged as
+``response_incomplete`` (no usage record, so the charge stays uncertain, §K).
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ import time
 from typing import Any
 
 from mitmproxy import ctx, http
+from mitmproxy.net import encoding
 
 _here = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("_zkqec_broker_policy", os.path.join(_here, "policy.py"))
@@ -35,6 +41,32 @@ sys.modules["_zkqec_broker_policy"] = P
 _spec.loader.exec_module(P)
 
 BLOCK_BODY = b"zkqec broker: request blocked by policy\n"
+
+
+class _Tee:
+    """Stream transform: passes every chunk through unchanged and keeps a bounded copy."""
+
+    def __init__(self, cap: int) -> None:
+        self.buf = bytearray()
+        self.cap = cap
+        self.overflow = False
+
+    def __call__(self, chunk: bytes) -> bytes:
+        if not self.overflow:
+            if len(self.buf) + len(chunk) > self.cap:
+                self.overflow = True
+                self.buf = bytearray()
+            else:
+                self.buf += chunk
+        return chunk
+
+    def content(self, content_encoding: str | None) -> bytes | None:
+        if self.overflow:
+            return None
+        try:
+            return encoding.decode(bytes(self.buf), content_encoding or "identity")
+        except ValueError:
+            return None
 
 
 class BrokerLog:
@@ -237,6 +269,33 @@ class ZkqecBroker:
         flow.metadata["zkqec_kind"] = endpoint.kind if endpoint else None
         flow.metadata["zkqec_body"] = endpoint.body if endpoint else None
 
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        if flow.metadata.get("zkqec_job") is None or flow.response is None \
+                or flow.metadata.get("zkqec_kind") != P.MODEL:
+            return
+        tee = _Tee(P.MAX_USAGE_BODY_BYTES)
+        flow.metadata["zkqec_tee"] = tee
+        flow.response.stream = tee
+
+    def _model_usage(self, flow: http.HTTPFlow) -> tuple[int, dict[str, Any] | None]:
+        """(body bytes seen, parsed usage) of a model response, from the streamed copy."""
+        assert flow.response is not None
+        tee = flow.metadata.get("zkqec_tee")
+        if tee is None:                         # not streamed (no body): parse what was buffered
+            raw, content = flow.response.raw_content or b"", flow.response.get_content(strict=False) or b""
+        else:
+            raw, content = bytes(tee.buf), tee.content(flow.response.headers.get("content-encoding"))
+        if content is None:
+            return len(raw), None
+        ctype = flow.response.headers.get("content-type")
+        if flow.metadata.get("zkqec_body") == "anthropic_messages":
+            return len(raw), P.anthropic_usage(content, ctype)
+        u = None
+        for line in content.decode("utf-8", "replace").splitlines():
+            if line.startswith("data:") and "response.completed" in line:
+                u = P.ws_server_usage(line[5:].strip().encode())
+        return len(raw), u
+
     def response(self, flow: http.HTTPFlow) -> None:
         assert self.log is not None
         job_id = flow.metadata.get("zkqec_job")
@@ -247,15 +306,7 @@ class ZkqecBroker:
                                "status": flow.response.status_code,
                                "body_bytes": len(flow.response.raw_content or b"")}
         if flow.metadata.get("zkqec_kind") == P.MODEL:
-            content = flow.response.get_content(strict=False) or b""
-            ctype = flow.response.headers.get("content-type")
-            if flow.metadata.get("zkqec_body") == "anthropic_messages":
-                u = P.anthropic_usage(content, ctype)
-            else:
-                u = None
-                for line in content.decode("utf-8", "replace").splitlines():
-                    if line.startswith("data:") and "response.completed" in line:
-                        u = P.ws_server_usage(line[5:].strip().encode())
+            rec["body_bytes"], u = self._model_usage(flow)
             rec["usage"] = u["usage"] if u else None
             rec["stop_reason"] = u.get("stop_reason") if u else None
             rec["usage_status"] = "reported" if u else "unknown"
@@ -269,6 +320,13 @@ class ZkqecBroker:
         self.log.write({"event": "flow_error", "job_id": job_id,
                         "host": P.sanitize_label(flow.request.pretty_host if flow.request else None),
                         "error": P.sanitize_label(msg, 160)})
+        if flow.metadata.get("zkqec_tee") is not None and flow.response is not None:
+            # Diagnostic only: an interrupted stream never yields a usage record (§K).
+            n, u = self._model_usage(flow)
+            self.log.write({"event": "response_incomplete", "job_id": flow.metadata.get("zkqec_job"),
+                            "path": P.sanitize_label(P.strip_query(flow.request.path), 160),
+                            "status": flow.response.status_code, "body_bytes": n,
+                            "usage_partial": u["usage"] if u else None, "usage_status": "incomplete"})
 
     def tls_failed_client(self, data: Any) -> None:
         if self.log is None:

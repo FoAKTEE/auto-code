@@ -2,18 +2,19 @@
 
 Covers: TLS interception with the per-campaign CA, HTTP body policy, WebSocket frame policy (including
 Codex's `additional_tools` input item), ceilings, the dispatch switch, fail-closed, log-before-forward
-ordering and log sanitization.
+ordering, log sanitization, and streamed (unbuffered) model responses with usage from the stream.
 """
 from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 
 from zkqec.broker.bridge import Bridge
-from zkqec.broker.launcher import MITMDUMP, Broker, Ceilings
+from zkqec.broker.launcher import MITMDUMP, Broker, Ceilings, summarize_job
 from zkqec.broker.testing import FakeUpstream, ProxyClient, local_policy_overrides, make_test_pki
 
 pytestmark = pytest.mark.skipif(not MITMDUMP.exists() or shutil.which("openssl") is None,
@@ -76,6 +77,52 @@ def test_quiet_block_does_not_fail_job(env):
     assert c.request("POST", "/v1/messages", json.dumps(MSG).encode())[0] == 200
     c.close(); br.stop()
     assert b.blocked_reason("h_quiet") is None
+
+
+@pytest.mark.parametrize("gz", [False, True])
+def test_model_response_is_streamed_not_buffered(env, gz):
+    # m1-live-2: a buffered SSE body gave the CLI no first byte for ~180 s; it aborted and re-sent a
+    # (possibly billed) request. The head and first event must reach the client before the stream ends.
+    _, b, up, _ = env
+    up.sse_delay, up.sse_gzip = 3.0, gz
+    try:
+        br, c = _client(env, f"h_stream_{int(gz)}", "claude", "m1", Ceilings(1, 3, 4096, 100, 60))
+        status, data, t_head, t_done = c.request_timed("POST", "/v1/messages", json.dumps(MSG).encode())
+        c.close(); br.stop()
+    finally:
+        up.sse_delay, up.sse_gzip = 0.0, False
+    assert status == 200 and t_done >= 3.0
+    assert t_head < 2.0
+    if not gz:
+        assert data.startswith(b"event: message_start") and b"message_delta" in data
+    usage = [r for r in b.records(f"h_stream_{int(gz)}") if r.get("event") == "response"]
+    assert len(usage) == 1 and usage[0]["usage_status"] == "reported"
+    assert usage[0]["usage"] == {"input_tokens": 11, "output_tokens": 7, "cache_creation_input_tokens": 0}
+    assert usage[0]["body_bytes"] == len(data) and usage[0]["stop_reason"] == "end_turn"
+
+
+def test_client_abort_mid_stream_leaves_usage_unreported(env):
+    # An aborted stream is a model request without a usage record: the charge stays uncertain (§K),
+    # and the partial copy is logged for diagnosis only.
+    _, b, up, _ = env
+    up.sse_delay = 2.0
+    try:
+        br, c = _client(env, "h_abort", "claude", "m1", Ceilings(1, 3, 4096, 100, 60))
+        status, _, t_head, _ = c.request_timed("POST", "/v1/messages", json.dumps(MSG).encode(),
+                                               abort_after_head=True)
+        time.sleep(3.0)                         # the upstream finishes into a closed client
+        br.stop()
+    finally:
+        up.sse_delay = 0.0
+    assert status == 200 and t_head < 1.5
+    recs = b.records("h_abort")
+    assert not [r for r in recs if r.get("event") == "response"]
+    partial = [r for r in recs if r.get("event") == "response_incomplete"]
+    assert len(partial) == 1 and partial[0]["usage_status"] == "incomplete"
+    assert partial[0]["usage_partial"] == {"input_tokens": 11, "output_tokens": 1,
+                                           "cache_creation_input_tokens": 0}
+    s = summarize_job(recs)
+    assert s["model_requests"] == 1 and s["usage_records"] == 0 and s["usage_missing"] == 1
 
 
 def test_websocket_frames(env):

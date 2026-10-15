@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import ssl
 import struct
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,11 +51,15 @@ class Seen:
 @dataclass
 class FakeUpstream:
     """TLS server on 127.0.0.1 answering like a model API: SSE with usage for ``POST /v1/messages``,
-    a ``response.completed`` frame (with usage) for every WebSocket text frame, JSON 200 otherwise."""
+    a ``response.completed`` frame (with usage) for every WebSocket text frame, JSON 200 otherwise.
+    ``sse_delay`` holds the SSE body back after its first part (a slow, thinking model);
+    ``sse_gzip`` sends it with ``Content-Encoding: gzip``."""
     cert: str
     key: str
     seen: list[Seen] = field(default_factory=list)
     port: int = 0
+    sse_delay: float = 0.0
+    sse_gzip: bool = False
 
     def start(self) -> "FakeUpstream":
         ready = threading.Event()
@@ -102,8 +108,11 @@ class FakeUpstream:
                                                                         "cache_creation_input_tokens": 0}}},
                         {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}},
                     ]
-                    payload = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
-                    ctype = b"text/event-stream"
+                    parts = [f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events]
+                    payload, ctype = b"".join(parts), b"text/event-stream"
+                    if self.sse_delay or self.sse_gzip:
+                        await self._send_sse(w, parts)
+                        continue
                 else:
                     payload, ctype = b'{"ok":true}', b"application/json"
                 w.write(b"HTTP/1.1 200 OK\r\nContent-Type: " + ctype + b"\r\nContent-Length: "
@@ -113,6 +122,21 @@ class FakeUpstream:
             pass
         finally:
             w.close()
+
+    async def _send_sse(self, w: asyncio.StreamWriter, parts: list[bytes]) -> None:
+        body = b"".join(parts)
+        head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        if self.sse_gzip:
+            body = gzip.compress(body)
+            head += b"Content-Encoding: gzip\r\n"
+            cut = len(body) // 2
+        else:
+            cut = len(parts[0])
+        w.write(head + b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body[:cut])
+        await w.drain()
+        await asyncio.sleep(self.sse_delay)
+        w.write(body[cut:])
+        await w.drain()
 
     async def _ws_loop(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
@@ -200,6 +224,32 @@ class ProxyClient:
                 break
             data += chunk
         return status, data
+
+    def request_timed(self, method: str, path: str, body: bytes = b"", *,
+                      abort_after_head: bool = False) -> tuple[int, bytes, float, float]:
+        """Like :meth:`request`, also returning seconds to the response head and to the full body.
+        ``abort_after_head`` closes the connection once the head and first body bytes arrive."""
+        assert self.sock is not None
+        t0 = time.monotonic()
+        hdr = {"Host": f"{self.host}:{self.port}", "Content-Length": str(len(body)),
+               "Content-Type": "application/json"}
+        req = f"{method} {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in hdr.items()) + "\r\n"
+        self.sock.sendall(req.encode() + body)
+        head = _read_head(self.sock)
+        t_head = time.monotonic() - t0
+        status = int(head.split(b" ", 2)[1])
+        length = next((int(l.split(b":", 1)[1]) for l in head.split(b"\r\n")[1:]
+                       if l.lower().startswith(b"content-length:")), 0)
+        data = b""
+        while len(data) < length:
+            chunk = self.sock.recv(length - len(data))
+            if not chunk:
+                break
+            data += chunk
+            if abort_after_head:
+                self.close()
+                break
+        return status, data, t_head, time.monotonic() - t0
 
     def websocket(self, path: str) -> int:
         assert self.sock is not None
