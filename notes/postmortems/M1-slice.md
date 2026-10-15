@@ -1,7 +1,7 @@
 # M1 post-mortem — minimal live vertical slice
 
-Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..8, all `single-implementation,
-non-evaluation`. m1-live-8 (B1 ownership fix, run from the read-only evaluator snapshot) is the acceptance run;
+Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..9, all `single-implementation,
+non-evaluation`. m1-live-9 (interrupt deferral, run from the read-only evaluator snapshot) is the acceptance run;
 the earlier runs are superseded or failed (§1).
 Everything below is algebra-level (D11).
 
@@ -16,9 +16,10 @@ Everything below is algebra-level (D11).
 | m1-live-5 | round 2, snapshot, 9458710 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (evidence byte-identical to m1-live-3); superseded by the re-review (N1–N5) | 0.678 | 2 | 331 s | ok, confirmation supplement linked |
 | m1-live-6 | round 3, snapshot, 6e7e610 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence); superseded by re-review 3 (B1) | 0.332 | 2 | 160 s | ok, required supplement linked |
 | m1-live-7 | B1 drain-before-reap, snapshot, f70055e | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence); superseded by re-review 4 (residual B1) | 0.217 | 2 | 123 s | ok, required supplement linked |
-| m1-live-8 | B1 ownership fix, snapshot, 01d1f32 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence) | 0.208 | 2 | 115 s | ok, required supplement linked |
+| m1-live-8 | B1 ownership fix, snapshot, 01d1f32 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence); superseded by re-review 5 | 0.208 | 2 | 115 s | ok, required supplement linked |
+| m1-live-9 | interrupt deferral, snapshot, ff75f68 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence) | 0.177 | 2 | 100 s | ok, required supplement linked |
 
-Cumulative M1 live spend $2.95 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
+Cumulative M1 live spend $3.12 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
 
 S-A (m1-live-2 and m1-live-3): [[60,8,6]], w=6, deg=6, d_X=d_Z=6 certified exactly at t=3. m1-live-3 proposed the
 identical candidate (`1016c96ed5f742fc`). S-F: a [[14,2,3]] code (w=4, deg=6) with a qubit permutation verified by L3
@@ -124,6 +125,13 @@ gated on the pidfd, ignored `SIGCHLD` refused (5d26221). m1-live-8 re-ran the sl
 *Lesson:* for process lifecycles, reason about every interleaving including asynchronous exceptions, not only the
 happy and timeout paths.
 
+**I14. Re-review 5: asynchronous interrupts between bytecodes** (an interrupt between `ECHILD` and clearing
+ownership with no pidfd; an interrupt during setup, before the lifecycle `try`). *Fix:* the whole parent-side
+lifecycle runs with deferred signal handlers; a recorded interrupt is honoured by the ordered kill/drain/reap path and
+re-delivered after every child, member and descriptor is gone; positive ownership check for the no-pidfd fallback;
+children die with their parent (b83b9cf). *Lesson:* make a class of interleavings impossible instead of patching
+one interleaving per review.
+
 ## 3. Model performance (single samples — not an evaluation)
 
 | call | output tokens | wall | CLI-reported list price | outcome |
@@ -140,6 +148,8 @@ happy and timeout paths.
 | m1-live-7 sf | 2,360 | 24 s | 0.0479 | [[14,2,3]] + SWAP (candidate 02f09068…, as in m1-live-5) |
 | m1-live-8 sa | 8,409 | 73 s | 0.1688 | [[60,8,6]] (same candidate, sixth time) |
 | m1-live-8 sf | 1,912 | 17 s | 0.0389 | [[14,2,3]] + SWAP (candidate d0a4e759…) |
+| m1-live-9 sa | 6,710 | 57 s | 0.1348 | [[60,8,6]] (same candidate, seventh time) |
+| m1-live-9 sf | 2,049 | 19 s | 0.0416 | [[14,2,3]] + SWAP (candidate 55fc2f3d…, as in m1-live-2) |
 
 The S-A answer is the identical proposal in all three hardened-era runs and the S-F code recurs, which is consistent
 with recall of a fixed construction; known-code labelling waits for M4. The m1-live-5 S-A call came within 44 tokens

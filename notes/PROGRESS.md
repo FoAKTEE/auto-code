@@ -90,3 +90,6 @@
 - Codex re-review 4: BLOCK on residual B1 (post-reap signals on an interrupt after the reap or after ECHILD) →
   `notes/reviews/M1-triage-4.md`; fixed with explicit pid ownership + pidfd (5d26221); suite 802 passed;
   m1-live-8 (snapshot, 01d1f32): both targets, controls passed, supplement linked, $0.21; cumulative M1 live $2.95.
+- Codex re-review 5: BLOCK (asynchronous interrupts between bytecodes: ECHILD + interrupt + no pidfd; interrupt during
+  setup) → `notes/reviews/M1-triage-5.md`; fixed by deferring interrupts across the lifecycle (b83b9cf); suite 808
+  passed; m1-live-9 (snapshot, ff75f68): both targets, controls passed, supplement linked, $0.18; cumulative $3.12.
