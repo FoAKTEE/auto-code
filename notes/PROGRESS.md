@@ -83,3 +83,7 @@
   `runs/qualify/20261015T213850Z` (34 / 3); full suite 795 passed.
 - m1-live-6 (snapshot, 6e7e610): both targets met, controls passed, required supplement linked, $0.33; cumulative
   M1 live $2.52 of $5. Next: Codex re-review of round 3 → `notes/reviews/M1-triage-3.md`.
+- Codex re-review 3: BLOCK on one new blocker (B1: group cleanup after the leader was reaped could signal a reused
+  id); N2–N6 and the projection fixed; every §M1 Accept item passes → `notes/reviews/M1-triage-3.md`. B1 fixed
+  (997b815); suite 797 passed; m1-live-7 (snapshot, f70055e): both targets, controls passed, supplement linked,
+  $0.22; cumulative M1 live $2.74 of $5. Next: focused Codex review of B1 + m1-live-7.

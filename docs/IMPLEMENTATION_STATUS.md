@@ -19,13 +19,13 @@ Suite: `.venv/bin/python -m pytest -q tests` (slow tests included; the one skip 
 | L2 certification feasibility (this host) | measured | `results/feasibility/M1-certification.md`; D10 ranges `notes/DECISIONS.md` G8 |
 | Job state machine, fencing, settlement, §K reservations (invocation totals) | tested | `tests/orchestrator/test_jobs.py`, `tests/pipeline/test_recovery.py`, `tests/agents/test_reservation_bound.py` |
 | Bounded execution of verifier, identity, control and confirmation work (child + RLIMIT_CPU/AS + wall kill) | tested | `tests/exec/test_bounded.py`, `tests/exec/test_deadline.py`, `tests/pipeline/test_ceilings.py` |
-| Read-only evaluator snapshot (isolated re-exec, runtime facts in the manifest) | tested + live | `tests/exec/test_snapshot.py`; m1-live-5/6 ran from it |
+| Read-only evaluator snapshot (isolated re-exec, runtime facts in the manifest) | tested + live | `tests/exec/test_snapshot.py`; m1-live-5..7 ran from it |
 | Live-call barrier for test runs | tested | `tests/sandbox/test_live_guard.py`, `tests/conftest.py` |
 | Sandbox (bwrap), campaign slice, TLS-inspecting broker (streaming, fail-closed on log failure, mandatory usage counters) | qualified (M0) | `runs/qualify/20261015T213850Z`: 34 qualified, 3 unqualified (Codex not tool-free ×2; slice CPU quota, G7) |
-| ClaudeCall provider (K0) | qualified + live | m1-live-6; Codex: dev-only, `K0-unenforced` (G6) |
-| P1a control suite (§I) | tested + live | 20 controls, 0/37 false authorizations, 0/24 false rejections (`notes/build/controls.md`); pass required by the audit; recorded by m1-live-6 |
+| ClaudeCall provider (K0) | qualified + live | m1-live-7; Codex: dev-only, `K0-unenforced` (G6) |
+| P1a control suite (§I) | tested + live | 20 controls, 0/37 false authorizations, 0/24 false rejections (`notes/build/controls.md`); pass required by the audit; recorded by m1-live-7 |
 | Report (ledger-rendered, linted), bundles v2 with broker evidence, confirmation supplement, offline audit | tested + live | `tests/report`; `results/bundles/index.md` (every live bundle re-audited; m1-live-4 fails as designed) |
-| M1 live slice (one S-A, one S-F) | done (non-evaluation), acceptance pending re-review | m1-live-6: both targets met, $0.33; cumulative M1 live $2.52; `notes/postmortems/M1-slice.md` |
+| M1 live slice (one S-A, one S-F) | done (non-evaluation), acceptance pending re-review | m1-live-7: both targets met, $0.22; cumulative M1 live $2.74; `notes/postmortems/M1-slice.md` |
 | ISD, identity relations, theorem registry, twins | planned (M2) | — |
 | Multi-agent runtime (Designer-B, skeptic, route agent, commentator) | planned (M3) | — |
 | Evaluation campaigns, known-code database, novelty labels | planned (M4) | — |

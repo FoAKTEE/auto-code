@@ -1,7 +1,7 @@
 # M1 post-mortem — minimal live vertical slice
 
-Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..6, all `single-implementation,
-non-evaluation`. m1-live-6 (third hardening round, run from the read-only evaluator snapshot) is the acceptance run;
+Scope: M1 (`prompt/00-master-prompt.md` §M1), Phase 1a. Live runs m1-live-1..7, all `single-implementation,
+non-evaluation`. m1-live-7 (B1 cleanup fix, run from the read-only evaluator snapshot) is the acceptance run;
 the earlier runs are superseded or failed (§1).
 Everything below is algebra-level (D11).
 
@@ -14,9 +14,10 @@ Everything below is algebra-level (D11).
 | m1-live-3 | hardened, 7d8c36d (§4) | both tasks `target_met` on proposal 1; P1a controls 0/37 false authorizations, 0/24 false rejections | 0.360 (measured) | 2 | 168 s | ok (bundle v2, self-contained) |
 | m1-live-4 | round 2, snapshot, addb11b | both tasks `target_met`; control suite refused in snapshot mode (I9) → no control summary | 0.295 | 2 | — | **fails** (controls required) |
 | m1-live-5 | round 2, snapshot, 9458710 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (evidence byte-identical to m1-live-3); superseded by the re-review (N1–N5) | 0.678 | 2 | 331 s | ok, confirmation supplement linked |
-| m1-live-6 | round 3, snapshot, 6e7e610 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence) | 0.332 | 2 | 160 s | ok, required supplement linked |
+| m1-live-6 | round 3, snapshot, 6e7e610 | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence); superseded by re-review 3 (B1) | 0.332 | 2 | 160 s | ok, required supplement linked |
+| m1-live-7 | B1 fix, snapshot, f70055e | both tasks `target_met` on proposal 1; controls passed 0/37, 0/24 (same evidence) | 0.217 | 2 | 123 s | ok, required supplement linked |
 
-Cumulative M1 live spend $2.52 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
+Cumulative M1 live spend $2.74 of the $5 D5 cap, including an unintended $0.205 test-suite run (I10).
 
 S-A (m1-live-2 and m1-live-3): [[60,8,6]], w=6, deg=6, d_X=d_Z=6 certified exactly at t=3. m1-live-3 proposed the
 identical candidate (`1016c96ed5f742fc`). S-F: a [[14,2,3]] code (w=4, deg=6) with a qubit permutation verified by L3
@@ -110,6 +111,11 @@ projection was stale. Third hardening round 92dcf66..c8089ed; re-qualified `runs
 *Lesson:* composing two individually sound mechanisms (bounded children, nested inside bounded children) needs its
 own adversarial test.
 
+**I12. Re-review 3 blocked M1 on the N1 cleanup** (`M1-codex-rereview-3.md`, `M1-triage-3.md`): after `wait4` reaped
+the leader, the drain signalled its numeric group id, which a reused pid could lead (B1). *Fix:* observe the exit with
+`waitid(WNOWAIT)`, drain while the zombie leader keeps the id allocated, reap last (997b815). m1-live-7 re-ran the
+acceptance slice on the fixed evaluator.
+
 ## 3. Model performance (single samples — not an evaluation)
 
 | call | output tokens | wall | CLI-reported list price | outcome |
@@ -122,6 +128,8 @@ own adversarial test.
 | m1-live-5 sf | 1,851 | 17 s | 0.0377 | [[14,2,3]] + SWAP (same code as m1-live-2) |
 | m1-live-6 sa | 12,097 | 112 s | 0.2675 | [[60,8,6]] (same candidate, fourth time) |
 | m1-live-6 sf | 2,669 | 25 s | 0.0644 | [[14,2,3]] + SWAP |
+| m1-live-7 sa | 8,440 | 73 s | 0.1694 | [[60,8,6]] (same candidate, fifth time) |
+| m1-live-7 sf | 2,360 | 24 s | 0.0479 | [[14,2,3]] + SWAP (candidate 02f09068…, as in m1-live-5) |
 
 The S-A answer is the identical proposal in all three hardened-era runs and the S-F code recurs, which is consistent
 with recall of a fixed construction; known-code labelling waits for M4. The m1-live-5 S-A call came within 44 tokens
