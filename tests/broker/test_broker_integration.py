@@ -237,3 +237,57 @@ def test_dispatch_switch_and_log_hygiene(env):
     for r in (x for x in recs if x.get("event") == "response"):
         assert any(a["seq"] < r["seq"] and a.get("decision") == "allow" and a.get("job_id") == r.get("job_id")
                    and a.get("path") == r.get("path") for a in recs)
+
+
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("counter", ["input_tokens", "output_tokens"])
+@pytest.mark.parametrize("mode", ["sse", "json"])
+def test_a_complete_message_missing_a_counter_stays_usage_missing(env, mode, counter, retry,
+                                                                  monkeypatch, tmp_path):
+    # Codex M1 re-review N2: complete framing (message_start, final message_delta, message_stop; or
+    # a JSON message with stop_reason) without a mandatory counter is not usage: the broker logs it
+    # unknown, alone or followed by a complete retry, and the call settles uncertain in full.
+    from zkqec.agents import providers
+    from zkqec.contracts import Reservation
+    from zkqec.contracts.jobs import charge_for
+    from zkqec.orchestrator.campaign import outcome_state
+    _, b, up, _ = env
+    jid = f"h_ctr_{mode}_{counter[:2]}{int(retry)}"
+    up.json_messages, up.drop_counter = mode == "json", [counter]
+    try:
+        br, c = _client(env, jid, "claude", "m1", Ceilings(2, 6, 4096, 100, 60))
+        sent = [c.request("POST", "/v1/messages", json.dumps(MSG).encode())
+                for _ in range(1 + retry)]
+        c.close(); br.stop()
+    finally:
+        up.json_messages, up.drop_counter = False, []
+    assert all(status == 200 for status, _ in sent)
+    if mode == "sse":                                    # the framing itself is complete
+        assert b"message_start" in sent[0][1] and b"message_stop" in sent[0][1]
+    deadline = time.time() + 10
+    while len([r for r in b.records(jid) if r.get("event") == "response"]) < len(sent):
+        assert time.time() < deadline
+        time.sleep(0.05)
+    recs = b.records(jid)
+    assert [r["usage_status"] for r in recs if r.get("event") == "response"] == \
+        ["unknown"] + ["reported"] * retry
+    s = summarize_job(recs)
+    assert s["model_requests"] == 1 + retry and s["usage_missing"] == 1
+
+    class Recorded:
+        ca_cert, port = b.ca_cert, b.port
+        grant = staticmethod(lambda *a, **k: "token")
+        revoke = staticmethod(lambda token: None)
+        blocked_reason = staticmethod(lambda job: None)
+        records = staticmethod(lambda job: recs)
+
+    monkeypatch.setattr(providers, "run_job", lambda *a, **k: _Job())
+    prov = providers.ClaudeCallProvider("m1", broker=Recorded(), slice_=None, jobs_root=tmp_path)
+    reservation = {"usd": 1.0, "requests": 2, "input_tokens": 8192, "output_tokens": 200,
+                   "wall_seconds": 60, "cpu_seconds": 0}
+    res = prov.call(job_id=jid, system_prompt="s", request="r", schema={},
+                    reservation=Reservation(**reservation))
+    assert res.outcome == "uncertain" and res.record["telemetry_complete"] is False
+    assert "input_tokens" not in res.usage and "output_tokens" not in res.usage
+    assert charge_for(outcome_state(res.outcome), reservation, res.usage) == \
+        {u: float(v) for u, v in reservation.items()}

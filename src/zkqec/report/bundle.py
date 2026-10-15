@@ -704,9 +704,12 @@ def audit_broker(adm, store, campaign_id: str, broker_dir: Path) -> list[str]:
     model requests and usage are reconstructed from the sealed log (the authoritative telemetry) and
     must equal its call record and its settled measurement; incomplete usage must have settled
     uncertain; each call's issued grant is the per-request derivation of its reservation and the log
-    shows it respected; a broker job without a call is an orphan."""
+    shows it respected; a broker job without a call is an orphan. Usage is complete only with its
+    mandatory counters (``input_tokens``, ``output_tokens``), never a missing counter read as zero
+    (Codex M1 re-review N2)."""
     from zkqec.agents.providers import call_ceilings
     from zkqec.broker.launcher import summarize_job
+    from zkqec.broker.policy import charged_tokens
     from zkqec.contracts import Reservation
 
     camp = adm.ledger.campaign(campaign_id)
@@ -772,12 +775,10 @@ def audit_broker(adm, store, campaign_id: str, broker_dir: Path) -> list[str]:
         actual = s["actual"] or {}
         if "requests" in actual and actual["requests"] != float(summ["model_requests"]):
             problems.append(f"{tag}: settled requests differ from the sealed broker log")
-        complete = summ["usage"] != "unknown" and summ["usage_missing"] == 0
-        if complete:
-            u = summ["usage"]
-            tokens = {"input_tokens": float(u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-                                            + u.get("cache_read_input_tokens", 0)),
-                      "output_tokens": float(u.get("output_tokens", 0))}
+        # Codex M1 re-review N2: complete only with both mandatory counters (never defaulted)
+        tokens = charged_tokens(summ["usage"]) if summ["usage"] != "unknown" \
+            and summ["usage_missing"] == 0 else None
+        if tokens is not None:
             if summ["model_requests"] and any(actual.get(k) != v for k, v in tokens.items()):
                 problems.append(f"{tag}: settled tokens differ from the sealed broker usage")
         elif summ["model_requests"] and (s["from_state"] != "uncertain"

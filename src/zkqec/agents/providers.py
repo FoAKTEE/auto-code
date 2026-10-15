@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..broker.launcher import Broker, Ceilings, summarize_job
-from ..broker.policy import Grant, reservation_bound
+from ..broker.policy import Grant, charged_tokens, reservation_bound
 from ..contracts import Reservation, content_hash
 from ..orchestrator.campaign import CallResult
 from ..sandbox.cgroup import CampaignSlice
@@ -118,6 +118,9 @@ class ClaudeCallProvider:
             cli = {}
         structured = cli.get("structured_output") if isinstance(cli, dict) else None
         usage_known = summ["usage"] != "unknown" and summ["usage_missing"] == 0
+        # Codex M1 re-review N2: tokens only with both mandatory counters, never a default of 0
+        tokens = charged_tokens(summ["usage"]) if usage_known else None
+        usage_known = tokens is not None
         record = {
             "provider": "claude", "model": self.model, "effort": self.effort,
             "launch": {**launch.describe(), "argv": [a if len(a) < 400 else f"<{len(a)} chars>"
@@ -137,12 +140,9 @@ class ClaudeCallProvider:
             "cli_stderr_tail": res.stderr.decode("utf-8", "replace")[-2000:],
             "telemetry_complete": bool(usage_known),
         }
-        tokens = summ["usage"] if usage_known else {}
         usage = {"requests": float(summ["model_requests"]), "wall_seconds": float(res.wall_seconds)}
-        if usage_known:
-            usage["input_tokens"] = float(tokens.get("input_tokens", 0) + tokens.get("cache_creation_input_tokens", 0)
-                                          + tokens.get("cache_read_input_tokens", 0))
-            usage["output_tokens"] = float(tokens.get("output_tokens", 0))
+        if tokens is not None:
+            usage.update(tokens)
         if isinstance(cli, dict) and cli.get("total_cost_usd") is not None:
             usage["usd"] = float(cli["total_cost_usd"])
         if summ["model_requests"] == 0 and not summ["failed"]:

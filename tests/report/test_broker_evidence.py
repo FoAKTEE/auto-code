@@ -57,8 +57,9 @@ def cfg(cid: str) -> CampaignConfig:
 class FakeCli:
     """Stands in for ``run_job``: appends the broker records of one sandboxed CLI call."""
 
-    def __init__(self, broker: Broker) -> None:
+    def __init__(self, broker: Broker, second_usage: dict | None = None) -> None:
         self.broker, self.calls, self.seq = broker, 0, 0
+        self.second_usage = second_usage
         self._write({"event": "broker_start", "policy_sha256": sha256_file(broker.policy_path),
                      "pid": 1})
 
@@ -96,7 +97,7 @@ class FakeCli:
             out = BAD
         else:
             self._request(job, 1)
-            self._response(job, usage)
+            self._response(job, self.second_usage or usage)
             out = GOOD
         stdout = json.dumps({"structured_output": out, "total_cost_usd": 0.0472,
                              "is_error": False}).encode()
@@ -105,9 +106,10 @@ class FakeCli:
                                 "stdout": stdout, "stderr": b""})()
 
 
-def run_live_like(root: Path, mp: pytest.MonkeyPatch, cid: str = "evid", **kw) -> tuple[dict, Path, Broker]:
+def run_live_like(root: Path, mp: pytest.MonkeyPatch, cid: str = "evid", second_usage=None,
+                  **kw) -> tuple[dict, Path, Broker]:
     broker = Broker(cid.replace(".", "-"), root / "ops", overrides=local_policy_overrides(443))
-    mp.setattr(providers, "run_job", FakeCli(broker))
+    mp.setattr(providers, "run_job", FakeCli(broker, second_usage))
     provider = providers.ClaudeCallProvider("claude-opus-5-5", broker=broker, slice_=None,
                                             jobs_root=root / "jobs")
     out = run_campaign(cfg(cid), provider, root / "runs", require_clean=False, broker=broker, **kw)
@@ -202,6 +204,44 @@ def test_tampered_broker_evidence_fails_the_audit(live, tmp_path, name):
     edit(ev)
     problems = audit_broker(adm, store, "evid", ev)
     assert any(expected in p for p in problems), problems
+
+
+def _lenient_summary(records):
+    """The pre-N2 summary: any non-empty usage record counted as reported."""
+    from zkqec.broker import launcher
+    s = dict(launcher.summarize_job(records))
+    reported = [r["usage"] for r in records if r.get("event") in ("response", "ws_server")
+                and r.get("usage")]
+    totals: dict = {}
+    for u in reported:
+        for k, v in u.items():
+            totals[k] = totals.get(k, 0) + int(v)
+    s.update(usage=totals or "unknown", usage_records=len(reported),
+             usage_missing=max(0, s["model_requests"] - len(reported)))
+    return s
+
+
+def test_a_missing_input_counter_is_never_audited_as_zero(tmp_path, monkeypatch):
+    """Codex M1 re-review N2: the second call's sealed broker log holds a complete-looking usage
+    record without input_tokens, and the call was settled completed as if that counter were zero
+    (the defect: the provider defaulted it, and the auditor made the same assumption). The broker
+    audit must refuse it: missing mandatory usage settles uncertain at the reservation."""
+    monkeypatch.setattr(providers, "summarize_job", _lenient_summary)
+    monkeypatch.setattr(providers, "charged_tokens", lambda u: {        # the defaulting provider
+        "input_tokens": float(u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                              + u.get("cache_read_input_tokens", 0)),
+        "output_tokens": float(u.get("output_tokens", 0))}, raising=False)
+    out, run, broker = run_live_like(tmp_path, monkeypatch, cid="n2", seal_bundle=False,
+                                     second_usage={"cache_creation_input_tokens": 100,
+                                                   "output_tokens": 2_000})
+    store = ArtifactStore(run / "store")
+    with Admission(run / "ledger.db", store, build_registry(store)) as adm:
+        forged = [s for s in adm.ledger.settlements("n2")
+                  if s["kind"] == "propose" and s["from_state"] == "completed"]
+        assert len(forged) == 1 and forged[0]["actual"]["input_tokens"] == 100.0
+        problems = audit_broker(adm, store, "n2", run / "broker")
+    job = forged[0]["job_id"]
+    assert any(job in p and "did not settle uncertain" in p for p in problems), problems
 
 
 def test_a_secret_in_the_broker_evidence_refuses_the_seal(live, tmp_path, monkeypatch):

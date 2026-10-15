@@ -286,3 +286,44 @@ def test_reservation_bound():
     g = P.Grant("j", "claude", frozenset(), 3, 8, 400_000, 1024, 0)
     r = P.reservation_bound(g, price_in_per_mtok=0.2, price_out_per_mtok=0.5, price_per_request=0.0)
     assert r == pytest.approx(3 * (400_000 * 0.2 + 1024 * 0.5) / 1e6)
+
+
+# Codex M1 re-review N2: complete framing is not enough; the mandatory counters must be present
+def test_usage_requires_its_mandatory_counters():
+    """``input_tokens`` (message_start usage, or the JSON usage) and ``output_tokens`` (the final
+    message_delta, or the JSON usage) are mandatory: a complete message missing either (or giving
+    a non-integer or negative count) is unknown usage, never a zero. Cache counters absent from a
+    complete message (or null) are zero: the API omits them when no cache was used; a present but
+    malformed cache counter is unknown usage."""
+    stop = {"type": "message_stop"}
+
+    def start(**usage):
+        return {"type": "message_start", "message": {"usage": usage}}
+    sse = "text/event-stream"
+    missing = [
+        _sse({"type": "message_start", "message": {}}, _TEXT, dict(_DELTA, usage={"output_tokens": 20}),
+             stop),                                              # the Codex repro: no initial usage
+        _sse(start(output_tokens=1), _TEXT, _DELTA, stop),       # usage without input_tokens
+        _sse(start(input_tokens="7", output_tokens=1), _DELTA, stop),
+        _sse(start(input_tokens=True, output_tokens=1), _DELTA, stop),
+        _sse(start(input_tokens=-1, output_tokens=1), _DELTA, stop),
+        _sse(start(input_tokens=7), dict(_DELTA, usage={"output_tokens": -3}), stop),
+        _sse(start(input_tokens=7), dict(_DELTA, usage={"output_tokens": 2.5}), stop),
+        _sse(start(input_tokens=7, cache_read_input_tokens="9"), _DELTA, stop),
+        _sse(start(input_tokens=7, cache_creation_input_tokens=-1), _DELTA, stop),
+    ]
+    for body in missing:
+        assert P.anthropic_usage(body, sse) is None, body
+    ok = P.anthropic_usage(_sse(start(input_tokens=7, cache_read_input_tokens=None), _DELTA, stop), sse)
+    assert ok["usage"] == {"input_tokens": 7, "output_tokens": 40}
+    assert P.charged_tokens(ok["usage"]) == {"input_tokens": 7.0, "output_tokens": 40.0}
+    cached = P.anthropic_usage(_sse(start(input_tokens=7, cache_creation_input_tokens=100,
+                                          cache_read_input_tokens=3), _DELTA, stop), sse)
+    assert P.charged_tokens(cached["usage"]) == {"input_tokens": 110.0, "output_tokens": 40.0}
+    msg = {"type": "message", "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 9}}
+    for usage in ({"output_tokens": 9}, {"input_tokens": 3}, {"input_tokens": None, "output_tokens": 9},
+                  {"input_tokens": 3, "output_tokens": "9"}, {"input_tokens": 3, "output_tokens": -9},
+                  {"input_tokens": 3, "output_tokens": 9, "cache_read_input_tokens": 1.5}):
+        assert P.anthropic_usage(json.dumps(dict(msg, usage=usage)).encode(), "application/json") is None
+    assert P.charged_tokens({"output_tokens": 9}) is None and P.charged_tokens({"input_tokens": 3}) is None
+    assert P.charged_tokens({"input_tokens": 3, "output_tokens": True}) is None

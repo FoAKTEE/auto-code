@@ -591,16 +591,44 @@ def _flat_usage(u: Any) -> dict[str, int]:
 
 
 MAX_USAGE_BODY_BYTES = 64 << 20               # larger model responses are not parsed: usage unknown
+MANDATORY_USAGE = ("input_tokens", "output_tokens")
+CACHE_INPUT_USAGE = ("cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _count(v: Any) -> bool:
+    return type(v) is int and v >= 0
+
+
+def _counters_ok(u: Any) -> bool:
+    """Every token counter present (and not null) is a non-negative integer."""
+    return not isinstance(u, dict) or all(u.get(k) is None or _count(u[k])
+                                          for k in MANDATORY_USAGE + CACHE_INPUT_USAGE)
+
+
+def charged_tokens(u: Any) -> dict[str, float] | None:
+    """The charged token units of one usage record (§K): input = ``input_tokens`` + cache writes +
+    cache reads, output = ``output_tokens``. None (unknown) unless both mandatory counters are
+    non-negative integers: a missing mandatory counter is never zero (Codex M1 re-review N2). Cache
+    counters absent from a complete record (or null) count as zero, since the API omits them when
+    no cache was used; a malformed one makes the record unknown."""
+    if not isinstance(u, dict) or not all(_count(u.get(k)) for k in MANDATORY_USAGE) \
+            or not _counters_ok(u):
+        return None
+    return {"input_tokens": float(u["input_tokens"] + sum(u.get(k) or 0 for k in CACHE_INPUT_USAGE)),
+            "output_tokens": float(u["output_tokens"])}
 
 
 def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = MAX_USAGE_BODY_BYTES, *,
                     complete: bool = True) -> dict[str, Any] | None:
     """Usage of one **complete** Anthropic Messages response, else None (unknown, §J5, §K).
 
-    SSE: exactly one ``message_start`` (initial usage), a final ``message_delta`` carrying usage with
-    an output count, then ``message_stop``, and no ``error`` event. JSON: a message with ``usage`` and
-    a non-null ``stop_reason``. A cleanly ended HTTP body without these (a stream cut short upstream)
-    is not complete accounting, whatever partial counters it held (Codex M1 milestone review B2).
+    SSE: exactly one ``message_start`` whose usage has ``input_tokens``, a final ``message_delta``
+    carrying usage with ``output_tokens``, then ``message_stop``, and no ``error`` event. JSON: a
+    message with a non-null ``stop_reason`` and ``usage`` with ``input_tokens`` and
+    ``output_tokens``. A cleanly ended HTTP body without these (a stream cut short upstream) is not
+    complete accounting, whatever partial counters it held (Codex M1 milestone review B2), and
+    neither is complete framing without a mandatory counter, or with any token counter that is not
+    a non-negative integer (Codex M1 re-review N2; see :func:`charged_tokens`).
     ``complete=False`` returns whatever partial usage was seen (diagnostics only, never a usage
     record)."""
     if len(body) > max_bytes:
@@ -610,7 +638,7 @@ def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = MAX_
         usage: dict[str, int] = {}
         stop = None
         starts = 0
-        final_usage = stopped = failed = after_stop = False
+        start_input = final_usage = stopped = failed = after_stop = malformed = False
         for line in text.splitlines():
             if not line.startswith("data:"):
                 continue
@@ -629,10 +657,14 @@ def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = MAX_
             if t == "message_start":
                 starts += 1
                 msg = ev.get("message")
-                usage.update(_flat_usage(msg.get("usage") if isinstance(msg, dict) else None))
+                u = msg.get("usage") if isinstance(msg, dict) else None
+                start_input = isinstance(u, dict) and _count(u.get("input_tokens"))
+                malformed = malformed or not _counters_ok(u)
+                usage.update(_flat_usage(u))
             elif t == "message_delta":
                 u = ev.get("usage")
-                final_usage = isinstance(u, dict) and type(u.get("output_tokens")) is int
+                final_usage = isinstance(u, dict) and _count(u.get("output_tokens"))
+                malformed = malformed or not _counters_ok(u)
                 usage.update(_flat_usage(u))
                 delta = ev.get("delta")
                 stop = (delta.get("stop_reason") if isinstance(delta, dict) else None) or stop
@@ -640,7 +672,8 @@ def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = MAX_
                 stopped = True
             elif t == "error":
                 failed = True
-        ok = starts == 1 and final_usage and stopped and not failed and not after_stop
+        ok = starts == 1 and start_input and final_usage and stopped and not failed \
+            and not after_stop and not malformed and charged_tokens(usage) is not None
         if ok or (not complete and (starts or usage)):
             return {"usage": usage, "stop_reason": sanitize_label(stop)}
         return None
@@ -648,8 +681,8 @@ def anthropic_usage(body: bytes, content_type: str | None, max_bytes: int = MAX_
         doc = json.loads(text)
     except ValueError:
         return None
-    if isinstance(doc, dict) and isinstance(doc.get("usage"), dict) \
-            and (doc.get("stop_reason") is not None or not complete):
+    if isinstance(doc, dict) and isinstance(doc.get("usage"), dict) and (not complete or (
+            doc.get("stop_reason") is not None and charged_tokens(doc["usage"]) is not None)):
         return {"usage": _flat_usage(doc["usage"]), "stop_reason": sanitize_label(doc.get("stop_reason"))}
     return None
 

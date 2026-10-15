@@ -263,11 +263,14 @@ def _port_open(port: int) -> bool:
 
 
 def summarize_job(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Telemetry for one job from broker records (§J5). Missing usage is ``unknown``, never zero."""
+    """Telemetry for one job from broker records (§J5). Missing usage is ``unknown``, never zero: a
+    usage record counts as reported only with both mandatory counters (``input_tokens``,
+    ``output_tokens``; :func:`~zkqec.broker.policy.charged_tokens`), any other is missing (Codex M1
+    re-review N2)."""
     allowed = [r for r in records if r.get("event") in ("request", "ws_frame") and r.get("decision") == P.ALLOW]
     model = [r for r in allowed if r.get("model_request")]
     usages = [r for r in records if r.get("event") in ("response", "ws_server") and "usage" in r]
-    reported = [r["usage"] for r in usages if r.get("usage")]
+    reported = [r["usage"] for r in usages if P.charged_tokens(r.get("usage")) is not None]
     tools: set[str] = set()
     for r in model:
         tools.update(t for t in (r.get("tools") or []) if t)

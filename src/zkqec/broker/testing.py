@@ -66,7 +66,10 @@ class FakeUpstream:
     JSON 200 otherwise. ``sse_delay`` holds the SSE body back after its first part (a slow, thinking
     model); ``sse_gzip`` sends it with ``Content-Encoding: gzip``; ``sse_truncate`` makes that many
     next model responses end cleanly (correct Content-Length) in the middle of the message, after
-    ``message_start`` and one text delta."""
+    ``message_start`` and one text delta. ``json_messages`` answers with one JSON message instead of
+    a stream; ``drop_counter`` lists, per next model response, a usage counter to leave out of an
+    otherwise complete message (``input_tokens``: from ``message_start`` or the JSON usage;
+    ``output_tokens``: from the final ``message_delta`` or the JSON usage)."""
     cert: str
     key: str
     seen: list[Seen] = field(default_factory=list)
@@ -74,6 +77,8 @@ class FakeUpstream:
     sse_delay: float = 0.0
     sse_gzip: bool = False
     sse_truncate: int = 0
+    json_messages: bool = False
+    drop_counter: list[str] = field(default_factory=list)
 
     def start(self) -> "FakeUpstream":
         ready = threading.Event()
@@ -117,15 +122,30 @@ class FakeUpstream:
                     return
                 self.seen.append(Seen("http", method, path, len(body)))
                 if method == "POST" and path.split("?")[0] == "/v1/messages":
-                    events = list(SSE_MESSAGE)
-                    if self.sse_truncate > 0:
-                        self.sse_truncate -= 1
-                        events = events[:3]
-                    parts = [f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events]
-                    payload, ctype = b"".join(parts), b"text/event-stream"
-                    if self.sse_delay or self.sse_gzip:
-                        await self._send_sse(w, parts)
-                        continue
+                    events = json.loads(json.dumps(SSE_MESSAGE))
+                    drop = self.drop_counter.pop(0) if self.drop_counter else None
+                    if drop == "input_tokens":
+                        del events[0]["message"]["usage"]["input_tokens"]
+                    elif drop == "output_tokens":
+                        del events[-2]["usage"]["output_tokens"]
+                    if self.json_messages:
+                        usage = {**events[0]["message"]["usage"], **events[-2]["usage"]}
+                        if drop is not None:
+                            usage.pop(drop, None)
+                        payload, ctype = json.dumps({
+                            "type": "message", "role": "assistant", "stop_reason": "end_turn",
+                            "content": [{"type": "text", "text": "{}"}],
+                            "usage": usage}).encode(), b"application/json"
+                    else:
+                        if self.sse_truncate > 0:
+                            self.sse_truncate -= 1
+                            events = events[:3]
+                        parts = [f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode()
+                                 for e in events]
+                        payload, ctype = b"".join(parts), b"text/event-stream"
+                        if self.sse_delay or self.sse_gzip:
+                            await self._send_sse(w, parts)
+                            continue
                 else:
                     payload, ctype = b'{"ok":true}', b"application/json"
                 w.write(b"HTTP/1.1 200 OK\r\nContent-Type: " + ctype + b"\r\nContent-Length: "
