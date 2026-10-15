@@ -478,3 +478,54 @@ def test_the_archived_live_bundles_are_classified_by_their_contents():
     assert bundle_mod.final_confirmation(found["m1-live-5"])["problems"] == []
     assert bundle_mod.final_confirmation(found["m1-live-4"])["problems"] == \
         ["the confirmation audit did not pass"]                # m1-live-4 stays failed evidence
+
+
+# --- Codex M1 re-review N5: supplement totals are finite, non-negative numbers ---------------------
+def _total(text: str, unit: str, field: str, raw: str | None) -> str:
+    """The supplement with ``final_totals[unit][field]`` set to the raw JSON text ``raw`` (None:
+    removed); raw text so that non-standard constants such as NaN can be written."""
+    doc = json.loads(text)
+    if raw is None:
+        del doc["final_totals"][unit][field]
+        return json.dumps(doc)
+    doc["final_totals"][unit][field] = "__X__"
+    return json.dumps(doc).replace('"__X__"', raw)
+
+
+def _spent(text: str) -> str:
+    return json.dumps(str(json.loads(text)["final_totals"]["usd"]["spent"]))
+
+
+TOTALS_TAMPER = {
+    "nan_spent": lambda t: _total(t, "usd", "spent", "NaN"),              # the Codex repro
+    "infinity_spent": lambda t: _total(t, "usd", "spent", "Infinity"),
+    "overflow_spent": lambda t: _total(t, "usd", "spent", "1e999"),       # parses to inf
+    "negative_open": lambda t: _total(t, "usd", "open", "-1.0"),
+    "string_spent": lambda t: _total(t, "usd", "spent", _spent(t)),       # the right value
+    "bool_open": lambda t: _total(t, "requests", "open", "false"),
+    "missing_spent": lambda t: _total(t, "usd", "spent", None),
+    "extra_field": lambda t: _total(t, "usd", "refund", "1.0"),
+    "missing_unit": lambda t: json.dumps({**json.loads(t), "final_totals": {
+        k: v for k, v in json.loads(t)["final_totals"].items() if k != "cpu_seconds"}}),
+    "not_an_object": lambda t: json.dumps({**json.loads(t), "final_totals": [1, 2]}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(TOTALS_TAMPER))
+def test_supplement_totals_must_be_finite_non_negative_numbers(sealed, tmp_path, name):
+    out, run, bundle, supp = sealed
+    bad = tmp_path / supp.name
+    bad.write_text(TOTALS_TAMPER[name](supp.read_text()))
+    problems = check_confirmation(bundle, bad)
+    assert any("final totals" in p or "non-standard JSON" in p for p in problems), problems
+
+
+def test_a_non_standard_json_constant_anywhere_makes_the_supplement_unreadable(sealed, tmp_path):
+    out, run, bundle, supp = sealed
+    bad = tmp_path / supp.name
+    doc = json.loads(supp.read_text())
+    doc["audit"]["problems"] = ["__X__"]
+    bad.write_text(json.dumps(doc).replace('"__X__"', "-Infinity"))
+    assert check_confirmation(bundle, bad) == ["supplement unreadable: non-standard JSON constant "
+                                               "-Infinity"]
+    assert bundle_mod.load_supplement(supp) == json.loads(supp.read_text())

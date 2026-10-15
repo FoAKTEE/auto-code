@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -338,9 +339,43 @@ REQUIRED, NOT_REQUIRED = "required", "not_required"       # the manifest's ``con
 BROKER_EVIDENCE = "bundle/broker/broker-manifest.json"
 
 
+class NonStandardJSON(ValueError):
+    """A JSON text with a non-standard constant (NaN, Infinity, -Infinity)."""
+
+
+def _refuse_constant(name: str) -> Any:
+    raise NonStandardJSON(f"non-standard JSON constant {name}")
+
+
 def load_supplement(path: Path) -> Any:
-    """The parsed confirmation supplement (``ValueError`` if it is not JSON)."""
-    return json.loads(Path(path).read_text())
+    """The parsed confirmation supplement: standard JSON only, so ``NaN``, ``Infinity`` and
+    ``-Infinity`` are refused (:class:`NonStandardJSON`; Codex M1 re-review N5); ``ValueError`` if
+    it is not JSON."""
+    return json.loads(Path(path).read_text(), parse_constant=_refuse_constant)
+
+
+def _amount(v: Any) -> bool:
+    """A total: a finite, non-negative int or float (never a bool or a string)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
+
+
+def _totals_problems(totals: Any, units: tuple[str, ...]) -> tuple[list[str], set[str]]:
+    """Shape of ``final_totals``: exactly ``{unit: {"spent": x, "open": y}}`` for every unit, each
+    amount finite and non-negative; return (problems, the units that are well formed)."""
+    if not isinstance(totals, dict):
+        return ["final totals are not an object of units"], set()
+    problems = []
+    if set(totals) != set(units):
+        problems.append(f"final totals name units {sorted(map(str, totals))}, not {sorted(units)}")
+    good = set()
+    for u in units:
+        t = totals.get(u)
+        if isinstance(t, dict) and set(t) == {"spent", "open"} and all(map(_amount, t.values())):
+            good.add(u)
+        else:
+            problems.append(f"final totals for {u} are not finite non-negative numbers "
+                            "{spent, open}")
+    return problems, good
 
 
 def supplement_path(bundle: Path) -> Path:
@@ -453,12 +488,16 @@ def _bundle_members(bundle: Path, names: set[str], dest: Path) -> dict[str, Path
 def check_confirmation(bundle: Path, supplement: Path) -> list[str]:
     """A confirmation supplement against its sealed bundle: same bundle hash and sealed head, events
     chained from that head, exactly the frozen confirmation job settled under the settlement rule,
-    and final totals equal to the sealed settlements plus the supplement's."""
+    and final totals equal to the sealed settlements plus the supplement's. The supplement is
+    standard JSON (no NaN or Infinity) and every charge and total is a finite non-negative number
+    of the right shape before it is compared (Codex M1 re-review N5)."""
     from zkqec.admission.ledger import event_hash
     from zkqec.contracts import UNITS, UsageError, check_usage
     from zkqec.contracts.jobs import charge_for
     try:
         doc = load_supplement(supplement)
+    except NonStandardJSON as exc:
+        return [f"supplement unreadable: {exc}"]
     except (OSError, ValueError) as exc:
         return [f"supplement unreadable: {type(exc).__name__}"]
     if not isinstance(doc, dict) or doc.get("format") != CONFIRMATION_FORMAT:
@@ -489,7 +528,11 @@ def check_confirmation(bundle: Path, supplement: Path) -> list[str]:
         return problems + ["the sealed ledger has no frozen campaign"]
     prev, seq = head.get("hash"), head.get("seq", 0)
     settled = []
-    for ev in doc.get("events") or []:
+    events = doc.get("events")
+    if not isinstance(events, list) or not all(isinstance(ev, dict) for ev in events):
+        problems.append("supplement events are not a list of events")
+        events = []
+    for ev in events:
         seq += 1
         if ev.get("seq") != seq or ev.get("prev_hash") != prev \
                 or ev.get("hash") != event_hash(prev, ev.get("kind"), ev.get("payload")):
@@ -519,16 +562,28 @@ def check_confirmation(bundle: Path, supplement: Path) -> list[str]:
             rule = None
         if rule != p.get("charged"):
             problems.append("confirmation charge does not follow the settlement rule (§K)")
-    if not (doc.get("audit") or {}).get("ok"):
+    audit = doc.get("audit")
+    if not (isinstance(audit, dict) and audit.get("ok") is True):
         problems.append("the confirmation audit did not pass")
+    # N5: every charge and total is a finite, non-negative number before any comparison (a NaN
+    # compares false with everything, so it would pass an inequality test)
     spent = {u: 0.0 for u in UNITS}
     for p in [p for k, p in sealed if k == "job_settled" and p.get("campaign_id") == cid] + settled:
+        try:
+            charged = check_usage(p.get("charged"), complete=True)
+        except UsageError:
+            problems.append(f"settlement of job {p.get('job_id')} has no finite non-negative "
+                            "charge per unit")
+            continue
         for u in UNITS:
-            spent[u] += float((p.get("charged") or {}).get(u, 0.0))
-    totals = doc.get("final_totals") or {}
+            spent[u] += charged[u]
+    shape, good = _totals_problems(doc.get("final_totals"), UNITS)
+    problems += shape
     for u in UNITS:
-        t = totals.get(u) or {}
-        if abs(float(t.get("spent", -1)) - spent[u]) > 1e-9 or float(t.get("open", -1)) != 0.0:
+        if u not in good:
+            continue
+        t = doc["final_totals"][u]
+        if abs(float(t["spent"]) - spent[u]) > 1e-9 or t["open"] != 0:
             problems.append(f"final totals for {u} differ from the sealed and confirmation "
                             "settlements (or leave a reservation open)")
     return problems
