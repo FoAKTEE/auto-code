@@ -5,8 +5,11 @@ Flow for one proposal (prompt §7 step 3, appendix §B, §C, §F):
   L2 (distance at the half-weight the task needs: certify d ≥ d_min ⇔ exclusion through d_min−1,
   so t = ⌈(d_min−1)/2⌉) → [S-F] L3 (logical_action) → DesignCandidate → resolver verdicts.
 
-Every verifier run is a job in the :class:`JobBook`; its settlement commits inside the admission's
-closing transaction (fenced by the lease generation). Recovery (§L): a settled job is only ever
+Every verifier and identity run is a job in the :class:`JobBook` with a CPU and a wall-clock
+reservation; the wall ceiling is enforced (exceeding it closes the execution as ``crashed`` with no
+receipt), L2 work is additionally bounded by its deterministic budgets (patterns, pairs, memory), and
+the measured CPU and wall time are charged. Settlement commits inside the admission's closing
+transaction (fenced by the lease generation). Recovery (§L): a settled job is only ever
 *read* (its execution's recorded closure); a settled job whose execution never closed gets its old
 execution closed as abandoned and a **new** reserved retry job (``retry_of``, its own execution key
 and reservation, fenced settlement). Agents never call this module; the orchestrator does.
@@ -148,16 +151,16 @@ def _strict_witnesses(w: Any) -> dict[str, Any]:
 class Pipeline:
     def __init__(self, admission: Admission, store: ArtifactStore, book: JobBook, domain: str, *,
                  caps: GrammarCaps, distance_budget: dict | None = None, cpu_reservation: int = 600,
-                 families: tuple[str, ...] | None = None):
+                 wall_reservation: int = 600, families: tuple[str, ...] | None = None):
         self.adm, self.store, self.book, self.domain = admission, store, book, domain
         self.caps, self.distance_budget = caps, distance_budget or {}
-        self.cpu_reservation = cpu_reservation
+        self.cpu_reservation, self.wall_reservation = cpu_reservation, wall_reservation
         self.families = None if families is None else frozenset(families)   # frozen profile
 
     # -- one verifier run = one settled job -------------------------------------------------------
-    def _run(self, name: str, inputs: dict[str, str], key: str):
-        res = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0, wall_seconds=0,
-                          cpu_seconds=self.cpu_reservation)
+    def _run(self, name: str, inputs: dict[str, str], key: str, *, identity: bool = False):
+        res = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0,
+                          wall_seconds=self.wall_reservation, cpu_seconds=self.cpu_reservation)
         prev = None
         for attempt in range(MAX_ATTEMPTS):
             ekey = key if attempt == 0 else f"{key}#retry{attempt}"
@@ -171,7 +174,7 @@ class Pipeline:
                 if done is not None:                     # closed under another namespace's job
                     self.book.cancel(job)
                     return done
-                return self._execute(job, name, inputs, ekey)
+                return self._execute(job, name, inputs, ekey, identity)
             if state != "settled":                       # completed/failed/uncertain: charge it
                 self.book.settle(job)
             done = self.adm.closed_report(name, inputs, self.domain, ekey)
@@ -184,17 +187,22 @@ class Pipeline:
             prev = job
         raise RetriesExhausted(f"{name}:{key}: no completed closure after {MAX_ATTEMPTS} attempts")
 
-    def _execute(self, job: str, name: str, inputs: dict[str, str], ekey: str):
+    def _execute(self, job: str, name: str, inputs: dict[str, str], ekey: str, identity: bool):
         gen = self.book.dispatch(job)
-        t0 = time.process_time()
+        t0, w0 = time.process_time(), time.monotonic()
 
         def settle(outcome: str) -> None:
-            cpu = max(0.0, time.process_time() - t0)
+            usage = {"cpu_seconds": max(0.0, time.process_time() - t0),
+                     "wall_seconds": max(0.0, time.monotonic() - w0)}
             self.book.complete(job, gen, "completed" if outcome == "admitted" else "failed",
-                               actual={"cpu_seconds": cpu})
+                               actual=usage)
             self.book.settle(job)
+        if identity:
+            return self.adm.run_identity(name, inputs["presentation"], self.domain,
+                                         idempotency_key=ekey, on_close=settle,
+                                         wall_seconds=self.wall_reservation)
         return self.adm.run_verifier(name, inputs, self.domain, idempotency_key=ekey,
-                                     on_close=settle)
+                                     on_close=settle, wall_seconds=self.wall_reservation)
 
     # -- evaluation --------------------------------------------------------------------------------
     def evaluate(self, proposal: Proposal, task: TaskSA | TaskSF) -> Evaluation:
@@ -214,7 +222,7 @@ class Pipeline:
         if facts.get("css_valid") != "verified":
             ev.facts = facts
             return self._verdicts(ev, task, DesignCandidate(C=p_sha))
-        self.adm.run_identity("identity.code_sha", p_sha, self.domain, idempotency_key=f"id:{p_sha}")
+        self._run("identity.code_sha", {"presentation": p_sha}, f"id:{p_sha}", identity=True)
         res = self.adm.resolver(self.domain)
         ev.code = (res.code_of(p_sha) or (None, None))[0]
         facts = self._presentation_facts(res, p_sha)

@@ -10,7 +10,9 @@ satisfied or the proposal budget is spent → templated report (from the ledger 
 from __future__ import annotations
 
 import json
+import resource
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -45,6 +47,13 @@ class CampaignConfig(Frozen):
     per_call: Reservation
     distance_budget: dict[str, int] = Field(default_factory=dict)
     max_n: int = Field(default=200, ge=1, le=1024)
+    # §K: per-verifier-job ceilings (wall enforced, CPU and wall charged as measured) and the
+    # confirmation (offline re-execution) capacity reserved before any proposal is dispatched.
+    verifier_cpu_seconds: int = Field(default=600, ge=1)
+    verifier_wall_seconds: int = Field(default=600, ge=1)
+    confirmation: Reservation = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0,
+                                            wall_seconds=1800, cpu_seconds=1800)
+    deadline_seconds: int | None = Field(default=None, ge=0)   # campaign wall-clock deadline
     labels: tuple[Literal["single-implementation", "non-evaluation", "K0-unenforced", "dev-only",
                           "fixture"], ...] = ("single-implementation", "non-evaluation")
 
@@ -116,7 +125,11 @@ def _task_view(task: TaskSA | TaskSF) -> dict[str, Any]:
 
 def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                  require_clean: bool = True, seal_bundle: bool = True,
-                 archive: Path | None = None) -> dict[str, Any]:
+                 archive: Path | None = None,
+                 deadline_seconds: float | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    limits = [x for x in (cfg.deadline_seconds, deadline_seconds) if x is not None]
+    deadline = started + min(limits) if limits else None
     gs = git_state()
     if require_clean and gs["dirty"]:
         raise EvaluatorDirty(f"evaluator tree is dirty: {gs['dirty_paths']}")
@@ -140,14 +153,24 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     manifest_sha = store.put_json(manifest)
     (run / "manifest.json").write_bytes(store.get_bytes(manifest_sha))
     prof = profile_key(cfg.profile)
+    confirmation = config["confirmation"]
     adm.freeze_campaign(cfg.campaign_id, namespace=namespace(cfg.campaign_id, profile=prof),
                         config=config, tasks=config["tasks"], caps=dict(cfg.caps),
-                        labels=list(cfg.labels), domain=dom, manifest=manifest_sha)
+                        labels=list(cfg.labels), domain=dom, manifest=manifest_sha,
+                        confirmation={u: float(v) for u, v in confirmation.items()})
     book = adm.job_book(cfg.campaign_id, profile=prof)
     book.set_caps(cfg.caps)
+    try:
+        # §K: confirmation capacity is reserved before any proposal is dispatched.
+        confirm_job = book.reserve("confirm", "confirmation", cfg.confirmation)
+    except BaseException:
+        adm.close()
+        raise
     families = tuple(grammar_for(cfg.profile))
     pipe = Pipeline(adm, store, book, dom, caps=GrammarCaps(max_n=cfg.max_n),
-                    distance_budget=cfg.distance_budget, families=families)
+                    distance_budget=cfg.distance_budget, families=families,
+                    cpu_reservation=cfg.verifier_cpu_seconds,
+                    wall_reservation=cfg.verifier_wall_seconds)
     evaluations = 0
     calls_dir = run / "calls"; calls_dir.mkdir()
     stop_reason = {}
@@ -156,7 +179,13 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
             history: list[Evaluation] = []
             launch_failures = 0
             stop_reason[task.task_id] = "proposal_budget_spent"
+            if deadline is not None and time.monotonic() >= deadline:
+                stop_reason[task.task_id] = "deadline"
+                continue
             for i in range(cfg.max_proposals_per_task):
+                if deadline is not None and time.monotonic() >= deadline:
+                    stop_reason[task.task_id] = "deadline"         # §7 stop rule: no new dispatch
+                    break
                 request = json.dumps({"task": _task_view(task), "digest": json.loads(render_digest(history)),
                                       "grammar": grammar_for(cfg.profile)}, sort_keys=True)
                 if lint_request(request, [task.task_id]):
@@ -224,6 +253,34 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
         kw = {"archive": archive} if archive else {}
         entry = seal(run, cfg.campaign_id, run / "ledger.db", run / "store", report_md,
                      extra_dirs={"calls": calls_dir}, commit=gs["commit"], **kw)
-        audit = audit_bundle(Path(entry["path"]), workdir=run / "audit", **kw)
-        out.update(bundle=entry, audit={k: audit[k] for k in ("ok", "problems") if k in audit})
+        audit, confirmation_charge = _confirm(run, cfg, prof, store, confirm_job, entry, kw)
+        out.update(bundle=entry, audit={k: audit[k] for k in ("ok", "problems") if k in audit},
+                   confirmation=confirmation_charge)
     return out
+
+
+def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, job: str,
+             entry: dict, kw: dict) -> tuple[dict, dict]:
+    """Phase-1a confirmation (§7.4): offline re-execution from the sealed bundle, run under the
+    confirmation job reserved at freeze. Its dispatch and settlement happen after the bundle was
+    sealed (the sealed ledger shows the reservation as reserved, not spent); the measured wall and
+    child CPU time are charged in the run ledger."""
+    adm = Admission(run / "ledger.db", store, build_registry(store))
+    try:
+        book = adm.job_book(cfg.campaign_id, profile=prof)
+        gen = book.dispatch(job)
+        w0 = time.monotonic()
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        audit: dict[str, Any] = {"ok": False, "problems": ["confirmation did not complete"]}
+        try:
+            audit = audit_bundle(Path(entry["path"]), workdir=run / "audit", **kw)
+        finally:
+            c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            usage = {"wall_seconds": time.monotonic() - w0,
+                     "cpu_seconds": (c1.ru_utime + c1.ru_stime) - (c0.ru_utime + c0.ru_stime),
+                     "usd": 0.0, "requests": 0.0, "input_tokens": 0.0, "output_tokens": 0.0}
+            book.complete(job, gen, "completed" if audit.get("ok") else "failed", actual=usage)
+            charged = book.settle(job)
+    finally:
+        adm.close()
+    return audit, charged

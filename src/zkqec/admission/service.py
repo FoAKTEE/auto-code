@@ -18,8 +18,11 @@ changed or vanished) and raises :class:`AdmissionRefused`.
 from __future__ import annotations
 
 import re
+import signal
+import threading
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal
 
@@ -37,6 +40,32 @@ MAX_RESULTS = 10_000
 MAX_MESSAGE = 500
 _CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 Outcome = Literal["admitted", "crashed", "refused"]
+
+
+class _WallDeadline(BaseException):
+    """Raised from SIGALRM when a verifier exceeds its wall-clock ceiling (never caught by
+    verifier code, which only catches Exception)."""
+
+
+@contextmanager
+def _wall_deadline(seconds: float | None):
+    """Wall-clock ceiling for one verifier call (§K). Enforced with SIGALRM in the main thread
+    when no other interval timer is active; otherwise the deterministic budgets and the campaign
+    cgroup slice bound the work."""
+    if (not seconds or threading.current_thread() is not threading.main_thread()
+            or not hasattr(signal, "setitimer") or signal.getitimer(signal.ITIMER_REAL)[0] > 0):
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise _WallDeadline()
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 class AdmissionRefused(Exception):
@@ -107,12 +136,15 @@ class Admission:
     # -- verifiers -------------------------------------------------------------------------------
     def run_verifier(self, name: str, inputs: dict[str, str], domain: str, *,
                      idempotency_key: str | None = None,
-                     on_close: Callable[[str], None] | None = None) -> ExecutionReport:
+                     on_close: Callable[[str], None] | None = None,
+                     wall_seconds: float | None = None) -> ExecutionReport:
         """Run a registered verifier and admit its results.
 
         ``on_close(outcome)`` runs INSIDE the closing write transaction (outcome ``admitted``,
         ``refused`` or ``crashed``) so operational job settlement and accounting commit atomically
         with the admission (appendix §L). It is not called for replayed executions.
+        ``wall_seconds`` is the job's wall-clock ceiling: exceeding it closes the execution as
+        ``crashed`` (``wall_timeout``) with no receipt — never a bound.
         """
         spec = self.registry.get(name, "verifier")
         loaded = self._load_inputs(inputs)
@@ -121,7 +153,11 @@ class Admission:
         if done is not None:
             return done
         try:
-            raw = spec.fn(**loaded)
+            with _wall_deadline(wall_seconds):
+                raw = spec.fn(**loaded)
+        except _WallDeadline:
+            return self._close_crashed(ex, "wall_timeout",
+                                       f"wall-clock ceiling of {wall_seconds} s reached", on_close)
         except Exception as exc:                                    # noqa: BLE001
             return self._close_crashed(ex, type(exc).__name__, str(exc), on_close)
         try:
@@ -150,7 +186,9 @@ class Admission:
 
     # -- identity --------------------------------------------------------------------------------
     def run_identity(self, name: str, presentation: str, domain: str, *,
-                     idempotency_key: str | None = None) -> ExecutionReport:
+                     idempotency_key: str | None = None,
+                     on_close: Callable[[str], None] | None = None,
+                     wall_seconds: float | None = None) -> ExecutionReport:
         """Record ``presentation -> code`` as computed by a registered identity function.
 
         The mapping comes only from the function's return value and the issuer only from the
@@ -164,18 +202,23 @@ class Admission:
         if done is not None:
             return done
         try:
-            code = spec.fn(**loaded)
+            with _wall_deadline(wall_seconds):
+                code = spec.fn(**loaded)
+        except _WallDeadline:
+            return self._close_crashed(ex, "wall_timeout",
+                                       f"wall-clock ceiling of {wall_seconds} s reached", on_close)
         except Exception as exc:                                    # noqa: BLE001
-            return self._close_crashed(ex, type(exc).__name__, str(exc))
+            return self._close_crashed(ex, type(exc).__name__, str(exc), on_close)
         try:
             check_sha(code)
         except ValueError as exc:
-            return self._close_crashed(ex, "malformed_result", str(exc))
+            return self._close_crashed(ex, "malformed_result", str(exc), on_close)
         core = {"presentation": presentation, "code": code, "execution_id": ex["execution_id"]}
         iid = content_hash(core)
         payload = {**core, "identity_id": iid, "issuer": ex["issuer"],
                    "issuer_version": ex["issuer_version"], "domain": ex["domain"]}
-        return self._commit(ex, [("identity_recorded", iid, payload)], set(inputs.values()), [])
+        return self._commit(ex, [("identity_recorded", iid, payload)], set(inputs.values()), [],
+                            on_close)
 
     # -- revocation and incidents ----------------------------------------------------------------
     def revoke(self, target_id: str, reason: str) -> bool:

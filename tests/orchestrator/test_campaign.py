@@ -137,3 +137,41 @@ def test_call_record_sidecars_hold_only_sanitized_bytes(tmp_path):
                        require_clean=False, seal_bundle=False)
     disk = _disk(out["run_dir"])
     assert b"opaque-secret-123" not in disk and b"[REDACTED:secret_field]" in disk
+
+
+# --- Codex M1 review #13: confirmation reserved up front; campaign deadline ------------------------
+def _ops(run_dir):
+    import sqlite3
+    conn = sqlite3.connect(f"{run_dir}/ledger.db")
+    rows = conn.execute("SELECT kind, state, reservation FROM ops_jobs ORDER BY created_at").fetchall()
+    conn.close()
+    return rows
+
+
+def test_confirmation_capacity_is_reserved_before_any_dispatch(tmp_path):
+    prov = ReplayProviderDouble([GOOD])
+    out = run_campaign(cfg(caps={"usd": 1.0, "requests": 20, "cpu_seconds": 5000,
+                                 "wall_seconds": 5000}), prov, tmp_path,
+                       require_clean=False, seal_bundle=False)
+    rows = _ops(out["run_dir"])
+    assert rows[0][0] == "confirm" and rows[0][1] == "reserved"
+    assert json.loads(rows[0][2])["cpu_seconds"] > 0
+    assert out["totals"]["cpu_seconds"]["open"] == json.loads(rows[0][2])["cpu_seconds"]
+    report = (tmp_path / "t1" / "report.md").read_text()
+    assert "| cpu_seconds | 5000 |" in report and "reserved for confirmation" in report
+
+
+def test_no_dispatch_without_confirmation_capacity(tmp_path):
+    from zkqec.orchestrator.jobs import BudgetExceeded
+    prov = ReplayProviderDouble([GOOD])
+    with pytest.raises(BudgetExceeded):
+        run_campaign(cfg(caps={"usd": 1.0, "cpu_seconds": 10}), prov, tmp_path,
+                     require_clean=False, seal_bundle=False)
+    assert prov.requests == []
+
+
+def test_campaign_deadline_stops_dispatch(tmp_path):
+    prov = ReplayProviderDouble([GOOD] * 4)
+    out = run_campaign(cfg(), prov, tmp_path, require_clean=False, seal_bundle=False,
+                       deadline_seconds=0)
+    assert prov.requests == [] and out["stop"]["sa-secret-id"] == "deadline"

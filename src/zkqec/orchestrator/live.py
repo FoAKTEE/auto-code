@@ -17,6 +17,9 @@ from ..sandbox.cgroup import CampaignSlice, DeadlineSupervisor
 from .campaign import CampaignConfig, run_campaign
 
 
+LIVE_SEAL_MARGIN_SECONDS = 900
+
+
 def run_live(cfg: CampaignConfig, run_root: Path, *, deadline_seconds: int = 3600,
              memory_max: int = 64 * 1024**3, tasks_max: int = 4096) -> dict[str, Any]:
     if cfg.provider != "claude" or cfg.profile.knowledge != "K0":
@@ -33,7 +36,9 @@ def run_live(cfg: CampaignConfig, run_root: Path, *, deadline_seconds: int = 360
     try:
         provider = ClaudeCallProvider(cfg.model, broker=broker, slice_=slice_,
                                       jobs_root=Path(f"/tmp/zkq-{ident}"), effort=cfg.effort)
-        out = run_campaign(cfg, provider, Path(run_root))
+        # Stop dispatching early enough to seal and confirm before the supervisor's hard deadline.
+        out = run_campaign(cfg, provider, Path(run_root),
+                           deadline_seconds=max(0, deadline_seconds - LIVE_SEAL_MARGIN_SECONDS))
         out["broker_manifest"] = broker.manifest()
         (Path(out["run_dir"]) / "broker-manifest.json").write_text(
             json.dumps(out["broker_manifest"], indent=2, sort_keys=True, default=str))
