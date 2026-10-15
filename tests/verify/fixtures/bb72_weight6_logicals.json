@@ -1,0 +1,61 @@
+{
+ "description": "Bravyi et al. 2024 (arXiv:2308.07915) Table 3 [[72,12,6]] bivariate bicycle code; weight-6 logical witnesses, one per sector, for deterministic validation (upper bound 6).",
+ "family": "two_block_group_algebra",
+ "params": {
+  "l": 6,
+  "m": 6,
+  "a": [
+   [
+    3,
+    0
+   ],
+   [
+    0,
+    1
+   ],
+   [
+    0,
+    2
+   ]
+  ],
+  "b": [
+   [
+    0,
+    3
+   ],
+   [
+    1,
+    0
+   ],
+   [
+    2,
+    0
+   ]
+  ]
+ },
+ "polynomials": "A = x^3 + y + y^2, B = y^3 + x + x^2 over Z_6 x Z_6",
+ "monomial_convention": "[p, q] = x^p y^q; kernel shift_matrix: row i*m+j -> column ((i+p) mod l)*m + (j+q) mod m",
+ "n": 72,
+ "k": 12,
+ "presentation_sha": "a75f95f54f0a7341f42a971b4ef7def6edd318fe20e233b9d104b3793f46fa35",
+ "code_sha": "3a5eafd498fd6f73a0e5822f2c459137c2b7e3edce1a117c11a37fd5ffde6805",
+ "witness_support": {
+  "X": [
+   0,
+   3,
+   6,
+   12,
+   27,
+   30
+  ],
+  "Z": [
+   0,
+   1,
+   2,
+   3,
+   20,
+   22
+  ]
+ },
+ "found_by": "dev-time search, 2026-10-15: zkqec.kernel.distance.sector_distance(half_weight=3) (complete syndrome-collision enumeration); re-validated by the tests, never re-searched"
+}
