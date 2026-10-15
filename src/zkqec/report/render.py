@@ -3,7 +3,8 @@
 The authoritative section is a deterministic function of (ledger, campaign id). Everything in it is
 derived from hash-chained events of that campaign: the frozen tasks, labels, configuration hash,
 domain and manifest (``campaign_frozen``), the evaluated candidates (``evaluation_recorded``), the
-current receipts (resolver), the accounting (``job_settled``; units never summed) and the autonomy
+current receipts (resolver), the accounting (``job_settled``; units never summed), the §I control
+summary (``controls_recorded``: k/N false authorizations, j/M false rejections) and the autonomy
 log (``autonomy_recorded``). No caller-supplied record is rendered, so a caller cannot substitute
 tasks, membership, totals or prose. Strings come from closed vocabularies or validated patterns and
 are Markdown-escaped anyway. The linter re-renders and requires byte equality. LLM-written text may
@@ -84,6 +85,8 @@ def report_data(adm: Admission, campaign_id: str) -> dict[str, Any]:
             "overruns": sorted(s["job_id"] for s in settlements if s["overrun"]),
             "autonomy_log": [{k: a[k] for k in ("actor", "action", "detail")}
                              for a in adm.ledger.autonomy(campaign_id)],
+            "controls": [{k: c[k] for k in ("control_set", "results", "evidence")}
+                         for c in adm.ledger.controls(campaign_id)],
             "integrity": _integrity(adm)}
 
 
@@ -147,6 +150,18 @@ def render_markdown(data: dict[str, Any]) -> str:
         or ["| — | — | 0 |"]
     L += ["", f"- Overrun jobs (charged beyond their reservation): "
               f"{', '.join(f'`{j}`' for j in data['overruns']) or 'none'}"]
+    L += ["", "## Controls (§I: k/N false authorizations, j/M false rejections)", ""]
+    if not data["controls"]:
+        L.append("- none recorded (controls not supplied for this campaign)")
+    for c in data["controls"]:
+        rows = c["results"]
+        L += [f"Control set `{esc(c['control_set'])}`, evidence `{c['evidence']}`:", "",
+              "| control | false authorizations k/N | false rejections j/M |", "|---|---|---|"]
+        L += [f"| {esc(r['control'])} | {r['false_authorizations']}/{r['injections']} | "
+              f"{r['false_rejections']}/{r['paired_positives']} |" for r in rows]
+        k, n = sum(r["false_authorizations"] for r in rows), sum(r["injections"] for r in rows)
+        j, m = sum(r["false_rejections"] for r in rows), sum(r["paired_positives"] for r in rows)
+        L += ["", f"- False authorizations: {k}/{n}; false rejections: {j}/{m}", ""]
     L += ["", "## Autonomy log (human actions)", ""]
     L += [f"- {esc(a['actor'])}: {esc(a['action'])} — {esc(a['detail'])}"
           for a in data["autonomy_log"]] or ["- none"]

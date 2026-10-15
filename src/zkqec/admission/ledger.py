@@ -26,7 +26,8 @@ Campaign metadata is ledger-anchored too (§A5, §K, §L): ``campaign_frozen`` (
 frozen tasks, caps, typed labels, domain, manifest artifact, confirmation reservation),
 ``evaluation_recorded`` (evaluation membership: task, candidate, proposal, call record, typed
 source), ``job_settled`` (one per settled job: reservation, measured usage and the charge, which
-apply re-derives with the §K settlement rule) and ``autonomy_recorded`` (human actions). Their apply
+apply re-derives with the §K settlement rule), ``autonomy_recorded`` (human actions) and
+``controls_recorded`` (§I control summary: k/N false authorizations, j/M false rejections). Their apply
 step validates types, references to the frozen campaign and its tasks, finite non-negative units and
 closed label/source vocabularies, so the report and the audit derive tasks, membership and accounting
 from these events only.
@@ -49,8 +50,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
-from zkqec.contracts import (CAMPAIGN_LABELS, UNITS, Receipt, TaskSA, TaskSF, UsageError, canonical_json, charge_for,
-                             check_usage, content_hash)
+from zkqec.contracts import (CAMPAIGN_LABELS, UNITS, Receipt, TaskSA, TaskSF, UsageError,
+                             canonical_json, charge_for, check_usage, content_hash)
 from zkqec.store import check_sha
 from zkqec.store.sanitize import DEFAULT_SANITIZER, SecretDetected
 
@@ -60,7 +61,8 @@ GENESIS = "0" * 64
 SCHEMA_VERSION = "zkqec-ledger-1"
 EVENT_KINDS = ("ledger_opened", "execution_opened", "execution_closed", "receipt_admitted",
                "identity_recorded", "revoked", "incident_opened", "quarantined",
-               "campaign_frozen", "evaluation_recorded", "job_settled", "autonomy_recorded")
+               "campaign_frozen", "evaluation_recorded", "job_settled", "autonomy_recorded",
+               "controls_recorded")
 CAMPAIGN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/-]{0,255}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -70,6 +72,9 @@ LABELS = CAMPAIGN_LABELS
 JOB_KINDS = frozenset({"propose", "verify", "falsify", "revise_route", "baseline", "confirm"})
 SETTLED_FROM = frozenset({"completed", "failed", "uncertain", "cancelled"})
 AUTONOMY_ACTIONS = frozenset({"pause", "resume", "abort", "rescope", "note"})
+CONTROL_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+CONTROL_FIELDS = frozenset({"control", "injections", "false_authorizations", "paired_positives",
+                            "false_rejections"})
 
 _EVENTS_SQL = f"""
 CREATE TABLE IF NOT EXISTS events (
@@ -149,10 +154,13 @@ _PROJECTIONS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "autonomy": ("""event_seq INTEGER PRIMARY KEY REFERENCES events(seq),
         campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id), body TEXT NOT NULL""",
         ("autonomy_recorded",), ""),
+    "controls": ("""event_seq INTEGER PRIMARY KEY REFERENCES events(seq),
+        campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id), body TEXT NOT NULL""",
+        ("controls_recorded",), ""),
     "artifact_refs": ("""sha TEXT NOT NULL, event_seq INTEGER NOT NULL REFERENCES events(seq),
         role TEXT NOT NULL, PRIMARY KEY (sha, event_seq, role)""",
         ("execution_opened", "receipt_admitted", "campaign_frozen", "evaluation_recorded",
-         "job_settled"), ""),
+         "job_settled", "controls_recorded"), ""),
 }
 PROJECTION_TABLES = tuple(_PROJECTIONS)
 
@@ -227,6 +235,8 @@ def referenced_artifacts(kind: str, payload: dict) -> list[tuple[str, str]]:
         return sorted(set(refs))
     if kind == "job_settled":
         return [(payload["result"], "result")] if payload.get("result") else []
+    if kind == "controls_recorded":
+        return [(payload["evidence"], "evidence")]
     return []
 
 
@@ -506,6 +516,37 @@ def _apply_autonomy_recorded(conn, seq, p):
                  (seq, p["campaign_id"], canonical_json(p).decode()))
 
 
+def _apply_controls_recorded(conn, seq, p):
+    """§I control summary: per control, k/N false authorizations over N production-path
+    injections and j/M false rejections over M paired positives, with an evidence artifact."""
+    _keys(seq, "controls_recorded", p, {"campaign_id", "control_set", "results", "evidence"})
+    _campaign_row(conn, seq, p["campaign_id"])
+    _match(seq, SOURCE_RE, p["control_set"], "control set")
+    results = p["results"]
+    if not isinstance(results, list) or not results:
+        raise LedgerError(f"event {seq}: a control summary needs at least one control")
+    seen = set()
+    for r in results:
+        if not isinstance(r, dict) or set(r) != CONTROL_FIELDS:
+            raise LedgerError(f"event {seq}: control rows need exactly {sorted(CONTROL_FIELDS)}")
+        _match(seq, CONTROL_RE, r["control"], "control name")
+        if r["control"] in seen:
+            raise LedgerError(f"event {seq}: duplicate control {r['control']}")
+        seen.add(r["control"])
+        counts = [r[k] for k in ("injections", "false_authorizations", "paired_positives",
+                                 "false_rejections")]
+        if any(type(x) is not int or x < 0 for x in counts) \
+                or r["false_authorizations"] > r["injections"] \
+                or r["false_rejections"] > r["paired_positives"]:
+            raise LedgerError(f"event {seq}: control {r['control']}: counts must be integers "
+                              "with 0 <= k <= N and 0 <= j <= M")
+    _sha_or_none(seq, p["evidence"], "evidence")
+    if p["evidence"] is None:
+        raise LedgerError(f"event {seq}: a control summary needs an evidence artifact")
+    conn.execute("INSERT INTO controls VALUES (?,?,?)",
+                 (seq, p["campaign_id"], canonical_json(p).decode()))
+
+
 _APPLY: dict[str, Callable] = {
     "ledger_opened": _apply_ledger_opened, "execution_opened": _apply_execution_opened,
     "execution_closed": _apply_execution_closed, "receipt_admitted": _apply_receipt_admitted,
@@ -513,6 +554,7 @@ _APPLY: dict[str, Callable] = {
     "incident_opened": _apply_incident_opened, "quarantined": _apply_quarantined,
     "campaign_frozen": _apply_campaign_frozen, "evaluation_recorded": _apply_evaluation_recorded,
     "job_settled": _apply_job_settled, "autonomy_recorded": _apply_autonomy_recorded,
+    "controls_recorded": _apply_controls_recorded,
 }
 
 
@@ -702,6 +744,9 @@ class Ledger:
 
     def autonomy(self, campaign_id: str) -> list[dict]:
         return self._bodies("autonomy", campaign_id)
+
+    def controls(self, campaign_id: str) -> list[dict]:
+        return self._bodies("controls", campaign_id)
 
     def first_event(self) -> Event | None:
         return next(self.events(), None)

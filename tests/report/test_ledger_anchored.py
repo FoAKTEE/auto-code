@@ -199,3 +199,47 @@ def test_unsettled_jobs_and_orphan_events_fail_reconciliation(ran):
     problems = audit_campaign(adm, store, "t1")
     assert any(settled in p and "has no operational job" in p for p in problems), problems
     assert any("dispatched: unsettled at audit" in p for p in problems), problems
+
+
+# --- Codex M1 review #17 (code side): §I control summary; cost and autonomy from events -----------
+CONTROLS = [
+    {"control": "semantic_conflict_lower5_upper3", "injections": 1, "false_authorizations": 0,
+     "paired_positives": 1, "false_rejections": 0},
+    {"control": "steane_t2_d5_misreading", "injections": 2, "false_authorizations": 0,
+     "paired_positives": 2, "false_rejections": 1},
+]
+
+
+def test_report_renders_the_control_summary_when_supplied(camp):
+    adm, store, _, _ = camp
+    assert "## Controls" in render(adm, "c3") and "none recorded" in render(adm, "c3")
+    evidence = store.put_json({"pytest": "log"})
+    adm.record_controls("c3", "p1a-controls-v1", CONTROLS, evidence=evidence)
+    md = render(adm, "c3")
+    assert "| semantic_conflict_lower5_upper3 | 0/1 | 0/1 |" in md
+    assert "| steane_t2_d5_misreading | 0/2 | 1/2 |" in md
+    assert "False authorizations: 0/3; false rejections: 1/3" in md
+    assert lint(md, adm, "c3") == []
+
+
+@pytest.mark.parametrize("bad", [
+    {"false_authorizations": 2},                 # k > N
+    {"false_rejections": -1},
+    {"injections": 1.5},
+    {"control": "Bad Name"},
+    {"extra": 1},
+])
+def test_control_results_are_validated_at_apply(camp, bad):
+    adm, store, _, _ = camp
+    row = {**CONTROLS[0], **bad}
+    with pytest.raises((LedgerError, ValueError)):
+        adm.record_controls("c3", "p1a-controls-v1", [row], evidence=store.put_json({"e": 1}))
+
+
+def test_autonomy_and_cost_sections_come_from_ledger_events(camp):
+    adm, _, book, _ = camp
+    adm.record_autonomy("c3", "owner", "pause", "paused for broker maintenance")
+    md = render(adm, "c3")
+    assert "- owner: pause — paused for broker maintenance" in md
+    spent = sum(s["charged"]["cpu_seconds"] for s in adm.ledger.settlements("c3"))
+    assert spent == book.totals()["cpu_seconds"]["spent"] and f"| {spent:g} |" in md

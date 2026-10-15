@@ -297,6 +297,16 @@ class Admission:
             self._append("autonomy_recorded", {"campaign_id": campaign_id, "actor": actor,
                                                "action": action, "detail": detail})
 
+    def record_controls(self, campaign_id: str, control_set: str, results: list[dict], *,
+                        evidence: str) -> None:
+        """Record a §I control summary (per control: N injections with k false authorizations,
+        M paired positives with j false rejections) backed by an evidence artifact."""
+        with self.ledger.transaction():
+            self._durable([evidence])
+            self._append("controls_recorded", {"campaign_id": campaign_id,
+                                               "control_set": control_set,
+                                               "results": list(results), "evidence": evidence})
+
     def job_book(self, campaign_id: str, **namespace):
         """The campaign's operational job book, bound to this ledger: every settlement appends a
         ``job_settled`` event in the same transaction as the operational update (§L)."""
