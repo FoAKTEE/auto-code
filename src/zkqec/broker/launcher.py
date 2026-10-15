@@ -41,7 +41,9 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, mode)
     try:
-        os.write(fd, data)
+        view = memoryview(data)
+        while view:                     # a short write is continued, never ignored
+            view = view[os.write(fd, view):]
         os.fsync(fd)
     finally:
         os.close(fd)
