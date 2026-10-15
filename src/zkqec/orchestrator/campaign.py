@@ -1,10 +1,11 @@
 """Minimal M1 campaign runner (prompt §7; appendix §J3, §K, §L, §M, §N).
 
-freeze (clean evaluator tree, manifest) → per task: request (task + verdict-free digest + grammar
-manifest), syntactic request screening, reserve → dispatch → provider call (call mode, no tools) →
-settle with actual usage → L0 caps + strict Proposal parse → pipeline.evaluate → stop when the task
-is satisfied or the proposal budget is spent → templated report → sealed bundle → offline audit
-(the Phase-1a confirmation: re-execution from the sealed bundle).
+freeze (clean evaluator tree, manifest, ``campaign_frozen`` ledger event) → per task: request
+(task + verdict-free digest + grammar manifest), syntactic request screening, reserve → dispatch →
+provider call (call mode, no tools) → settle with actual usage (a ``job_settled`` event in the same
+transaction) → strict intake → pipeline.evaluate → ``evaluation_recorded`` → stop when the task is
+satisfied or the proposal budget is spent → templated report (from the ledger only) → sealed bundle
+→ offline audit (the Phase-1a confirmation: re-execution from the sealed bundle).
 """
 from __future__ import annotations
 
@@ -23,10 +24,10 @@ from ..grammar import MANIFESTS, GrammarCaps
 from ..grammar.intake import parse_proposal
 from ..pipeline import Evaluation, Pipeline, build_registry, evaluator_domain
 from ..report.bundle import audit_bundle, seal
-from ..report.render import CampaignRecord, EvaluationRef, render
+from ..report.render import render
 from ..store import ArtifactStore
 from .digest import render_digest
-from .jobs import BudgetExceeded, JobBook
+from .jobs import BudgetExceeded, namespace
 
 REPO = Path(__file__).resolve().parents[3]
 FROZEN_PATHS = ("src", "roles", "configs", "pyproject.toml", "requirements.lock")
@@ -44,7 +45,8 @@ class CampaignConfig(Frozen):
     per_call: Reservation
     distance_budget: dict[str, int] = Field(default_factory=dict)
     max_n: int = Field(default=200, ge=1, le=1024)
-    labels: tuple[str, ...] = ("single-implementation", "non-evaluation")
+    labels: tuple[Literal["single-implementation", "non-evaluation", "K0-unenforced", "dev-only",
+                          "fixture"], ...] = ("single-implementation", "non-evaluation")
 
 
 @dataclass
@@ -130,19 +132,23 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     reg = build_registry(store)
     adm = Admission(run / "ledger.db", store, reg)
     dom = evaluator_domain(reg)
-    book = JobBook(adm.ledger.conn, cfg.campaign_id, profile=profile_key(cfg.profile))
+    config = cfg.model_dump(mode="json")
+    manifest = {"campaign_id": cfg.campaign_id, "config_sha256": content_hash(config),
+                "config": config, "domain": dom, "registry": reg.manifest(),
+                "git": gs, "contract_sha256": content_hash(contract),
+                "provider": provider.name, "model": provider.model}
+    manifest_sha = store.put_json(manifest)
+    (run / "manifest.json").write_bytes(store.get_bytes(manifest_sha))
+    prof = profile_key(cfg.profile)
+    adm.freeze_campaign(cfg.campaign_id, namespace=namespace(cfg.campaign_id, profile=prof),
+                        config=config, tasks=config["tasks"], caps=dict(cfg.caps),
+                        labels=list(cfg.labels), domain=dom, manifest=manifest_sha)
+    book = adm.job_book(cfg.campaign_id, profile=prof)
     book.set_caps(cfg.caps)
     families = tuple(grammar_for(cfg.profile))
     pipe = Pipeline(adm, store, book, dom, caps=GrammarCaps(max_n=cfg.max_n),
                     distance_budget=cfg.distance_budget, families=families)
-    manifest = {"campaign_id": cfg.campaign_id, "config_sha256": content_hash(cfg),
-                "config": cfg.model_dump(mode="json"), "domain": dom, "registry": reg.manifest(),
-                "git": gs, "contract_sha256": content_hash(contract),
-                "provider": provider.name, "model": provider.model}
-    manifest_sha = store.put_json(manifest)
-    (run / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    evaluations: list[EvaluationRef] = []
-    autonomy_log: list[dict[str, Any]] = []
+    evaluations = 0
     calls_dir = run / "calls"; calls_dir.mkdir()
     stop_reason = {}
     try:
@@ -176,8 +182,8 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 else:
                     launch_failures = 0
                 state = outcome_state(res.outcome)
-                book.complete(job, gen, state, actual=res.usage or None)
-                book.settle(job)
+                book.complete(job, gen, state, actual=res.usage or None, result_sha=rec_sha)
+                book.settle(job)                  # + job_settled event, same transaction (§L)
                 proposal = None
                 # An "uncertain" call keeps its full reservation, but if it produced output the
                 # proposal is still evaluated: scientific authority comes from verifiers, not the call.
@@ -199,30 +205,25 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 ev = pipe.evaluate(proposal, task)
                 history.append(ev)
                 if ev.candidate is not None:
-                    evaluations.append(EvaluationRef(task_id=task.task_id, candidate=ev.candidate,
-                                                     proposal=p_sha, source=f"designer:{provider.name}",
-                                                     call_record=rec_sha))
+                    adm.record_evaluation(cfg.campaign_id, task.task_id, candidate=ev.candidate,
+                                          proposal=p_sha, call_record=rec_sha,
+                                          source=f"designer:{provider.name}")
+                    evaluations += 1
                 if ev.satisfies == "verified":
                     stop_reason[task.task_id] = "target_met"
                     break
-        camp = CampaignRecord(campaign_id=cfg.campaign_id, manifest={**manifest, "manifest_sha256": manifest_sha},
-                              tasks=cfg.tasks, evaluations=tuple(evaluations),
-                              autonomy_log=tuple(autonomy_log), budget_totals=book.totals(),
-                              labels=cfg.labels)
-        report_md = render(adm, dom, camp)
+        report_md = render(adm, cfg.campaign_id)          # from the ledger only (§A5)
         (run / "report.md").write_text(report_md)
-        (run / "campaign.json").write_text(json.dumps(camp.model_dump(mode="json"), indent=2, sort_keys=True))
         totals = book.totals()
     finally:
         adm.close()
-    out: dict[str, Any] = {"run_dir": str(run), "stop": stop_reason, "evaluations": len(evaluations),
+    out: dict[str, Any] = {"run_dir": str(run), "stop": stop_reason, "evaluations": evaluations,
                            "satisfied": sorted(k for k, v in stop_reason.items() if v == "target_met"),
                            "totals": totals}
     if seal_bundle:
         kw = {"archive": archive} if archive else {}
         entry = seal(run, cfg.campaign_id, run / "ledger.db", run / "store", report_md,
-                     camp.model_dump(mode="json"), extra_dirs={"calls": calls_dir},
-                     commit=gs["commit"], **kw)
+                     extra_dirs={"calls": calls_dir}, commit=gs["commit"], **kw)
         audit = audit_bundle(Path(entry["path"]), workdir=run / "audit", **kw)
         out.update(bundle=entry, audit={k: audit[k] for k in ("ok", "problems") if k in audit})
     return out

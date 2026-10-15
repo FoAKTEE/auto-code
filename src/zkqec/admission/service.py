@@ -29,7 +29,7 @@ from zkqec.store import (SANITIZER_VERSION, ArtifactNotFound, ArtifactStore, Art
                          IntegrityError, SecretDetected, StoreError, check_sha)
 
 from .evidence import current_identities, current_receipts, find_conflicts
-from .ledger import SCHEMA_VERSION, Ledger, VerifyReport
+from .ledger import SCHEMA_VERSION, Ledger, LedgerError, VerifyReport, evaluation_core
 from .registry import ArtifactInput, Registered, VerifierRegistry
 from .resolver import Resolver
 
@@ -206,6 +206,73 @@ class Admission:
         self._append("incident_opened", {"incident_id": iid, "category": category,
                                                "detail": detail})
         return iid
+
+    # -- campaign metadata (ledger-anchored; §A5, §K, §L) -----------------------------------------
+    def _durable(self, shas) -> None:
+        for sha in sorted({x for x in shas if x}):
+            try:
+                self.store.ensure_durable(sha)
+            except (StoreError, OSError) as exc:
+                raise AdmissionRefused(f"artifact {sha} is not durably published: {exc}") from None
+
+    def freeze_campaign(self, campaign_id: str, *, namespace: str, config: dict, tasks: list,
+                        caps: dict, labels: list, domain: str, manifest: str,
+                        confirmation: dict | None = None) -> None:
+        """Record the frozen campaign (config hash, tasks, caps, labels, domain, manifest artifact,
+        confirmation reservation) once; everything the report shows about the campaign comes from
+        this event."""
+        payload = {"campaign_id": campaign_id, "namespace": namespace,
+                   "config_sha256": content_hash(config), "config": config, "tasks": list(tasks),
+                   "caps": caps, "labels": list(labels), "domain": domain, "manifest": manifest,
+                   "confirmation": confirmation}
+        with self.ledger.transaction():
+            if self.ledger.campaign(campaign_id) is not None:
+                raise LedgerError(f"campaign {campaign_id} is already frozen")
+            self._durable([manifest])
+            self._append("campaign_frozen", payload)
+
+    def record_evaluation(self, campaign_id: str, task_id: str, *, candidate: str,
+                          source: str, proposal: str | None = None,
+                          call_record: str | None = None,
+                          artifacts: dict[str, str] | None = None) -> str:
+        """Record that a candidate was evaluated for a frozen task (report membership)."""
+        core = {"campaign_id": campaign_id, "task_id": task_id, "candidate": candidate,
+                "proposal": proposal, "call_record": call_record, "source": source,
+                "artifacts": dict(sorted((artifacts or {}).items()))}
+        eid = content_hash(evaluation_core(core))
+        with self.ledger.transaction():
+            if self.ledger.conn.execute("SELECT 1 FROM evaluations WHERE evaluation_id=?",
+                                        (eid,)).fetchone():
+                return eid
+            self._durable([candidate, proposal, call_record, *core["artifacts"].values()])
+            self._append("evaluation_recorded", {"evaluation_id": eid, **core})
+        return eid
+
+    def record_autonomy(self, campaign_id: str, actor: str, action: str, detail: str) -> None:
+        """Autonomy log (§4.13): one human action on the campaign."""
+        with self.ledger.transaction():
+            self._append("autonomy_recorded", {"campaign_id": campaign_id, "actor": actor,
+                                               "action": action, "detail": detail})
+
+    def job_book(self, campaign_id: str, **namespace):
+        """The campaign's operational job book, bound to this ledger: every settlement appends a
+        ``job_settled`` event in the same transaction as the operational update (§L)."""
+        from zkqec.orchestrator.jobs import JobBook
+        camp = self.ledger.campaign(campaign_id)
+        if camp is None:
+            raise LedgerError(f"campaign {campaign_id} is not frozen")
+        book = JobBook(self.ledger.conn, campaign_id, **namespace, ledger=self.ledger,
+                       settlement_sink=lambda payload: self._record_settlement(campaign_id,
+                                                                               payload))
+        if book.namespace != camp["namespace"]:
+            raise LedgerError(f"namespace {book.namespace} is not the frozen {camp['namespace']}")
+        return book
+
+    def _record_settlement(self, campaign_id: str, payload: dict) -> None:
+        if not self.ledger._in_tx:
+            raise LedgerError("a settlement is recorded only inside the ledger transaction")
+        self._durable([payload.get("result")])
+        self._append("job_settled", {"campaign_id": campaign_id, **payload})
 
     # -- reading, verification -------------------------------------------------------------------
     def resolver(self, domain: str) -> Resolver:

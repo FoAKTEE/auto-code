@@ -22,7 +22,18 @@
 * :meth:`Ledger.append` requires the writer capability the admission service created the ledger
   with: scientific events have a single writer (§4.2).
 
-Operational job/dispatch state is *not* kept here (§L: separate from the scientific log).
+Campaign metadata is ledger-anchored too (§A5, §K, §L): ``campaign_frozen`` (configuration hash,
+frozen tasks, caps, typed labels, domain, manifest artifact, confirmation reservation),
+``evaluation_recorded`` (evaluation membership: task, candidate, proposal, call record, typed
+source), ``job_settled`` (one per settled job: reservation, measured usage and the charge, which
+apply re-derives with the §K settlement rule) and ``autonomy_recorded`` (human actions). Their apply
+step validates types, references to the frozen campaign and its tasks, finite non-negative units and
+closed label/source vocabularies, so the report and the audit derive tasks, membership and accounting
+from these events only.
+
+Operational job/dispatch state (reservations, leases, generations) is *not* kept here (§L: separate
+from the scientific log); its settlement is recorded by ``job_settled`` in the same transaction as
+the operational update, and the audit reconciles the two.
 Hash chains detect accidental or third-party tampering, not a compromised trusted writer (§O).
 """
 from __future__ import annotations
@@ -31,13 +42,15 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
-from zkqec.contracts import Receipt, canonical_json, content_hash
+from zkqec.contracts import (UNITS, Receipt, TaskSA, TaskSF, UsageError, canonical_json, charge_for,
+                             check_usage, content_hash)
 from zkqec.store import check_sha
 from zkqec.store.sanitize import DEFAULT_SANITIZER, SecretDetected
 
@@ -46,7 +59,18 @@ from .evidence import IdentityRecord, ReceiptRecord
 GENESIS = "0" * 64
 SCHEMA_VERSION = "zkqec-ledger-1"
 EVENT_KINDS = ("ledger_opened", "execution_opened", "execution_closed", "receipt_admitted",
-               "identity_recorded", "revoked", "incident_opened", "quarantined")
+               "identity_recorded", "revoked", "incident_opened", "quarantined",
+               "campaign_frozen", "evaluation_recorded", "job_settled", "autonomy_recorded")
+CAMPAIGN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/-]{0,255}$")
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+LABELS = frozenset({"single-implementation", "non-evaluation", "K0-unenforced", "dev-only",
+                    "fixture"})
+JOB_KINDS = frozenset({"propose", "verify", "falsify", "revise_route", "baseline", "confirm"})
+SETTLED_FROM = frozenset({"completed", "failed", "uncertain", "cancelled"})
+AUTONOMY_ACTIONS = frozenset({"pause", "resume", "abort", "rescope", "note"})
 
 _EVENTS_SQL = f"""
 CREATE TABLE IF NOT EXISTS events (
@@ -106,9 +130,30 @@ _PROJECTIONS: dict[str, tuple[str, tuple[str, ...], str]] = {
         incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
         event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
         PRIMARY KEY (target_id, incident_id)""", ("quarantined",), ""),
+    "campaigns": ("""campaign_id TEXT PRIMARY KEY,
+        event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
+        namespace TEXT NOT NULL, domain TEXT NOT NULL, config_sha TEXT NOT NULL,
+        manifest TEXT NOT NULL, body TEXT NOT NULL""", ("campaign_frozen",), ""),
+    "campaign_tasks": ("""campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+        task_id TEXT NOT NULL, event_seq INTEGER NOT NULL REFERENCES events(seq),
+        task_sha TEXT NOT NULL, body TEXT NOT NULL,
+        PRIMARY KEY (campaign_id, task_id)""", ("campaign_frozen",), ""),
+    "evaluations": ("""evaluation_id TEXT PRIMARY KEY,
+        event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
+        campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id), task_id TEXT NOT NULL,
+        candidate TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL""",
+        ("evaluation_recorded",), ""),
+    "settlements": ("""job_id TEXT PRIMARY KEY,
+        event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
+        campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id), kind TEXT NOT NULL,
+        charged TEXT NOT NULL, body TEXT NOT NULL""", ("job_settled",), ""),
+    "autonomy": ("""event_seq INTEGER PRIMARY KEY REFERENCES events(seq),
+        campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id), body TEXT NOT NULL""",
+        ("autonomy_recorded",), ""),
     "artifact_refs": ("""sha TEXT NOT NULL, event_seq INTEGER NOT NULL REFERENCES events(seq),
         role TEXT NOT NULL, PRIMARY KEY (sha, event_seq, role)""",
-        ("execution_opened", "receipt_admitted"), ""),
+        ("execution_opened", "receipt_admitted", "campaign_frozen", "evaluation_recorded",
+         "job_settled"), ""),
 }
 PROJECTION_TABLES = tuple(_PROJECTIONS)
 
@@ -174,6 +219,15 @@ def referenced_artifacts(kind: str, payload: dict) -> list[tuple[str, str]]:
         refs += [(sha, "witness") for sha in r["witnesses"]]
         refs += [(sha, "artifact") for sha in r["artifacts"]]
         return sorted(set(refs))
+    if kind == "campaign_frozen":
+        return [(payload["manifest"], "manifest")]
+    if kind == "evaluation_recorded":
+        refs = [(payload["candidate"], "candidate")]
+        refs += [(payload[k], k) for k in ("proposal", "call_record") if payload.get(k)]
+        refs += [(sha, f"call:{name}") for name, sha in sorted(payload["artifacts"].items())]
+        return sorted(set(refs))
+    if kind == "job_settled":
+        return [(payload["result"], "result")] if payload.get("result") else []
     return []
 
 
@@ -300,11 +354,166 @@ def _apply_quarantined(conn, seq, p):
     conn.execute("INSERT INTO quarantines VALUES (?,?,?)", (p["target_id"], p["incident_id"], seq))
 
 
+def _keys(seq: int, kind: str, p: dict, keys: set[str]) -> None:
+    if not isinstance(p, dict) or set(p) != keys:
+        raise LedgerError(f"event {seq}: {kind} needs exactly the fields {sorted(keys)}")
+
+
+def _match(seq: int, pattern: re.Pattern, value, what: str) -> None:
+    if not isinstance(value, str) or not pattern.match(value):
+        raise LedgerError(f"event {seq}: bad {what} {value!r}")
+
+
+def _sha_or_none(seq: int, value, what: str) -> None:
+    if value is not None:
+        try:
+            check_sha(value)
+        except ValueError:
+            raise LedgerError(f"event {seq}: {what} is not an artifact hash") from None
+
+
+def _usage(seq: int, value, what: str, *, complete: bool = False, optional: bool = False):
+    if value is None and optional:
+        return None
+    try:
+        return check_usage(value, complete=complete)
+    except UsageError as exc:
+        raise LedgerError(f"event {seq}: {what}: {exc}") from None
+
+
+def _campaign_row(conn, seq: int, campaign_id) -> tuple:
+    row = conn.execute("SELECT namespace, body FROM campaigns WHERE campaign_id=?",
+                       (campaign_id,)).fetchone()
+    if row is None:
+        raise LedgerError(f"event {seq}: campaign {campaign_id!r} was never frozen")
+    return row
+
+
+def _apply_campaign_frozen(conn, seq, p):
+    _keys(seq, "campaign_frozen", p, {"campaign_id", "namespace", "config_sha256", "config",
+                                      "tasks", "caps", "labels", "domain", "manifest",
+                                      "confirmation"})
+    _match(seq, CAMPAIGN_RE, p["campaign_id"], "campaign id")
+    _match(seq, NAMESPACE_RE, p["namespace"], "namespace")
+    if p["namespace"].split("/")[0] != p["campaign_id"]:
+        raise LedgerError(f"event {seq}: namespace must start with the campaign id")
+    if not isinstance(p["config"], dict) or content_hash(p["config"]) != p["config_sha256"]:
+        raise LedgerError(f"event {seq}: config_sha256 does not match the frozen config")
+    tasks = p["tasks"]
+    if not isinstance(tasks, list) or not tasks:
+        raise LedgerError(f"event {seq}: a campaign freezes at least one task")
+    if "tasks" in p["config"] and p["config"]["tasks"] != tasks:
+        raise LedgerError(f"event {seq}: frozen tasks differ from the frozen config's tasks")
+    seen = set()
+    for t in tasks:
+        model = TaskSF if isinstance(t, dict) and t.get("kind") == "S-F" else TaskSA
+        try:
+            parsed = model.model_validate(t)
+        except ValueError as exc:
+            raise LedgerError(f"event {seq}: invalid task: {str(exc)[:200]}") from None
+        if parsed.model_dump(mode="json") != t:
+            raise LedgerError(f"event {seq}: task is not in canonical form")
+        _match(seq, TASK_ID_RE, parsed.task_id, "task id")
+        if parsed.task_id in seen:
+            raise LedgerError(f"event {seq}: duplicate task id {parsed.task_id}")
+        seen.add(parsed.task_id)
+    _usage(seq, p["caps"], "caps")
+    labels = p["labels"]
+    if not isinstance(labels, list) or len(set(labels)) != len(labels) or \
+            any(x not in LABELS for x in labels):
+        raise LedgerError(f"event {seq}: labels must be distinct values from {sorted(LABELS)}")
+    _sha_or_none(seq, p["domain"], "domain")
+    _sha_or_none(seq, p["manifest"], "manifest")
+    if p["domain"] is None or p["manifest"] is None:
+        raise LedgerError(f"event {seq}: domain and manifest are required")
+    _usage(seq, p["confirmation"], "confirmation reservation", complete=True, optional=True)
+    conn.execute("INSERT INTO campaigns VALUES (?,?,?,?,?,?,?)",
+                 (p["campaign_id"], seq, p["namespace"], p["domain"], p["config_sha256"],
+                  p["manifest"], canonical_json(p).decode()))
+    for t in tasks:
+        conn.execute("INSERT INTO campaign_tasks VALUES (?,?,?,?,?)",
+                     (p["campaign_id"], t["task_id"], seq, content_hash(t),
+                      canonical_json(t).decode()))
+
+
+def evaluation_core(p: dict) -> dict:
+    return {k: p[k] for k in ("campaign_id", "task_id", "candidate", "proposal", "call_record",
+                              "source", "artifacts")}
+
+
+def _apply_evaluation_recorded(conn, seq, p):
+    _keys(seq, "evaluation_recorded", p, {"evaluation_id", "campaign_id", "task_id", "candidate",
+                                          "proposal", "call_record", "source", "artifacts"})
+    if content_hash(evaluation_core(p)) != p["evaluation_id"]:
+        raise LedgerError(f"event {seq}: evaluation_id does not match its content")
+    _campaign_row(conn, seq, p["campaign_id"])
+    if not conn.execute("SELECT 1 FROM campaign_tasks WHERE campaign_id=? AND task_id=?",
+                        (p["campaign_id"], p["task_id"])).fetchone():
+        raise LedgerError(f"event {seq}: task {p['task_id']!r} is not frozen in the campaign")
+    if p["candidate"] is None:
+        raise LedgerError(f"event {seq}: an evaluation needs a candidate")
+    for k in ("candidate", "proposal", "call_record"):
+        _sha_or_none(seq, p[k], k)
+    _match(seq, SOURCE_RE, p["source"], "source")
+    arts = p["artifacts"]
+    if not isinstance(arts, dict) or any(not (isinstance(k, str) and k.isidentifier())
+                                         for k in arts):
+        raise LedgerError(f"event {seq}: artifacts must be a name -> sha map")
+    for name, sha in arts.items():
+        _sha_or_none(seq, sha, f"artifact {name}")
+    conn.execute("INSERT INTO evaluations VALUES (?,?,?,?,?,?,?)",
+                 (p["evaluation_id"], seq, p["campaign_id"], p["task_id"], p["candidate"],
+                  p["source"], canonical_json(p).decode()))
+
+
+def _apply_job_settled(conn, seq, p):
+    _keys(seq, "job_settled", p, {"campaign_id", "namespace", "job_id", "kind", "idem_key",
+                                  "retry_of", "generation", "from_state", "reservation", "actual",
+                                  "charged", "overrun", "result"})
+    namespace, _ = _campaign_row(conn, seq, p["campaign_id"])
+    if p["namespace"] != namespace:
+        raise LedgerError(f"event {seq}: job namespace {p['namespace']!r} is not the campaign's")
+    _match(seq, JOB_ID_RE, p["job_id"], "job id")
+    if p["retry_of"] is not None:
+        _match(seq, JOB_ID_RE, p["retry_of"], "retry_of")
+    if p["kind"] not in JOB_KINDS or p["from_state"] not in SETTLED_FROM:
+        raise LedgerError(f"event {seq}: bad job kind or settled-from state")
+    if not isinstance(p["idem_key"], str) or not 0 < len(p["idem_key"]) <= 1024:
+        raise LedgerError(f"event {seq}: bad idempotency key")
+    if type(p["generation"]) is not int or p["generation"] < 0:
+        raise LedgerError(f"event {seq}: bad generation")
+    reservation = _usage(seq, p["reservation"], "reservation", complete=True)
+    actual = _usage(seq, p["actual"], "actual usage", optional=True)
+    charged = _usage(seq, p["charged"], "charge", complete=True)
+    if charged != charge_for(p["from_state"], reservation, actual):
+        raise LedgerError(f"event {seq}: the charge does not follow the settlement rule (§K)")
+    if p["overrun"] is not any(charged[u] > reservation[u] + 1e-12 for u in UNITS):
+        raise LedgerError(f"event {seq}: overrun flag is inconsistent")
+    _sha_or_none(seq, p["result"], "result")
+    conn.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?)",
+                 (p["job_id"], seq, p["campaign_id"], p["kind"], canonical_json(charged).decode(),
+                  canonical_json(p).decode()))
+
+
+def _apply_autonomy_recorded(conn, seq, p):
+    _keys(seq, "autonomy_recorded", p, {"campaign_id", "actor", "action", "detail"})
+    _campaign_row(conn, seq, p["campaign_id"])
+    _match(seq, SOURCE_RE, p["actor"], "actor")
+    if p["action"] not in AUTONOMY_ACTIONS:
+        raise LedgerError(f"event {seq}: autonomy action must be one of {sorted(AUTONOMY_ACTIONS)}")
+    if not isinstance(p["detail"], str) or len(p["detail"]) > 500 or "\n" in p["detail"]:
+        raise LedgerError(f"event {seq}: autonomy detail must be one line of at most 500 chars")
+    conn.execute("INSERT INTO autonomy VALUES (?,?,?)",
+                 (seq, p["campaign_id"], canonical_json(p).decode()))
+
+
 _APPLY: dict[str, Callable] = {
     "ledger_opened": _apply_ledger_opened, "execution_opened": _apply_execution_opened,
     "execution_closed": _apply_execution_closed, "receipt_admitted": _apply_receipt_admitted,
     "identity_recorded": _apply_identity_recorded, "revoked": _apply_revoked,
     "incident_opened": _apply_incident_opened, "quarantined": _apply_quarantined,
+    "campaign_frozen": _apply_campaign_frozen, "evaluation_recorded": _apply_evaluation_recorded,
+    "job_settled": _apply_job_settled, "autonomy_recorded": _apply_autonomy_recorded,
 }
 
 
@@ -475,6 +684,25 @@ class Ledger:
         rows = self.conn.execute(sql, (domain,) if domain else ())
         return [IdentityRecord(*row[:7], revoked=bool(row[7]), quarantined=bool(row[8]))
                 for row in rows]
+
+    # -- campaign projections ---------------------------------------------------------------------
+    def campaign(self, campaign_id: str) -> dict | None:
+        row = self.conn.execute("SELECT body FROM campaigns WHERE campaign_id=?",
+                                (campaign_id,)).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def _bodies(self, table: str, campaign_id: str) -> list[dict]:
+        return [json.loads(b) for b, in self.conn.execute(
+            f"SELECT body FROM {table} WHERE campaign_id=? ORDER BY event_seq", (campaign_id,))]
+
+    def evaluations(self, campaign_id: str) -> list[dict]:
+        return self._bodies("evaluations", campaign_id)
+
+    def settlements(self, campaign_id: str) -> list[dict]:
+        return self._bodies("settlements", campaign_id)
+
+    def autonomy(self, campaign_id: str) -> list[dict]:
+        return self._bodies("autonomy", campaign_id)
 
     def first_event(self) -> Event | None:
         return next(self.events(), None)

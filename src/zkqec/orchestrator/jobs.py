@@ -24,7 +24,10 @@ Lifecycle: ``reserved → dispatched → {completed | uncertain | failed} → se
   charged in full and flagged); uncertain jobs are charged their full reservation.
 * All methods can run inside the ledger's open transaction (e.g. from ``Admission.run_verifier``'s
   ``on_close`` hook) so admission and settlement commit atomically; otherwise they open their own
-  ``BEGIN IMMEDIATE`` transaction.
+  ``BEGIN IMMEDIATE`` transaction (the ledger's, when the book is bound to one).
+* A book bound to an admission ledger (:meth:`Admission.job_book`) records every settlement and
+  cancellation as a hash-chained ``job_settled`` event in the same transaction as the operational
+  update; :meth:`JobBook.reconcile` checks the operational tables against those events.
 """
 from __future__ import annotations
 
@@ -36,9 +39,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 
-from zkqec.contracts import Reservation, TRANSITIONS
-
-UNITS = ("usd", "requests", "input_tokens", "output_tokens", "wall_seconds", "cpu_seconds")
+from zkqec.contracts import TRANSITIONS, UNITS, Reservation, UsageError
+from zkqec.contracts.jobs import charge_for as _charge_rule
+from zkqec.contracts.jobs import check_usage as _check_usage
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ops_jobs (
@@ -88,25 +91,15 @@ def _now() -> str:
 
 def check_usage(actual: dict | None) -> dict[str, float] | None:
     """Typed usage: known units only, each a finite non-negative int/float (not bool)."""
-    if actual is None:
-        return None
-    if not isinstance(actual, dict):
-        raise JobError(f"usage must be a dict of units, got {type(actual).__name__}")
-    out = {}
-    for unit, v in actual.items():
-        if unit not in UNITS:
-            raise JobError(f"unknown usage unit {unit!r}")
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
-            raise JobError(f"usage {unit}={v!r} must be a finite non-negative number")
-        out[unit] = float(v)
-    return out
+    try:
+        return _check_usage(actual)
+    except UsageError as exc:
+        raise JobError(str(exc)) from None
 
 
 def charge_for(state: str, reservation: dict, actual: dict | None) -> dict[str, float]:
     """Settlement rule: uncertain or unmeasured ⇒ the reservation; measured units ⇒ the measure."""
-    if state == "uncertain" or actual is None:
-        return {u: float(reservation.get(u, 0.0)) for u in UNITS}
-    return {u: float(actual[u]) if u in actual else float(reservation.get(u, 0.0)) for u in UNITS}
+    return _charge_rule(state, reservation, actual)
 
 
 def _finite_charge(d: object) -> bool:
@@ -135,18 +128,34 @@ def namespace(campaign: str, arm: str | None = None, split: str | None = None,
 
 class JobBook:
     def __init__(self, conn: sqlite3.Connection, campaign: str, *, arm: str | None = None,
-                 split: str | None = None, profile: str | None = None):
+                 split: str | None = None, profile: str | None = None, ledger=None,
+                 settlement_sink=None):
         self.conn = conn
         self.namespace = namespace(campaign, arm, split, profile)
         self.campaign = self.namespace          # column value: the full namespace key
+        self._ledger, self._sink = ledger, settlement_sink
         # sqlite3.executescript would COMMIT an open transaction; run statements one by one.
         for stmt in _SCHEMA.strip().split(";\n"):
             if stmt.strip():
                 self.conn.execute(stmt)
 
     # -- transactions ---------------------------------------------------------------------------
+    @classmethod
+    def for_namespace(cls, conn: sqlite3.Connection, ns: str) -> "JobBook":
+        """A read/audit view of an existing namespace key (no settlement sink)."""
+        book = cls(conn, ns.split("/")[0])
+        book.namespace = book.campaign = ns
+        return book
+
     @contextmanager
     def _tx(self) -> Iterator[None]:
+        if self._ledger is not None:
+            if self._ledger._in_tx:
+                yield                     # the ledger's (e.g. closing) transaction owns it
+            else:
+                with self._ledger.transaction():
+                    yield
+            return
         if self.conn.in_transaction:
             yield                         # caller (e.g. the ledger's closing transaction) owns it
             return
@@ -286,7 +295,23 @@ class JobBook:
                        overrun=int(overrun))
             self._log(job_id, "settled", gen, {"charged": charged, "overrun": overrun,
                                                 "from": state})
+            self._record(job_id, state, gen, reservation,
+                         check_usage(json.loads(actual)) if actual else None, charged, overrun)
             return charged
+
+    def _record(self, job_id, from_state, gen, reservation, actual, charged, overrun) -> None:
+        """Append the hash-chained settlement event (same transaction) when bound to a ledger."""
+        if self._sink is None:
+            return
+        kind, idem, retry_of, result = self.conn.execute(
+            "SELECT kind, idem_key, retry_of, result_sha FROM ops_jobs WHERE job_id=? AND "
+            "campaign=?", (job_id, self.campaign)).fetchone()
+        self._sink({"namespace": self.namespace, "job_id": job_id, "kind": kind,
+                    "idem_key": idem, "retry_of": retry_of, "generation": gen,
+                    "from_state": from_state,
+                    "reservation": {u: float(reservation.get(u, 0.0)) for u in UNITS},
+                    "actual": actual, "charged": charged, "overrun": bool(overrun),
+                    "result": result})
 
     def cancel(self, job_id: str) -> None:
         """Cancel a reserved (never dispatched) job: it settles with a zero charge."""
@@ -297,6 +322,8 @@ class JobBook:
             zero = {u: 0.0 for u in UNITS}
             self._move(job_id, "settled", actual=json.dumps(zero), outcome="cancelled")
             self._log(job_id, "cancelled", 0, {})
+            row = self._row(job_id)
+            self._record(job_id, "cancelled", row[2], json.loads(row[3]), None, zero, False)
 
     def expire(self, job_id: str, generation: int, *, killed: bool) -> None:
         """Lease expiry: the old execution becomes uncertain (full reservation retained).
@@ -322,6 +349,59 @@ class JobBook:
 
     def state(self, job_id: str) -> str:
         return self._row(job_id)[1]
+
+    def reconcile(self, settlements: list[dict], caps: dict[str, float], *,
+                  confirmation: dict | None = None) -> list[str]:
+        """Operational tables vs the ledger's ``job_settled`` events and frozen caps (§L, §K).
+
+        Every settled job must have exactly one matching event (kind, key, retry, generation,
+        reservation, charge, settled-from state, result) and every event a settled job; the only
+        unsettled job allowed is the reserved confirmation job with the frozen reservation."""
+        problems = self.audit()
+        events = {e["job_id"]: e for e in settlements if e.get("namespace") == self.namespace}
+        for e in settlements:
+            if e.get("namespace") != self.namespace:
+                problems.append(f"settlement {e.get('job_id')} is outside namespace {self.namespace}")
+        settled_log = {}
+        for job_id, detail in self.conn.execute(
+                "SELECT job_id, detail FROM ops_log WHERE event='settled' AND job_id IN "
+                "(SELECT job_id FROM ops_jobs WHERE campaign=?) ORDER BY seq", (self.campaign,)):
+            settled_log[job_id] = json.loads(detail).get("charged")
+        for (job_id, kind, idem, retry_of, state, gen, res, actual, outcome,
+             result) in self.conn.execute(
+                "SELECT job_id, kind, idem_key, retry_of, state, generation, reservation, actual, "
+                "outcome, result_sha FROM ops_jobs WHERE campaign=? ORDER BY created_at",
+                (self.campaign,)):
+            reservation = json.loads(res)
+            if state != "settled":
+                if not (kind == "confirm" and state == "reserved" and confirmation is not None
+                        and {u: float(reservation.get(u, 0)) for u in UNITS} == confirmation):
+                    problems.append(f"job {job_id} ({kind}) is {state}: unsettled at audit")
+                continue
+            ev = events.pop(job_id, None)
+            if ev is None:
+                problems.append(f"settled job {job_id} has no job_settled event")
+                continue
+            try:
+                charged = json.loads(actual) if actual else None
+            except ValueError:
+                charged = None
+            mine = {"kind": kind, "idem_key": idem, "retry_of": retry_of, "generation": gen,
+                    "reservation": {u: float(reservation.get(u, 0)) for u in UNITS},
+                    "charged": charged, "from_state": outcome, "result": result}
+            theirs = {k: ev.get(k) for k in mine}
+            if mine != theirs:
+                diff = sorted(k for k in mine if mine[k] != theirs[k])
+                problems.append(f"job {job_id}: operational record differs from its settlement "
+                                f"event in {diff}")
+            if outcome != "cancelled" and settled_log.get(job_id) != ev.get("charged"):
+                problems.append(f"job {job_id}: ops_log charge differs from its settlement event")
+        for job_id in sorted(events):
+            problems.append(f"job_settled event {job_id} has no operational job")
+        frozen = {u: float(c) for u, c in caps.items()}
+        if self.caps() != frozen:
+            problems.append(f"operational caps {self.caps()} differ from the frozen caps {frozen}")
+        return problems
 
     def find(self, idem_key: str) -> str | None:
         """The job of this namespace with this idempotency key, if any."""

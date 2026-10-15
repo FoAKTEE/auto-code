@@ -294,6 +294,51 @@ class ArtifactStore:
         dest_dir = self._check_shards(sha, create=False)
         return [self.get_json(r) for r in self._read_index(dest_dir / f"{sha}.redactions")]
 
+    def verify_all(self) -> list[str]:
+        """Re-hash every stored artifact and every redaction record (and its index); report stray
+        files. Used by the offline audit before any replay (§M)."""
+        problems: list[str] = []
+        for first in sorted(self.root.iterdir()):
+            if first.name.startswith(".") and first.is_file():
+                continue
+            if not (len(first.name) == 2 and first.is_dir() and not first.is_symlink()):
+                problems.append(f"stray entry {first.name} in the store root")
+                continue
+            for second in sorted(first.iterdir()):
+                if not (len(second.name) == 2 and second.is_dir() and not second.is_symlink()):
+                    problems.append(f"stray entry {first.name}/{second.name}")
+                    continue
+                for f in sorted(second.iterdir()):
+                    name = f.name
+                    if _SHA_RE.match(name):
+                        try:
+                            self.verify(name)
+                        except StoreError as exc:
+                            problems.append(f"artifact {name}: {type(exc).__name__}: {exc}")
+                    elif name.endswith(".redactions") and _SHA_RE.match(name[:-11]):
+                        problems += self._verify_redactions(name[:-11], f)
+                    elif not name.startswith(".tmp-"):
+                        problems.append(f"stray file {first.name}/{second.name}/{name}")
+        return problems
+
+    def _verify_redactions(self, sha: str, index: Path) -> list[str]:
+        out = []
+        try:
+            recs = self._read_index(index)
+        except (StoreError, ValueError) as exc:
+            return [f"redaction index of {sha}: {exc}"]
+        if not self.exists(sha):
+            out.append(f"redaction index for missing artifact {sha}")
+        for rec_sha in recs:
+            try:
+                rec = self.get_json(rec_sha)
+            except StoreError as exc:
+                out.append(f"redaction record {rec_sha}: {type(exc).__name__}")
+                continue
+            if rec.get("schema") != REDACTION_SCHEMA or rec.get("artifact") != sha:
+                out.append(f"redaction record {rec_sha} does not describe artifact {sha}")
+        return out
+
     def iter_shas(self) -> Iterator[str]:
         for first in sorted(self.root.iterdir()):
             if not (len(first.name) == 2 and first.is_dir() and not first.is_symlink()):

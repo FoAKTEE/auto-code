@@ -6,11 +6,15 @@ Archive layout (``ARCHIVE``, outside the repo, durable):
   bundles/<campaign>/<sha256>.tar.zst   sealed campaign bundles
 
 A bundle holds the campaign's complete transitive evidence: manifest (with CAS refs and the ledger
-head), a consistent ledger snapshot, every stored artifact, the campaign record, the report, and any
-call records / broker logs. ``audit_bundle`` rebuilds everything in an empty directory from the
-archived runtime + wheels only (pip ``--no-index``), then runs the inner audit inside a bwrap
-network namespace: chain + projections + artifact hashes (``Admission.verify``), byte-level replay of
-every admitted verifier execution and identity, and the report lint.
+head), a consistent ledger snapshot (which carries the frozen campaign, evaluation membership and
+settlement events), every stored artifact, the report, and any call records / broker logs.
+``audit_bundle`` rebuilds everything in an empty directory from the archived runtime + wheels only
+(pip ``--no-index``), then runs the inner audit inside a bwrap network namespace: chain + apply
+invariants + projections + event-referenced artifact hashes (``Admission.verify``), every stored
+artifact and redaction record re-hashed, every candidate component and call-record artifact
+reference traversed, the operational job tables reconciled with the ``job_settled`` events and the
+frozen caps, call-record usage reconciled with the settled measurements, byte-level replay of every
+execution, and the report lint against the ledger only.
 """
 from __future__ import annotations
 
@@ -163,7 +167,7 @@ def scan_bundle_inputs(root: Path, sanitizer=None) -> list[str]:
 
 
 def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, report_md: str,
-         campaign_record: dict, extra_dirs: dict[str, Path] | None = None,
+         extra_dirs: dict[str, Path] | None = None,
          archive: Path = ARCHIVE, commit: str | None = None) -> dict[str, Any]:
     """Write a sealed bundle; return its index entry (bundle sha256, path, ledger head, closures)."""
     closures = ensure_closures(archive, commit=commit)
@@ -175,7 +179,6 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
         src.close()
         shutil.copytree(store_root, b / "store", symlinks=False)
         (b / "report.md").write_text(report_md)
-        (b / "campaign.json").write_text(json.dumps(campaign_record, indent=2, sort_keys=True))
         for name, d in (extra_dirs or {}).items():
             if d.exists():
                 shutil.copytree(d, b / name, symlinks=False)
@@ -281,11 +284,82 @@ def replay_executions(adm, reg, store) -> tuple[list[str], int, int]:
     return problems, replayed, identities
 
 
+def _call_record_problems(store, sha: str, what: str) -> tuple[list[str], dict | None]:
+    """Verify a call record and every artifact it references (request, prompt, schema, output)."""
+    try:
+        rec = store.get_json(sha)
+    except Exception as exc:                                     # noqa: BLE001
+        return [f"{what} call record {sha}: {type(exc).__name__}"], None
+    out = []
+    arts = rec.get("artifacts", {}) if isinstance(rec, dict) else {}
+    for name, ref in sorted(arts.items() if isinstance(arts, dict) else []):
+        try:
+            store.verify(ref)
+        except Exception as exc:                                 # noqa: BLE001
+            out.append(f"{what} call record {sha[:12]} artifact {name} {ref}: {type(exc).__name__}")
+    return out, rec
+
+
+def audit_campaign(adm, store, campaign_id: str) -> list[str]:
+    """Campaign-level audit over the ledger events: artifact references beyond the events
+    themselves, call-record accounting, and the operational tables vs ``job_settled`` (§K, §L, §M)."""
+    from zkqec.contracts import DesignCandidate, UsageError, check_usage
+    from zkqec.orchestrator.jobs import JobBook
+
+    camp = adm.ledger.campaign(campaign_id)
+    if camp is None:
+        return [f"campaign {campaign_id} is not frozen in the ledger"]
+    problems: list[str] = []
+    for ev in adm.ledger.evaluations(campaign_id):
+        try:
+            cand = DesignCandidate.model_validate(store.get_json(ev["candidate"]))
+        except Exception as exc:                                 # noqa: BLE001
+            problems.append(f"evaluation {ev['evaluation_id'][:12]}: candidate "
+                            f"{type(exc).__name__}"); continue
+        refs = [r for r in (cand.E, cand.A, cand.C, cand.L, cand.P, cand.D, cand.F, cand.eta)
+                if r not in ("absent", "unsupported")]
+        refs += [x for op in cand.G for x in (op.circuit, op.basis, op.target_action)]
+        for ref in refs:
+            try:
+                store.verify(ref)
+            except Exception as exc:                             # noqa: BLE001
+                problems.append(f"candidate {ev['candidate'][:12]} component {ref}: "
+                                f"{type(exc).__name__}")
+        if ev["call_record"]:
+            problems += _call_record_problems(store, ev["call_record"], "evaluation")[0]
+    settlements = adm.ledger.settlements(campaign_id)
+    for s in settlements:
+        if not s["result"]:
+            continue
+        found, rec = _call_record_problems(store, s["result"], f"job {s['job_id'][:12]}")
+        problems += found
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("job_id") != s["job_id"]:
+            problems.append(f"job {s['job_id']}: its call record names job {rec.get('job_id')}")
+        if "usage" in rec:
+            try:
+                usage = check_usage(rec["usage"] or None) or None
+            except UsageError as exc:
+                usage = f"invalid ({exc})"
+            if usage != s["actual"]:
+                problems.append(f"job {s['job_id']}: call-record usage differs from the settled "
+                                "measurement")
+        broker = rec.get("broker") if isinstance(rec.get("broker"), dict) else {}
+        if "model_requests" in broker and (s["actual"] or {}).get("requests") is not None \
+                and float(broker["model_requests"]) != s["actual"]["requests"]:
+            problems.append(f"job {s['job_id']}: broker request count differs from the charge")
+    book = JobBook.for_namespace(adm.ledger.conn, camp["namespace"])
+    problems += book.reconcile(settlements, camp["caps"], confirmation=camp["confirmation"])
+    return problems
+
+
 def audit_inner(bundle_dir: str) -> dict[str, Any]:
-    """Inside the reconstructed environment: verify ledger, replay executions, lint the report."""
+    """Inside the reconstructed environment: verify ledger, store and accounting, replay
+    executions, lint the report (all from the bundle's ledger)."""
     from zkqec.admission import Admission
     from zkqec.pipeline import build_registry
-    from zkqec.report.render import CampaignRecord, lint
+    from zkqec.report.render import lint
     from zkqec.store import ArtifactStore
 
     b = Path(bundle_dir)
@@ -301,11 +375,11 @@ def audit_inner(bundle_dir: str) -> dict[str, Any]:
         head = adm.ledger.head()
         if {"seq": head[0], "hash": head[1]} != manifest["ledger_head"]:
             problems.append("ledger head differs from the sealed manifest (truncation or tamper)")
+        problems += [f"store: {p}" for p in store.verify_all()]
+        problems += audit_campaign(adm, store, manifest["campaign_id"])
         replay_problems, replayed, identities = replay_executions(adm, reg, store)
         problems += replay_problems
-        camp = CampaignRecord.model_validate(json.loads((b / "campaign.json").read_text()))
-        domain = camp.manifest.get("domain")
-        problems += lint((b / "report.md").read_text(), adm, domain, camp)
+        problems += lint((b / "report.md").read_text(), adm, manifest["campaign_id"])
     finally:
         adm.close()
     return {"ok": not problems, "problems": problems, "replayed_executions": replayed,
