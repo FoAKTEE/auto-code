@@ -163,7 +163,7 @@ def seal(run_dir: Path, campaign_id: str, ledger_path: Path, store_root: Path, r
 def audit_bundle(bundle: Path, archive: Path = ARCHIVE, workdir: Path | None = None,
                  offline: bool = True) -> dict[str, Any]:
     """Reconstruct in an empty directory from archived closures only and run the inner audit."""
-    workdir = Path(workdir or tempfile.mkdtemp(prefix="zkqec-audit-"))
+    workdir = Path(workdir or tempfile.mkdtemp(prefix="zkqec-audit-")).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     if any(workdir.iterdir()):
         raise ValueError("audit workdir must be empty")

@@ -76,3 +76,23 @@ def test_large_pmin_requests_are_screened_for_family_terms_not_size(tmp_path):
     from zkqec.firewall.lint import family_terms
     assert family_terms("x" * 20000) == []
     assert family_terms("use a bicycle construction") == ["bicycle"]
+
+
+class LaunchFailingDouble(ReplayProviderDouble):
+    def call(self, *, job_id, system_prompt, request, schema, reservation):
+        self.requests.append(json.loads(request))
+        return CallResult("launch_failure", None, {}, {"provider": "replay"})
+
+
+def test_repeated_launch_failures_stop_the_campaign(tmp_path):
+    import zkqec.orchestrator.campaign as c
+    prov = LaunchFailingDouble([])
+    with pytest.raises(c.LaunchFailures):
+        run_campaign(cfg(), prov, tmp_path, require_clean=False, seal_bundle=False)
+    assert len(prov.requests) == 2
+
+
+def test_designer_schema_has_no_draft_uri():
+    from pathlib import Path
+    schema = json.loads((Path(__file__).resolve().parents[2] / "roles/designer/output.schema.json").read_text())
+    assert "$schema" not in schema       # the Claude CLI validator rejects the 2020-12 meta-schema URI

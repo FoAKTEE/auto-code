@@ -82,6 +82,7 @@ class ClaudeCallProvider:
             # Raw CLI JSON (result, usage, cost); the artifact store sanitizes before hashing (§M).
             "cli_stdout": res.stdout.decode("utf-8", "replace")[:1_000_000],
             "sandbox_job_id": sandbox_job,
+            "cli_stderr_tail": res.stderr.decode("utf-8", "replace")[-2000:],
             "telemetry_complete": bool(usage_known),
         }
         tokens = summ["usage"] if usage_known else {}

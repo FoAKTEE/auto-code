@@ -85,6 +85,10 @@ class EvaluatorDirty(RuntimeError):
     pass
 
 
+class LaunchFailures(RuntimeError):
+    """Repeated provider launch failures: an infrastructure fault that stops the campaign."""
+
+
 def _task_view(task: TaskSA | TaskSF) -> dict[str, Any]:
     d = task.model_dump(mode="json")
     d.pop("task_id", None)                    # identifiers are not shown to proposers (§N)
@@ -126,6 +130,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     try:
         for task in cfg.tasks:
             history: list[Evaluation] = []
+            launch_failures = 0
             stop_reason[task.task_id] = "proposal_budget_spent"
             for i in range(cfg.max_proposals_per_task):
                 request = json.dumps({"task": _task_view(task), "digest": json.loads(render_digest(history)),
@@ -147,6 +152,10 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                        "request_sha256": content_hash(request)}
                 rec_sha = store.put_json(rec)
                 (calls_dir / f"{task.task_id}-{i:03d}.json").write_text(json.dumps(rec, indent=2, sort_keys=True))
+                if res.outcome == "launch_failure" and res.text is None:
+                    launch_failures += 1
+                else:
+                    launch_failures = 0
                 state = {"completed": "completed", "uncertain": "uncertain"}.get(res.outcome, "failed")
                 book.complete(job, gen, state, actual=res.usage or None)
                 book.settle(job)
@@ -162,6 +171,10 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                 if proposal is None:
                     if res.outcome not in ("completed",) and res.text is None:
                         history.append(Evaluation(res.outcome, {"reason": res.outcome}))
+                    if launch_failures >= 2:
+                        # Infrastructure fault, not science: stop instead of burning attempts (§4.14).
+                        raise LaunchFailures(f"{task.task_id}: {launch_failures} consecutive launch "
+                                             f"failures; see {calls_dir}")
                     continue
                 p_sha = store.put_json(proposal.model_dump(mode="json"))
                 ev = pipe.evaluate(proposal, task)
