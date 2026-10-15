@@ -228,7 +228,7 @@ def audit_inner(bundle_dir: str) -> dict[str, Any]:
             problems.append("ledger head differs from the sealed manifest (truncation or tamper)")
         replayed = identities = 0
         conn = adm.ledger.conn
-        for ex_id, in conn.execute("SELECT execution_id FROM executions ORDER BY seq"):
+        for ex_id, in conn.execute("SELECT execution_id FROM executions ORDER BY rowid"):
             ex, cl = adm.ledger.execution(ex_id), adm.ledger.closure(ex_id)
             if cl is None or cl["outcome"] != "admitted":
                 continue
