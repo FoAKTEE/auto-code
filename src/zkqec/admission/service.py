@@ -148,8 +148,9 @@ class Admission:
         (:func:`zkqec.exec.run_bounded`: RLIMIT_CPU, RLIMIT_AS, wall kill); ``on_measure`` receives
         the :class:`BoundedResult` (the child's measured CPU, wall and peak RSS) before the
         closure. Any outcome but ``ok`` closes the execution as ``crashed`` (``cpu_exceeded``,
-        ``wall_exceeded``, ``memory_exceeded`` or the child's error type), with the measurement in
-        the closure detail and no receipt — never a bound. Without ``limits`` the verifier runs in
+        ``wall_exceeded``, ``memory_exceeded``, ``escaped`` or the child's error type), with the
+        measurement in the closure detail and no receipt — never a bound. The caller's
+        ``on_measure`` sees the outcome: an ``escaped`` run keeps its job's full reservation. Without ``limits`` the verifier runs in
         this process; ``wall_seconds`` is then an in-process SIGALRM ceiling (``wall_timeout``).
         """
         spec = self.registry.get(name, "verifier")

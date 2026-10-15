@@ -222,16 +222,23 @@ class Pipeline:
         limits = self.limits()
         gen = self.book.dispatch(job)
         t0, w0 = time.process_time(), time.monotonic()
-        child = {"cpu_seconds": 0.0}
+        child: dict = {"cpu_seconds": 0.0, "outcome": None}
 
         def measure(res) -> None:
-            child["cpu_seconds"] = float(res.cpu_seconds)
+            # BoundedResult.usage() omits CPU it could not measure (processes killed before the
+            # child reaped them): that unit is then charged at the reservation (Codex M1
+            # re-review N1).
+            child.update(cpu_seconds=res.usage().get("cpu_seconds"), outcome=res.outcome)
 
         def settle(outcome: str) -> None:
-            usage = {"cpu_seconds": max(0.0, time.process_time() - t0) + child["cpu_seconds"],
-                     "wall_seconds": max(0.0, time.monotonic() - w0)}
-            self.book.complete(job, gen, "completed" if outcome == "admitted" else "failed",
-                               actual=usage)
+            usage = {"wall_seconds": max(0.0, time.monotonic() - w0)}
+            if child["cpu_seconds"] is not None:
+                usage["cpu_seconds"] = max(0.0, time.process_time() - t0) + child["cpu_seconds"]
+            if child["outcome"] == "escaped":         # group members outlived the kill: the job
+                state = "uncertain"                   # keeps its full reservation (§L)
+            else:
+                state = "completed" if outcome == "admitted" else "failed"
+            self.book.complete(job, gen, state, actual=usage)
             self.book.settle(job)
         if identity:
             return self.adm.run_identity(name, inputs["presentation"], self.domain,

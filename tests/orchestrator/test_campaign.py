@@ -412,3 +412,119 @@ def test_controls_and_confirmation_are_evaluator_boundaries(tmp_path, monkeypatc
                                        "('controls:p1a', 'confirmation')", (kind,))]
     conn.close()
     assert states == ["reserved"]                          # never dispatched past a changed evaluator
+
+
+# --- Codex M1 re-review N1: an expired job leaves no nested worker and keeps its unresolved charge -
+def _proc(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    fields = stat[stat.rindex(")") + 2:].split()
+    return fields[0], int(fields[2])
+
+
+def _group_members(pgid):
+    import os
+    return [int(d) for d in os.listdir("/proc") if d.isdigit()
+            and (s := _proc(int(d))) is not None and s[1] == pgid and s[0] not in "ZX"]
+
+
+def _busy_worker(path):
+    import os
+    path.write_text(f"{os.getpid()} {os.getpgid(0)}")
+    while True:
+        pass
+
+
+def test_an_expired_control_job_leaves_no_inner_worker_and_retains_its_charge(tmp_path, monkeypatch):
+    """The Codex repro through the campaign: the control suite's job (a bounded child) runs an inner
+    bounded worker, as its pipeline verifiers do, and expires while that worker is busy. No process
+    of the job's group survives the return, the outcome is wall_exceeded, and the CPU the killed
+    worker used (never measured) stays charged at the job's reservation."""
+    import os
+    import signal
+    from zkqec.admission import Admission
+    from zkqec.controls import p1a
+    from zkqec.exec import Limits, run_bounded
+    from zkqec.pipeline import build_registry
+    from zkqec.store import ArtifactStore
+    marker = tmp_path / "inner"
+    first = p1a.CONTROL_SETS["p1a"][0].name
+    orig = p1a._run_control
+
+    def stuck(c, root, inputs):
+        if c.name == first:
+            run_bounded(_busy_worker, marker, limits=Limits(cpu_seconds=60, wall_seconds=60,
+                                                            memory_bytes=256 * 2**20))
+        return orig(c, root, inputs)
+    monkeypatch.setattr(p1a, "_run_control", stuck)
+    try:
+        out = run_campaign(cfg(controls="p1a", verifier_wall_seconds=3, verifier_cpu_seconds=3,
+                               max_proposals_per_task=1),
+                           ReplayProviderDouble(["not json"]), tmp_path, require_clean=False,
+                           seal_bundle=False)
+        inner, group = map(int, marker.read_text().split())
+        assert _proc(inner) is None or _proc(inner)[0] in "ZX"
+        assert _group_members(group) == []
+        c = out["controls"]
+        assert c["ok"] is False and c["passed"] is False and "wall_exceeded" in c["error"]
+        store = ArtifactStore(tmp_path / "t1" / "store")
+        with Admission(tmp_path / "t1" / "ledger.db", store, build_registry(store)) as adm:
+            (s,) = [s for s in adm.ledger.settlements("t1") if s["idem_key"] == "controls:p1a"]
+        assert s["from_state"] == "failed" and "cpu_seconds" not in s["actual"]
+        assert s["charged"]["cpu_seconds"] == s["reservation"]["cpu_seconds"] == 3.0
+        assert 3 <= s["charged"]["wall_seconds"] < 10
+    finally:
+        if marker.exists():
+            pid = int(marker.read_text().split()[0])
+            if _proc(pid) is not None and _proc(pid)[0] not in "ZX":
+                os.kill(pid, signal.SIGKILL)
+
+
+def _escape_everything(monkeypatch):
+    from zkqec.exec import bounded
+    monkeypatch.setattr(bounded, "_group_alive", lambda pgid: True)
+    monkeypatch.setattr(bounded, "ESCAPE_GRACE_SECONDS", 0.1)
+
+
+def test_an_escaped_control_job_keeps_its_full_reservation(tmp_path, monkeypatch):
+    import zkqec.orchestrator.campaign as campaign
+    from zkqec.admission import Admission
+    from zkqec.pipeline import build_registry
+    from zkqec.store import ArtifactStore
+    monkeypatch.setattr(campaign, "_suite", lambda *a: {"evidence": {"results": []}})
+    _escape_everything(monkeypatch)
+    out = run_campaign(cfg(controls="p1a", verifier_wall_seconds=3, verifier_cpu_seconds=3,
+                           max_proposals_per_task=1),
+                       ReplayProviderDouble(["not json"]), tmp_path, require_clean=False,
+                       seal_bundle=False)
+    assert out["controls"]["ok"] is False and "escaped" in out["controls"]["error"]
+    store = ArtifactStore(tmp_path / "t1" / "store")
+    with Admission(tmp_path / "t1" / "ledger.db", store, build_registry(store)) as adm:
+        (s,) = [s for s in adm.ledger.settlements("t1") if s["idem_key"] == "controls:p1a"]
+    assert s["from_state"] == "uncertain" and s["charged"] == s["reservation"]
+
+
+def test_an_escaped_confirmation_keeps_its_full_reservation(tmp_path, monkeypatch):
+    import zkqec.orchestrator.campaign as campaign
+    import zkqec.report.bundle as bundle_mod
+    archive = tmp_path / "archive"
+    closures = _fake_closures(archive, tmp_path)
+    monkeypatch.setattr(bundle_mod, "ensure_closures", lambda *a, **k: closures)
+    monkeypatch.setattr(campaign, "audit_bundle", lambda *a, **k: {"ok": True, "problems": []})
+    conf = Reservation(usd=0, requests=0, input_tokens=0, output_tokens=0, wall_seconds=2,
+                       cpu_seconds=2)
+    real = campaign._confirm
+
+    def confirm(*a, **k):                    # escape only the confirmation's bounded child
+        _escape_everything(monkeypatch)
+        return real(*a, **k)
+    monkeypatch.setattr(campaign, "_confirm", confirm)
+    out = run_campaign(cfg(confirmation=conf), ReplayProviderDouble([GOOD]), tmp_path / "runs",
+                       require_clean=False, archive=archive)
+    assert out["audit"]["ok"] is False and "escaped" in out["audit"]["problems"][0]
+    assert out["confirmation"] == {"usd": 0.0, "requests": 0.0, "input_tokens": 0.0,
+                                   "output_tokens": 0.0, "wall_seconds": 2.0, "cpu_seconds": 2.0}
+    assert "the confirmation audit did not pass" in out["confirmation_supplement"]["problems"]

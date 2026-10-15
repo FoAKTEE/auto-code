@@ -369,23 +369,34 @@ def _run_controls(cfg: CampaignConfig, adm: Admission, store: ArtifactStore, boo
     ``controls_recorded`` commits with the job's settlement. ``ok`` says the suite ran to
     completion; ``passed`` is its pass result (k = 0, j = 0, no outcome mismatch). A failing suite
     keeps the evidence it produced: a failure record (``FAILED_KIND``, with the completed controls)
-    is the failed job's settled result and a ``controls_failed`` incident names it (B3)."""
+    is the failed job's settled result and a ``controls_failed`` incident names it (B3). The suite's
+    own bounded workers (its pipeline verifiers) stay in the suite's process group, so the job's kill
+    reaches them; their unmeasured CPU is charged at the reservation, and an ``escaped`` group
+    (members outliving the kill) settles uncertain at the full reservation (Codex M1 re-review N1)."""
     gen = book.dispatch(job)
     t0, w0 = time.process_time(), time.monotonic()
     measured: dict[str, float] = {}
+    escaped = False
 
     def settle(state: str, result: str | None = None) -> None:
         usage = measured or {"cpu_seconds": max(0.0, time.process_time() - t0),
                              "wall_seconds": max(0.0, time.monotonic() - w0)}
-        book.complete(job, gen, state, actual=usage, result_sha=result)
+        # N1: members of the suite's process group outlived the kill: full reservation (§L)
+        book.complete(job, gen, "uncertain" if escaped else state, actual=usage,
+                      result_sha=result)
         book.settle(job)
     error, partial, evidence = None, None, None
     try:
         inputs = controls.campaign_inputs(adm, store, cfg.campaign_id)
         res = run_bounded(_suite, cfg.controls, scratch, inputs,
                           limits=_limits(cfg, _verifier_reservation(cfg)))
-        measured.update(cpu_seconds=res.cpu_seconds + max(0.0, time.process_time() - t0),
-                        wall_seconds=max(res.wall_seconds, time.monotonic() - w0))
+        # Codex M1 re-review N1: CPU the child never reaped (its killed workers) is unmeasured,
+        # absent from usage(), so it is charged at the reservation.
+        child = res.usage()
+        measured.update(wall_seconds=max(child["wall_seconds"], time.monotonic() - w0))
+        if "cpu_seconds" in child:
+            measured["cpu_seconds"] = child["cpu_seconds"] + max(0.0, time.process_time() - t0)
+        escaped = res.outcome == "escaped"
         if not res.ok:
             error = f"{res.outcome}: {res.detail.get('message', res.detail.get('error_type', ''))}"[:400]
         elif "error" in res.value:
@@ -437,13 +448,19 @@ def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, jo
         audit: dict[str, Any] = {"ok": False, "problems": ["confirmation did not complete"]}
         usage = {"wall_seconds": float(cfg.confirmation.wall_seconds),
                  "cpu_seconds": float(cfg.confirmation.cpu_seconds)}
+        state = "failed"
         try:
             # B5: the re-execution (and every process it starts) runs in a bounded child whose
             # CPU and wall ceilings are the confirmation reservation; its measured usage
             # (wait4: the child and its reaped descendants) is charged; non-ok is a failure.
+            # N1: the re-executed evaluator's own bounded workers stay in the child's process
+            # group; unmeasured CPU (killed workers) is absent from usage(), so charged at the
+            # reservation; an escaped group settles uncertain at the full reservation.
             res = run_bounded(audit_bundle, Path(entry["path"]), workdir=run / "audit",
                               limits=_limits(cfg, cfg.confirmation), **kw)
             usage = res.usage()
+            if res.outcome == "escaped":
+                state = "uncertain"
             if res.ok and isinstance(res.value, dict):
                 audit = res.value
             else:
@@ -452,7 +469,8 @@ def _confirm(run: Path, cfg: CampaignConfig, prof: str, store: ArtifactStore, jo
         finally:
             usage = {**usage, "wall_seconds": max(usage["wall_seconds"], time.monotonic() - w0),
                      "usd": 0.0, "requests": 0.0, "input_tokens": 0.0, "output_tokens": 0.0}
-            book.complete(job, gen, "completed" if audit.get("ok") else "failed", actual=usage)
+            book.complete(job, gen, "completed" if audit.get("ok") and state != "uncertain"
+                          else state, actual=usage)
             charged = book.settle(job)
         doc = confirmation_supplement(adm, cfg.campaign_id, entry, job, book.totals(), audit)
     finally:

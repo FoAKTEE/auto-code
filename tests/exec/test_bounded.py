@@ -146,3 +146,120 @@ def test_an_armed_parent_timer_does_not_fire_in_the_child():
 def test_limits_are_validated(bad):
     with pytest.raises(ValueError):
         Limits(**bad)
+
+
+# --- Codex M1 re-review N1: nested bounded workers never outlive the enclosing job ----------------
+SMALL = Limits(cpu_seconds=60, wall_seconds=60, memory_bytes=256 * 2**20)
+
+
+def _stat(pid):
+    """(state, pgrp) of a process from /proc, or None once it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    fields = stat[stat.rindex(")") + 2:].split()
+    return fields[0], int(fields[2])
+
+
+def _alive(pid):
+    s = _stat(pid)
+    return s is not None and s[0] not in "ZX"
+
+
+def _live_members(pgid):
+    """Live (non-zombie) processes of process group ``pgid``, read from /proc."""
+    return [int(d) for d in os.listdir("/proc") if d.isdigit()
+            and (s := _stat(int(d))) is not None and s[1] == pgid and s[0] not in "ZX"]
+
+
+def _busy(path):
+    with open(path, "w") as f:
+        f.write(f"{os.getpid()} {os.getpgid(0)}")
+    spin(60)
+
+
+def _cleanup(path):
+    if os.path.exists(path):
+        pid = int(open(path).read().split()[0])
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_an_expired_outer_job_leaves_no_inner_bounded_worker_running(tmp_path):
+    """The Codex repro: an outer job (a control suite) whose bounded child runs an inner bounded
+    worker (a pipeline verifier) expires while the inner one is busy. The inner worker stays in
+    the outer job's process group, so the outer wall kill reaches it; the parent returns only once
+    the whole group is gone; the inner worker's CPU was never measured, so the CPU unit is
+    unresolved (absent from the usage, i.e. charged at its reservation)."""
+    path = str(tmp_path / "inner")
+    try:
+        res = run_bounded(lambda: run_bounded(_busy, path, limits=SMALL).outcome,
+                          limits=Limits(cpu_seconds=30, wall_seconds=1, memory_bytes=512 * 2**20))
+        assert res.outcome == "wall_exceeded" and res.value is None
+        inner, group = map(int, open(path).read().split())
+        assert not _alive(inner) and _live_members(group) == []          # no survivor at return
+        assert res.detail["process_group"] == group                       # it never left the group
+        assert res.detail["cpu_complete"] is False and "cpu_seconds" not in res.usage()
+        assert res.usage()["wall_seconds"] == res.wall_seconds >= 1
+    finally:
+        _cleanup(path)
+
+
+def test_an_evaluator_re_executed_inside_a_bounded_child_stays_in_its_group(tmp_path):
+    """The confirmation re-executes the evaluator (a fresh interpreter, as in ``audit_bundle``),
+    whose own bounded workers must also stay inside the confirmation job's process group."""
+    import sys
+    path = str(tmp_path / "inner")
+    code = ("import sys; from zkqec.exec import Limits, run_bounded; import time, os\n"
+            "def busy(p):\n"
+            "    open(p, 'w').write(f'{os.getpid()} {os.getpgid(0)}')\n"
+            "    while True: pass\n"
+            "run_bounded(busy, sys.argv[1], limits=Limits(cpu_seconds=60, wall_seconds=60, "
+            "memory_bytes=256 * 2**20))\n")
+    try:
+        res = run_bounded(lambda: subprocess.run([sys.executable, "-c", code, path]).returncode,
+                          limits=Limits(cpu_seconds=30, wall_seconds=3, memory_bytes=512 * 2**20))
+        assert res.outcome == "wall_exceeded"
+        inner, group = map(int, open(path).read().split())
+        assert group == res.detail["process_group"] and not _alive(inner)
+        assert _live_members(group) == []
+    finally:
+        _cleanup(path)
+
+
+def test_a_nested_run_meets_its_own_deadline_inside_the_enclosing_group(tmp_path):
+    path = str(tmp_path / "inner")
+
+    def outer():
+        inner = run_bounded(_busy, path, limits=Limits(cpu_seconds=30, wall_seconds=0.5,
+                                                       memory_bytes=256 * 2**20))
+        return inner.outcome, inner.detail["process_group"], inner.wall_seconds, os.getpgid(0)
+    try:
+        res = run_bounded(outer, limits=ROOMY)
+        assert res.outcome == "ok"
+        outcome, inner_group, wall, outer_group = res.value
+        assert outcome == "wall_exceeded" and inner_group is None and 0.5 <= wall < 5
+        inner, group = map(int, open(path).read().split())
+        assert group == outer_group == res.detail["process_group"] and not _alive(inner)
+    finally:
+        _cleanup(path)
+
+
+def test_descendants_left_behind_by_a_finished_child_are_killed():
+    res = run_bounded(lambda: subprocess.Popen(["sleep", "30"]).pid, limits=ROOMY)
+    assert res.outcome == "ok" and not _alive(res.value)
+    assert res.detail["stragglers_killed"] is True and res.detail["cpu_complete"] is False
+    assert "cpu_seconds" not in res.usage()
+    clean = run_bounded(lambda: 1, limits=ROOMY)
+    assert clean.detail["stragglers_killed"] is False and "cpu_seconds" in clean.usage()
+
+
+def test_members_surviving_the_grace_period_are_an_escape(monkeypatch):
+    from zkqec.exec import bounded
+    monkeypatch.setattr(bounded, "_group_alive", lambda pgid: True)     # a member that never dies
+    monkeypatch.setattr(bounded, "ESCAPE_GRACE_SECONDS", 0.2)
+    res = run_bounded(lambda: 1, limits=ROOMY)
+    assert res.outcome == "escaped" and res.value is None and not res.ok
+    assert "escaped" in bounded.OUTCOMES and "cpu_seconds" not in res.usage()

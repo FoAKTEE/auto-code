@@ -183,3 +183,34 @@ def test_a_hung_verifier_or_identity_is_killed_at_its_wall_reservation(pipe, mon
     detail = [json.loads(d) for d, in pipe.adm.ledger.conn.execute(
         "SELECT detail FROM execution_closures WHERE outcome = 'crashed'")]
     assert [d["error_type"] for d in detail] == ["wall_exceeded"]
+
+
+def test_an_escaped_verifier_keeps_its_full_reservation_and_is_no_evidence(pipe, monkeypatch):
+    """Codex M1 re-review N1: members of a verifier's process group that outlive the grace period
+    make the run ``escaped``; the job settles uncertain at its full reservation, with no receipt."""
+    from zkqec.exec import bounded
+    monkeypatch.setattr(bounded, "_group_alive", lambda pgid: True)
+    monkeypatch.setattr(bounded, "ESCAPE_GRACE_SECONDS", 0.1)
+    ev = pipe.evaluate(chain(), TASK)
+    assert ev.satisfies == "unknown"
+    (key, reservation, charged, outcome), = jobs(pipe)
+    assert key.startswith("l1.css_algebra:") and outcome == "uncertain"
+    assert charged == {u: float(v) for u, v in reservation.items()}
+    detail = [json.loads(d) for d, in pipe.adm.ledger.conn.execute(
+        "SELECT detail FROM execution_closures WHERE outcome = 'crashed'")]
+    assert [d["error_type"] for d in detail] == ["escaped"]
+
+
+def test_a_wall_killed_verifier_is_charged_its_cpu_reservation(pipe, monkeypatch):
+    """The CPU of processes killed at the wall ceiling was never measured: that unit stays
+    charged at the reservation (§K: unmeasured is never zero)."""
+    import zkqec.verify.distance as dist
+
+    def slow(*a, **k):
+        time.sleep(30)
+    monkeypatch.setattr(dist, "sector_distance", slow)
+    pipe.wall_reservation = 1
+    pipe.evaluate(chain(), TASK)
+    [l2] = [r for r in jobs(pipe) if r[0].startswith("l2.distance:")]
+    assert l2[3] == "failed" and l2[2]["cpu_seconds"] == l2[1]["cpu_seconds"] == pipe.cpu_reservation
+    assert 1 <= l2[2]["wall_seconds"] < 5
