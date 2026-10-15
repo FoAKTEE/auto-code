@@ -30,3 +30,12 @@
   Phase 1b (M2–M4) continues only under D4 conditions; appendix v0.4 fixes distance completion rule (Steane t=2),
   Singleton "if", sector-correct disjoint bound, predicate-keyed transport, revocation/quarantine, dispatch state
   machine, fsync-dir publication, sanitize-before-hash, offline executable bundles, 15-mode control mapping.
+- Codex v0.4 verification review: "yes-with-listed-edits — Phase 1a"; five majors fixed in v0.5 (input-charge
+  reservations, dispatch recovery moved into M1, semantic bound conflicts, slice deadline via supervisor on
+  systemd 249, archived runnable runtime).
+- M0 probe (mitmproxy 11.0.2 in `.venv-broker`): Claude under normal HOME leaks ~20 claude.ai connector tools even
+  with `--tools ""`; fresh HOME + strict empty MCP config gives tools {StructuredOutput, DeferredToolPlaceholder}
+  only. Codex speaks WebSocket to chatgpt.com; with features disabled its frames have no tools key. TLS interception
+  works for both. `~/.local/bin/codex` silently falls back to Claude on usage limits; use `~/.local/node/bin/codex`.
+- Prompt v0.5 is final for Phase 1a; owner instructed to proceed with defaults (G5). Build started: `.venv` (uv,
+  pinned + hash lock), kernel vendored byte-identically, 64/64 upstream tests pass.

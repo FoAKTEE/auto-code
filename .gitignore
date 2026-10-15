@@ -3,6 +3,7 @@ ref-code/
 # working campaign directories and local envs
 runs/
 .venv/
+.venv-broker/
 __pycache__/
 *.pyc
 .pytest_cache/
