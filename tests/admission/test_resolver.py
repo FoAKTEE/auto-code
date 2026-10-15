@@ -181,3 +181,45 @@ def _receipt(p, *, evidence_kind="exact_algebra", guarantee=None, parents=(), st
                    guarantee=guarantee or Guarantee(kind="exact"), method="m",
                    completion="completed", issuer="test", issuer_version="0",
                    execution_id="e", input_hashes=(sha("in"),), domain=DOMAIN, parents=parents)
+
+
+# --- Codex M1 review #4: dependencies must be currently verified and authorizing ------------------
+def test_child_of_an_unknown_or_timed_out_parent_is_not_authoritative():
+    parent = Receipt(proposition=L("Z", 5), status="unknown", evidence_kind="exact_algebra",
+                     guarantee=Guarantee(kind="exact"), method="m", completion="timeout",
+                     issuer="test", issuer_version="0", execution_id="e",
+                     input_hashes=(sha("in"),), domain=DOMAIN)
+    pid = content_hash(parent)
+    child = _receipt(U("Z", 5), parents=(pid,))
+    cid = content_hash(child)
+    res = Resolver(DOMAIN, [ReceiptRecord(pid, parent), ReceiptRecord(cid, child)])
+    assert cid not in res.current() and res.status(U("Z", 5)).status == "unknown"
+    # a refuted parent is current but does not authorize its descendants either
+    ref = _receipt(L("X", 4), status="refuted")
+    rid = content_hash(ref)
+    kid = _receipt(U("X", 9), parents=(rid,))
+    res = Resolver(DOMAIN, [ReceiptRecord(rid, ref), ReceiptRecord(content_hash(kid), kid)])
+    assert res.status(U("X", 9)).status == "unknown"
+    # a non-authorizing parent kind (solver_claim) never authorizes a child
+    claim = _receipt(L("Z", 2), evidence_kind="solver_claim", status="unknown")
+    child2 = _receipt(U("Z", 7), parents=(content_hash(claim),))
+    res = Resolver(DOMAIN, [ReceiptRecord(content_hash(claim), claim),
+                            ReceiptRecord(content_hash(child2), child2)])
+    assert res.status(U("Z", 7)).status == "unknown"
+
+
+def test_conflict_removal_in_the_resolver_invalidates_descendants():
+    lo = _receipt(L("Z", 5))
+    hi = _receipt(U("Z", 3))
+    lo_id, hi_id = content_hash(lo), content_hash(hi)
+    child = _receipt(prop("dimension_eq", "code", CODE, k=2), parents=(lo_id,))
+    grandchild = _receipt(prop("distance_upper_bound", "code", CODE, sector="X", d=8),
+                          parents=(content_hash(child),))
+    recs = [ReceiptRecord(r_id, r) for r_id, r in ((lo_id, lo), (hi_id, hi),
+                                                   (content_hash(child), child),
+                                                   (content_hash(grandchild), grandchild))]
+    res = Resolver(DOMAIN, recs)                     # unquarantined conflict: defence in depth
+    assert res.unquarantined_conflicts
+    assert res.status(prop("dimension_eq", "code", CODE, k=2)).status == "unknown"
+    assert res.status(U("X", 8)).status == "unknown"
+    assert set(res.current()).isdisjoint({lo_id, hi_id, content_hash(child), content_hash(grandchild)})

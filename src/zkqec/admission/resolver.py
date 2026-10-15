@@ -1,9 +1,11 @@
 """Resolver: current authority by entailment within one domain (contracts §A3; prompt §4.5).
 
 Only *current* receipts are used (completed, authorizing evidence kind, not revoked, not
-quarantined, parents current; see :mod:`.evidence`). ``solver_claim``, ``agent_assertion`` and
-``assumption`` never authorize. Any conflict still present among current receipts (defence in depth:
-admission quarantines them) removes the conflicting receipts here too.
+quarantined, every parent current and verified; see :mod:`.evidence`). ``solver_claim``,
+``agent_assertion`` and ``assumption`` never authorize. Any conflict still present among current
+receipts (defence in depth: admission quarantines them) removes the conflicting receipts here too,
+and their descendants are invalidated transitively before any lookup index is built (to a fixed
+point: the reduced set is re-checked for conflicts).
 
 Registered inference rules
 --------------------------
@@ -90,11 +92,16 @@ class Resolver:
                  identities: Iterable[IdentityRecord] = (), *, store=None):
         self.domain = check_sha(domain)
         self.store = store
-        current = current_receipts(receipts, domain)
-        self.unquarantined_conflicts = tuple(find_conflicts(current))
-        for c in self.unquarantined_conflicts:
-            for rid in c.receipt_ids:
-                current.pop(rid, None)
+        records = list(receipts)
+        current = current_receipts(records, domain)
+        conflicts = find_conflicts(current)
+        found, excluded = list(conflicts), set()
+        while conflicts:                       # remove culprits AND their descendants, re-check
+            excluded |= {rid for c in conflicts for rid in c.receipt_ids}
+            current = current_receipts(records, domain, excluded=excluded)
+            conflicts = find_conflicts(current)
+            found += conflicts
+        self.unquarantined_conflicts = tuple(found)
         self._receipts = current
         self._by_key: dict[str, list[str]] = defaultdict(list)
         self._atoms: dict[tuple[str, str], list] = defaultdict(list)

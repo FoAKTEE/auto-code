@@ -3,8 +3,10 @@
 * :class:`ReceiptRecord` / :class:`IdentityRecord` are ledger rows with their revocation and
   quarantine flags.
 * A receipt is **current** in a domain iff it is authorizing (``completed`` + an authorizing evidence
-  kind + status ``verified``/``refuted``), of that domain, not revoked, not quarantined, and all its
-  parents are current (revocation invalidates descendants).
+  kind + status ``verified``/``refuted``), of that domain, not revoked, not quarantined, not
+  excluded by the caller (e.g. the resolver's conflict removal), and every parent is itself current
+  **and** a ``verified`` authorizing receipt (a dependency that is unknown, timed out, refuted,
+  non-authorizing, revoked, quarantined or excluded invalidates all descendants transitively).
 * Each current receipt on a scalar quantity becomes one or two interval **atoms**: verified lower →
   ``ge d``; verified upper → ``le d``; verified equality → ``ge v`` and ``le v``; refuted lower(d) →
   ``le d-1``; refuted upper(d) → ``ge d+1``; refuted equality(v) → ``ne v``. Refuted atoms are used
@@ -54,18 +56,27 @@ def is_authorizing(r: Receipt) -> bool:
             and not SIGNATURES[r.proposition.predicate].derived_only)
 
 
-def current_receipts(records: Iterable[ReceiptRecord], domain: str) -> dict[str, Receipt]:
+def _authorizes(r: Receipt) -> bool:
+    """A receipt that can serve as a premise: authorizing and ``verified``."""
+    return is_authorizing(r) and r.status == "verified"
+
+
+def current_receipts(records: Iterable[ReceiptRecord], domain: str, *,
+                     excluded: Iterable[str] = ()) -> dict[str, Receipt]:
     """Receipts that currently carry authority in ``domain`` (see module doc)."""
     pool = {rec.receipt_id: rec for rec in records if rec.receipt.domain == domain}
+    excluded = frozenset(excluded)
     memo: dict[str, bool] = {}
 
     def ok(rid: str, stack: frozenset = frozenset()) -> bool:
         if rid in memo:
             return memo[rid]
         rec = pool.get(rid)
-        good = (rec is not None and rid not in stack and not rec.revoked and not rec.quarantined
+        good = (rec is not None and rid not in stack and rid not in excluded
+                and not rec.revoked and not rec.quarantined
                 and content_hash(rec.receipt) == rid
-                and all(ok(p, stack | {rid}) for p in rec.receipt.parents))
+                and all(ok(p, stack | {rid}) and _authorizes(pool[p].receipt)
+                        for p in rec.receipt.parents))
         memo[rid] = good
         return good
 
