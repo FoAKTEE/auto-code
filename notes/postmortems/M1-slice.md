@@ -157,8 +157,8 @@ All list-price charges in M1 are reproduced exactly by `configs/broker/prices.js
 (effort high) proposal cost $0.04–0.05 (S-F, ~2k output tokens) to $0.24–0.64 (S-A, 12k–32k output tokens); the
 §K reservation per call is $1.92.
 
-Projection from the latest telemetry (m1-live-5 S-A call, $0.6397666), keeping the **unmeasured** assumption of 1.3×
-for skeptic, route and commentator calls:
+Projection on the conservative basis of the most expensive observed S-A call (m1-live-5, $0.6397666; m1-live-6 cost
+$0.2675), keeping the **unmeasured** assumption of 1.3× for skeptic, route and commentator calls:
 
 | workload | calculation | projection | D5 cap |
 |---|---|---|---|
