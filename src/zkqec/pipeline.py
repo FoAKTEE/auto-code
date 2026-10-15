@@ -242,16 +242,30 @@ class Pipeline:
                     facts["max_qubit_degree"] = pr.args["q"]
             elif (pr.predicate == "dimension_eq" and r.status == "verified" and code is not None
                   and pr.subject == code):
-                facts["k"] = pr.args["k"]
-                if r.artifacts:
-                    facts["canonical_basis"] = r.artifacts[0]
+                facts["k"] = pr.args["k"]          # code-level: transports across presentations
         if code is None and facts["css_valid"] == "verified":
             # Before the identity is recorded, k is read from this presentation's L1 execution.
             for r in res.current().values():
                 if r.proposition.predicate == "dimension_eq" and p_sha in r.input_hashes:
                     facts["k"] = r.proposition.args["k"]
-                    facts["canonical_basis"] = r.artifacts[0] if r.artifacts else None
+        facts["canonical_basis"] = self._own_basis(res, p_sha)
         return facts
+
+    def _own_basis(self, res, p_sha: str) -> str | None:
+        """The canonical basis stored by THIS presentation's own L1 execution, validated to belong
+        to it. A basis is presentation-bound (§A3, §B2); dimension evidence transports separately."""
+        for r in res.current().values():
+            if not (r.proposition.predicate == "dimension_eq" and r.status == "verified"
+                    and r.issuer == "l1.css_algebra" and tuple(r.input_hashes) == (p_sha,)
+                    and r.artifacts):
+                continue
+            try:
+                basis = LogicalBasis.model_validate(self.store.get_json(r.artifacts[0]))
+            except Exception:                                        # noqa: BLE001
+                continue
+            if basis.presentation == p_sha:
+                return r.artifacts[0]
+        return None
 
     def _distance_facts(self, res, code) -> dict[str, Any]:
         """Certified distance interval per sector, via the resolver (incl. the derived ``both``):

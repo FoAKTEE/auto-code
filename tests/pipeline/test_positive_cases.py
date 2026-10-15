@@ -97,3 +97,25 @@ def test_non_commuting_presentation_never_satisfies(pipe):
                                                     "hz": {"shape": [1, 2], "entries": [[0, 0]]}})
     ev = pipe.evaluate(p, sa(2))
     assert ev.facts["css_valid"] == "refuted" and ev.satisfies != "verified"
+
+
+# --- Codex M1 review #10: the canonical basis comes from the presentation being evaluated ----------
+def _steane_rows(order):
+    from zkqec.kernel.codes import steane
+    h = np.asarray(steane().hx)
+    return Proposal(family="explicit_sparse",
+                    params={"hx": sparse(h[list(order)]), "hz": sparse(h)},
+                    witnesses={"operation": {"permutation": list(range(7))}}, rationale="fixture")
+
+
+def test_equivalent_presentations_each_use_their_own_canonical_basis(pipe):
+    task = TaskSF(task_id="sf-steane-identity", k_req=1,
+                  target_action=SignedPauliImages(x_images=("X",), z_images=("Z",)),
+                  targets=StructuralTargets(n_max=7, k_min=1, d_min=3),
+                  hardware=HardwareDomain(name="perm", allowed_operations=("qubit_permutation",)))
+    results = [pipe.evaluate(_steane_rows(o), task) for o in ((0, 1, 2), (1, 0, 2), (0, 1, 2))]
+    assert [ev.satisfies for ev in results] == ["verified"] * 3, [ev.detail for ev in results]
+    for ev in results:
+        cand = pipe.store.get_json(ev.candidate)
+        basis = pipe.store.get_json(cand["L"])
+        assert basis["presentation"] == ev.presentation == cand["C"]
