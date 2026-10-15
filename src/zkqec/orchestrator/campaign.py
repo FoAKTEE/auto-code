@@ -29,6 +29,7 @@ from ..pipeline import Evaluation, Pipeline, build_registry, evaluator_domain
 from ..report.bundle import audit_bundle, seal
 from ..report.render import render
 from ..store import ArtifactStore
+from . import freeze
 from .digest import render_digest
 from .jobs import BudgetExceeded, namespace
 
@@ -133,6 +134,9 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     gs = git_state()
     if require_clean and gs["dirty"]:
         raise EvaluatorDirty(f"evaluator tree is dirty: {gs['dirty_paths']}")
+    # §4.3/§O: content fingerprint of every evaluator file, equal to the recorded commit (when the
+    # tree must be clean) and re-checked before every provider dispatch and verifier run.
+    guard = freeze.EvaluatorGuard(REPO, commit=gs["commit"] if require_clean else None)
     problems = check_fingerprints(REPO / "roles")
     contract = contract_path(cfg.profile).read_text()
     problems += lint_contract(contract, cfg.profile.prompt)
@@ -149,6 +153,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     manifest = {"campaign_id": cfg.campaign_id, "config_sha256": content_hash(config),
                 "config": config, "domain": dom, "registry": reg.manifest(),
                 "git": gs, "contract_sha256": content_hash(contract),
+                "evaluator_fingerprint": guard.manifest(),
                 "provider": provider.name, "model": provider.model}
     manifest_sha = store.put_json(manifest)
     (run / "manifest.json").write_bytes(store.get_bytes(manifest_sha))
@@ -166,11 +171,19 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
     except BaseException:
         adm.close()
         raise
+    def check_evaluator(boundary: str) -> None:
+        try:
+            guard.check(boundary)
+        except freeze.EvaluatorChanged as exc:
+            adm.open_incident("evaluator_changed", {"boundary": boundary[:100],
+                                                    "detail": str(exc)[:400]})
+            raise
+
     families = tuple(grammar_for(cfg.profile))
     pipe = Pipeline(adm, store, book, dom, caps=GrammarCaps(max_n=cfg.max_n),
                     distance_budget=cfg.distance_budget, families=families,
                     cpu_reservation=cfg.verifier_cpu_seconds,
-                    wall_reservation=cfg.verifier_wall_seconds)
+                    wall_reservation=cfg.verifier_wall_seconds, guard=check_evaluator)
     evaluations = 0
     calls_dir = run / "calls"; calls_dir.mkdir()
     stop_reason = {}
@@ -192,6 +205,7 @@ def run_campaign(cfg: CampaignConfig, provider: Provider, run_root: Path, *,
                     raise RuntimeError("rendered request leaked a task identifier")
                 if cfg.profile.prompt == "P-min" and family_terms(request):
                     raise RuntimeError("rendered P-min request names a code family/construction")
+                check_evaluator("provider dispatch")          # typed abort before reserving
                 try:
                     job = book.reserve("propose", f"{task.task_id}:{i}", cfg.per_call,
                                        input_sha=content_hash(request))

@@ -151,8 +151,10 @@ def _strict_witnesses(w: Any) -> dict[str, Any]:
 class Pipeline:
     def __init__(self, admission: Admission, store: ArtifactStore, book: JobBook, domain: str, *,
                  caps: GrammarCaps, distance_budget: dict | None = None, cpu_reservation: int = 600,
-                 wall_reservation: int = 600, families: tuple[str, ...] | None = None):
+                 wall_reservation: int = 600, families: tuple[str, ...] | None = None,
+                 guard=None):
         self.adm, self.store, self.book, self.domain = admission, store, book, domain
+        self.guard = guard            # frozen-evaluator check before every verifier run (§4.3)
         self.caps, self.distance_budget = caps, distance_budget or {}
         self.cpu_reservation, self.wall_reservation = cpu_reservation, wall_reservation
         self.families = None if families is None else frozenset(families)   # frozen profile
@@ -188,6 +190,8 @@ class Pipeline:
         raise RetriesExhausted(f"{name}:{key}: no completed closure after {MAX_ATTEMPTS} attempts")
 
     def _execute(self, job: str, name: str, inputs: dict[str, str], ekey: str, identity: bool):
+        if self.guard is not None:
+            self.guard(f"verifier {name}")          # typed abort before dispatch on any change
         gen = self.book.dispatch(job)
         t0, w0 = time.process_time(), time.monotonic()
 
