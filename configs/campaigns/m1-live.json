@@ -17,7 +17,7 @@
   "max_proposals_per_task": 4,
   "caps": {"usd": 5.0, "requests": 40, "input_tokens": 4000000, "output_tokens": 400000,
            "wall_seconds": 10800, "cpu_seconds": 7200},
-  "per_call": {"usd": 0.6, "requests": 3, "input_tokens": 400000, "output_tokens": 32000,
+  "per_call": {"usd": 1.92, "requests": 2, "input_tokens": 40000, "output_tokens": 32000,
                "wall_seconds": 900, "cpu_seconds": 0},
   "distance_budget": {"max_patterns": 3000000, "max_pairs": 200000000},
   "max_n": 200,
