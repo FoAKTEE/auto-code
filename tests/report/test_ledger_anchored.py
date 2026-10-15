@@ -191,6 +191,11 @@ def test_missing_call_record_and_corrupt_proposal_fail_the_audit(ran):
 def test_unsettled_jobs_and_orphan_events_fail_reconciliation(ran):
     _, run, adm, store = ran
     conn = sqlite3.connect(run / "ledger.db", isolation_level=None)
-    conn.execute("DELETE FROM ops_jobs WHERE job_id = (SELECT job_id FROM ops_jobs LIMIT 1)")
+    settled = conn.execute("SELECT job_id FROM ops_jobs WHERE state='settled' ORDER BY job_id "
+                           "LIMIT 1").fetchone()[0]
+    conn.execute("DELETE FROM ops_jobs WHERE job_id = ?", (settled,))
+    conn.execute("UPDATE ops_jobs SET state='dispatched' WHERE kind='propose' AND state='settled'")
     conn.close()
-    assert any("has no operational job" in p for p in audit_campaign(adm, store, "t1"))
+    problems = audit_campaign(adm, store, "t1")
+    assert any(settled in p and "has no operational job" in p for p in problems), problems
+    assert any("dispatched: unsettled at audit" in p for p in problems), problems
