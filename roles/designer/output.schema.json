@@ -1,26 +1,102 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "designer-proposal-v1",
+  "title": "designer-proposal-v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["family", "params", "rationale"],
+  "required": [
+    "family",
+    "params",
+    "rationale"
+  ],
   "properties": {
-    "family": {"type": "string", "enum": ["explicit_sparse", "two_block_group_algebra"]},
-    "params": {"type": "object"},
-    "requested": {"type": "array", "items": {"type": "string", "maxLength": 200}, "maxItems": 20},
+    "family": {
+      "type": "string",
+      "enum": [
+        "explicit_sparse",
+        "two_block_group_algebra"
+      ]
+    },
+    "params": {
+      "type": "object"
+    },
+    "requested": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "maxItems": 20
+    },
     "witnesses": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "basis": {"type": "object", "additionalProperties": false, "required": ["lx", "lz"],
-                  "properties": {"lx": {"type": "array", "items": {"type": "array", "items": {"type": "integer", "enum": [0, 1]}}},
-                                 "lz": {"type": "array", "items": {"type": "array", "items": {"type": "integer", "enum": [0, 1]}}}}},
-        "operation": {"type": "object", "additionalProperties": false,
-                      "properties": {"permutation": {"type": "array", "items": {"type": "integer", "minimum": 0}},
-                                     "local_cliffords": {"type": "array", "items": {"type": "string"}}}},
-        "logical_qubits": {"type": "array", "items": {"type": "integer", "minimum": 0}}
+        "basis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "lx",
+            "lz"
+          ],
+          "properties": {
+            "lx": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "enum": [
+                    0,
+                    1
+                  ]
+                }
+              }
+            },
+            "lz": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "enum": [
+                    0,
+                    1
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "permutation": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "local_cliffords": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "logical_qubits": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       }
     },
-    "rationale": {"type": "string", "maxLength": 4000}
+    "rationale": {
+      "type": "string",
+      "maxLength": 4000
+    }
   }
 }
