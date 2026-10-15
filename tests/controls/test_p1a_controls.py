@@ -169,3 +169,18 @@ def test_s_vs_sdg_flips_when_signs_are_ignored(tmp_path, monkeypatch):
     monkeypatch.setattr(Pauli, "to_str", lambda self: real(self)[1:])     # unsigned comparison
     ev = run_suite("p1a", tmp_path, INPUTS, only=("s_vs_sdg",))
     assert counts(ev, "s_vs_sdg")["false_authorizations"] == 1
+
+
+def test_the_suite_runs_inside_a_snapshot(tmp_path, monkeypatch, evidence):
+    # m1-live-4: in a campaign running from the read-only snapshot, the evaluator-tamper control's
+    # guard over its scratch copy was refused as "not the snapshot", so the whole suite failed (audit:
+    # controls not recorded). The snapshot-origin rule binds guards over the running evaluator only.
+    from zkqec.orchestrator import freeze
+    monkeypatch.setitem(freeze._ACTIVE, "root", str(freeze.REPO))
+    ev = run_suite("p1a", tmp_path, INPUTS)
+    assert canonical_json(ev) == canonical_json(evidence)       # identical to the repo-mode run
+    c = counts(ev, "evaluator_tamper")
+    assert (c["injections"], c["false_authorizations"]) == (2, 0)
+    assert (c["paired_positives"], c["false_rejections"]) == (1, 0)
+    with pytest.raises(freeze.EvaluatorChanged, match="runs from the snapshot"):
+        freeze.EvaluatorGuard(tmp_path)                 # a guard over the running evaluator still binds

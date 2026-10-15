@@ -270,13 +270,15 @@ class EvaluatorGuard:
     """Freeze the evaluator fingerprint at campaign start and re-check it at every boundary.
 
     Over a snapshot (a :data:`SNAPSHOT_MARKER` at ``repo``) the start check compares the marker's
-    commit and fingerprint (no git); in a process that entered a snapshot, ``repo`` must be it."""
+    commit and fingerprint (no git); in a process that entered a snapshot, a guard over the running
+    evaluator (``check_imports=True``) must be over that snapshot. A fingerprint-only guard
+    (``check_imports=False``) watches another tree, e.g. the evaluator-tamper control's scratch copy."""
 
     def __init__(self, repo: Path = REPO, *, commit: str | None = None,
                  check_imports: bool = True):
         self.repo = Path(repo).resolve()
         active = _ACTIVE.get("root")
-        if active is not None and self.repo != Path(active):
+        if check_imports and active is not None and self.repo != Path(active):
             raise EvaluatorChanged(f"guard over {self.repo}, but the evaluator runs from the "
                                    f"snapshot {active}")
         self.snapshot = snapshot_info(self.repo)
