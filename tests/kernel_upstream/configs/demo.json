@@ -1,0 +1,75 @@
+{
+  "schema_version": "1.0",
+  "seed": 7,
+  "task": {
+    "name": "tfim_chain_6_reference",
+    "terms": [
+      {
+        "coefficient": -1.0,
+        "pauli": "ZZIIII"
+      },
+      {
+        "coefficient": -1.0,
+        "pauli": "IZZIII"
+      },
+      {
+        "coefficient": -1.0,
+        "pauli": "IIZZII"
+      },
+      {
+        "coefficient": -1.0,
+        "pauli": "IIIZZI"
+      },
+      {
+        "coefficient": -1.0,
+        "pauli": "IIIIZZ"
+      },
+      {
+        "coefficient": -0.7,
+        "pauli": "XIIIII"
+      },
+      {
+        "coefficient": -0.7,
+        "pauli": "IXIIII"
+      },
+      {
+        "coefficient": -0.7,
+        "pauli": "IIXIII"
+      },
+      {
+        "coefficient": -0.7,
+        "pauli": "IIIXII"
+      },
+      {
+        "coefficient": -0.7,
+        "pauli": "IIIIXI"
+      },
+      {
+        "coefficient": -0.7,
+        "pauli": "IIIIIX"
+      }
+    ],
+    "evolution_time": 0.2,
+    "trotter_steps": 4,
+    "observable": "ZIIIII",
+    "initial_state": "zero_product",
+    "target_precision": 0.1,
+    "confidence_alpha": 0.05
+  },
+  "requirements": {
+    "min_k": 1,
+    "min_distance": 3,
+    "max_n": 128,
+    "max_check_weight": 12,
+    "max_total_degree": 16,
+    "require_disjoint_z": false,
+    "require_pairwise_global_h": false
+  },
+  "budget": {
+    "max_candidates": 5,
+    "half_weight": 3,
+    "max_half_patterns": 200000,
+    "max_collision_pairs": 20000000
+  },
+  "mode": "offline_baseline"
+}
