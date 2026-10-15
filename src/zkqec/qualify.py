@@ -1045,19 +1045,34 @@ class Qualifier:
                   f"{len(pins)} pins, all hashed; installed versions match ({len(set(pins) & set(installed))} checked)",
                   [{"mismatch": mismatch}]),
             Check(synth_unhashed == ["foo"], "a synthetic lock entry without a hash is detected", [])))
-        wheels = sorted(self.archive.glob("*.whl")) if self.archive.exists() else []
-        wheel_hashes = {sha256_file(w) for w in wheels}
+        # Wheels live in the bundle CAS (zkqec.report.bundle): closures-index -> wheelhouse sidecar.
+        from .report.bundle import ARCHIVE as CAS_ARCHIVE
+        lock_sha = sha256_file(REPO / "requirements.lock")
+        index_path = CAS_ARCHIVE / "cas" / "closures-index.json"
+        index = json.loads(index_path.read_text()) if index_path.exists() else {}
+        wh_sha = index.get(f"wheelhouse:{lock_sha}")
+        side = json.loads((CAS_ARCHIVE / "cas" / f"{wh_sha}.json").read_text()) if wh_sha else {}
+        wheels = side.get("wheels", {})
+        built = {re.split(r"-\d", b, 1)[0].lower().replace("_", "-") for b in side.get("built_from_sdist", [])}
         lock_hashes = set(re.findall(r"--hash=sha256:([0-9a-f]{64})", lock))
-        covered = [k for k in pins if _pin_hashes(lock, k) & wheel_hashes]
+
+        def _dist(wheel_name: str) -> str:
+            return wheel_name.split("-")[0].lower().replace("_", "-")
+        by_dist = {_dist(w): h for w, h in wheels.items()}
+        covered = [k for k in pins if k.lower() in by_dist and
+                   (by_dist[k.lower()] in lock_hashes or k.lower() in built)]
+        tar_ok = bool(wh_sha) and sha256_file(CAS_ARCHIVE / "cas" / f"{wh_sha}.tar.zst") == wh_sha
         self.add(Property(
             "O.wheel_archive", "Locked wheels archived for offline reconstruction", "§M/§O",
-            f"Every locked distribution has a wheel in {self.archive} whose sha256 is one of its lock hashes.",
-            Check(bool(wheels) and len(covered) == len(pins), f"{len(wheels)} wheels; {len(covered)}/{len(pins)} pins covered",
-                  [{"archive": str(self.archive)}]),
-            Check(bool(wheels) and not (wheel_hashes - lock_hashes), "no unlocked wheel in the archive" if wheels else
-                  "archive missing", []),
-            consequence="Bundles cannot yet be rebuilt offline from archived wheels; archive them (e.g. pip download "
-                        "--require-hashes) before M1 sealing."))
+            "The bundle CAS holds a content-addressed wheelhouse for this lock: every locked distribution has a "
+            "wheel whose sha256 is a lock hash, or was built at seal time from its hash-checked sdist.",
+            Check(bool(wheels) and len(covered) == len(pins),
+                  f"{len(wheels)} wheels; {len(covered)}/{len(pins)} pins covered; built from sdist: {sorted(built)}",
+                  [{"wheelhouse": wh_sha, "archive": str(CAS_ARCHIVE)}]),
+            Check(tar_ok, "the wheelhouse tarball matches its content address" if tar_ok else
+                  "wheelhouse missing or does not match its content address", []),
+            consequence="Bundles cannot be rebuilt offline until the wheelhouse closure exists (seal a bundle "
+                        "or call zkqec.report.bundle.ensure_closures)."))
         target = os.path.realpath(L.REAL_CODEX)
         wrapper_differs = L.CODEX_WRAPPER.exists() and os.path.realpath(L.CODEX_WRAPPER) != target
         argv = L.codex_call(L.CallSpec("codex", CODEX_MODEL, ROLE, PROMPT, SCHEMA)).argv
