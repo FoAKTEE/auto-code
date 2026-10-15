@@ -12,6 +12,7 @@ Without BUNDLE arguments, every ``<archive>/bundles/<campaign>/<sha>.tar.zst`` i
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -47,8 +48,15 @@ def _report_facts(report: str) -> dict:
 
 
 def index_bundle(path: Path, note: str | None) -> dict:
+    sup = path.with_name(f"{path.name.split('.')[0]}.confirmation.json")
+    confirmation: dict = {"supplement": None}
+    if sup.exists():                    # hash-linked confirmation settlement + final totals (§M)
+        doc = json.loads(sup.read_text())
+        confirmation = {"supplement": sup.name, "sha256": hashlib.sha256(sup.read_bytes()).hexdigest(),
+                        "final_totals": {u: v.get("spent") if isinstance(v, dict) else v
+                                         for u, v in sorted(doc.get("final_totals", {}).items())}}
     with tempfile.TemporaryDirectory(prefix="zkqec-index-") as td:
-        audit = audit_bundle(path, workdir=Path(td) / "audit")
+        audit = audit_bundle(path, workdir=Path(td) / "audit", supplement=sup if sup.exists() else None)
         b = Path(td) / "audit" / "bundle"
         manifest = json.loads((b / "manifest.json").read_text())
         facts = _report_facts((b / "report.md").read_text())
@@ -57,7 +65,7 @@ def index_bundle(path: Path, note: str | None) -> dict:
             "evaluator_commit": manifest["closures"].get("git_commit"), "closures": manifest["closures"],
             "ledger_head": manifest["ledger_head"], **facts,
             "audit": {"ok": bool(audit.get("ok")), "problems": audit.get("problems", [])},
-            "note": note}
+            "confirmation": confirmation, "note": note}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,13 +86,14 @@ def main(argv: list[str] | None = None) -> int:
     L = ["# Live bundle index (D9)", "",
          f"Archive `{ARCHIVE}`; re-audited offline with each bundle's embedded evaluator; indexed at "
          f"`{head[:12]}` ({doc['indexed_utc']}). Machine-readable: `index.json`.", "",
-         "| campaign | bundle sha256 | MB | evaluator commit | ledger head | audit | satisfied | USD | requests | note |",
-         "|---|---|---|---|---|---|---|---|---|---|"]
+         "| campaign | bundle sha256 | MB | evaluator commit | ledger head | audit | confirmation | satisfied | USD | requests | note |",
+         "|---|---|---|---|---|---|---|---|---|---|---|"]
     for e in doc["bundles"]:
         sat = sum(x["satisfies_task"] == "verified" for x in e["evaluated"])
         L.append(f"| {e['campaign_id']} | `{e['bundle_sha256']}` | {e['bytes'] / 1e6:.2f} | "
                  f"`{(e['evaluator_commit'] or '')[:12]}` | {e['ledger_head']['seq']} | "
-                 f"{'ok' if e['audit']['ok'] else 'FAIL'} | {sat}/{len(e['evaluated'])} | "
+                 f"{'ok' if e['audit']['ok'] else 'FAIL'} | "
+                 f"{'linked' if e['confirmation']['supplement'] else 'none (pre-B6)'} | {sat}/{len(e['evaluated'])} | "
                  f"{e['spend'].get('usd', 0):.4f} | {e['spend'].get('requests', 0):.0f} | {e['note'] or ''} |")
     if all({"single-implementation", "non-evaluation"} <= set(e["labels"]) for e in doc["bundles"]):
         L += ["", "Every bundle listed carries the labels `single-implementation, non-evaluation` (D11); "
