@@ -50,8 +50,9 @@ the declared list prices, before `run_live` creates anything (3f046ed); m1-live-
 
 **I4. Pre-hardening code reached live runs.** The Codex review of the committed M1 code
 (`notes/reviews/M1-codex-partial.md`) found 3 blockers (forged receipts survive verify + audit; unfenced
-re-verification on recovery; report inputs not ledger-bound) and 14 majors. All were fixed test-first in 19 gated
-commits (`notes/reviews/M1-hardening.md`). m1-live-1/2 stay labelled non-evaluation.
+re-verification on recovery; report inputs not ledger-bound) and 14 majors. The first hardening round addressed
+all 17 in 19 gated commits (`notes/reviews/M1-hardening.md`); the Codex milestone review confirmed 12 fixed and 5
+partial (#7, #13–#16) and found a new blocker and seven majors (I7). m1-live-1/2 stay labelled non-evaluation.
 *Lesson:* the M1 prerequisite list (§L state machine, crash tests) was met, but the evidence path (admission
 invariants, ledger-bound reporting, audit coverage) had only been reviewed in design. From M2 on, a Codex code review
 of the evidence path precedes any live campaign of the milestone.
@@ -65,6 +66,16 @@ pinned). Verifier CPU is charged by process time, so every unpinned campaign, co
 over-charged (conservative for the caps, but it distorts the CPU telemetry, including m1-live-3's 9.9 CPU-s).
 *Fix:* importing zkqec first pins OpenBLAS/OpenMP/MKL to one thread unless the caller set otherwise (test
 `tests/test_blas_pinning.py`). The m1-live-3 bundle keeps its recorded (unpinned) charges.
+
+**I7. The milestone review blocked M1 again** (`notes/reviews/M1-codex-milestone.md`, triage `M1-triage.md`).
+New blocker B1: a failed broker log write lets mitmproxy forward the flow, including a forbidden tool request —
+the log-before-forward rule had been qualified only for successful writes. Majors: truncated SSE counted as complete
+usage (B2), failed controls invisible to the audit (B3), cross-profile execution reuse introduced by hardening #2
+(B4), nested timers and unbounded controls/confirmation (B5), broker evidence and the confirmation settlement
+missing from bundles (B6), retry ancestor durability (B7), per-request token reservations (B8). The lead had also
+mis-triaged the §O snapshot import (P1a) as an M2 item. *Lessons:* qualify failure paths (full disk, short
+writes), not only the happy path; a hardening fix needs its own adversarial review before the next live run;
+check every deferral against the contract's phase marker.
 
 ## 3. Model performance (single samples — not an evaluation)
 
